@@ -51,6 +51,7 @@ void status_callback(const char *node_id,
                      DISLMDB_NODE_STATE old_state,
                      DISLMDB_NODE_STATE new_state,
                      void *user_data) {
+    (void)user_data;
     printf("Node %s state changed: %d -> %d\n", node_id, old_state, new_state);
 }
 
@@ -123,8 +124,9 @@ int main(int argc, char *argv[]) {
     config.consensus.heartbeat_interval_ms = 1000;  // 1 second heartbeat
     config.consensus.election_timeout_min_ms = 5000;  // 5 second min election timeout
     config.consensus.election_timeout_max_ms = 10000; // 10 second max election timeout
-    config.consensus.max_batch_size = 1;      // Tolerate 1 faulty node (needs 4 total nodes)
-    config.consensus.checkpoint_interval = 100; // Checkpoint every 100 operations
+    config.consensus.max_batch_size = 100;
+    config.consensus.fault_tolerance = 0;     // Solo / single-node: f=0 (use 1 for 4-node cluster)
+    config.consensus.checkpoint_interval = 100;
     
     // Create the environment
     rc = dislmdb_env_create(&env);

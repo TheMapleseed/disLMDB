@@ -1,176 +1,185 @@
 cmake_minimum_required(VERSION 3.16)
 project(DisLMDB VERSION 0.1.0 LANGUAGES C)
 
-# Set C standard
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
-# Detect compiler
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     set(USING_CLANG TRUE)
-    message(STATUS "Detected Clang compiler: ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
 elseif(CMAKE_C_COMPILER_ID MATCHES "GNU")
     set(USING_GCC TRUE)
-    message(STATUS "Detected GCC compiler: ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
 elseif(CMAKE_C_COMPILER_ID MATCHES "MSVC")
     set(USING_MSVC TRUE)
-    message(STATUS "Detected MSVC compiler: ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
-else()
-    message(WARNING "Unknown compiler: ${CMAKE_C_COMPILER_ID}")
 endif()
 
-# Add compile options
 add_compile_options(-Wall -Wextra -Wpedantic)
-
-# Error on warnings in Release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-Werror)
 endif()
 
-# Compiler-specific options
 if(USING_CLANG)
-    # Clang-specific warnings and optimizations
-    add_compile_options(
-        -Weverything
-        -Wno-padded  # Silence padding warnings
-        -Wno-reserved-id-macro  # Silence warnings about macros starting with underscore
-        -Wno-documentation-unknown-command  # Silence unknown doxygen commands
+    # Scoped to DisLMDB targets only (not vendored LMDB)
+    set(DISLMDB_EXTRA_WARNINGS
+        -Wno-padded
+        -Wno-reserved-id-macro
+        -Wno-documentation-unknown-command
+        -Wno-declaration-after-statement
+        -Wno-pre-c11-compat
+        -Wno-c++98-compat
+        -Wno-c++98-compat-pedantic
+        -Wno-unsafe-buffer-usage
+        -Wno-disabled-macro-expansion
     )
 elseif(USING_GCC)
-    # GCC-specific warnings
-    add_compile_options(
+    set(DISLMDB_EXTRA_WARNINGS
         -Wcast-qual
         -Wconversion
-        -Wdouble-promotion
         -Wformat=2
-        -Wformat-truncation
         -Wundef
     )
 endif()
 
-# Sanitizer options (enabled with -DENABLE_SANITIZER=ON)
 option(ENABLE_SANITIZER "Enable sanitizers for debugging" OFF)
 if(ENABLE_SANITIZER)
     if(USING_CLANG OR USING_GCC)
-        message(STATUS "Enabling sanitizers")
         add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address,undefined)
-    else()
-        message(WARNING "Sanitizers requested but not supported by current compiler")
     endif()
 endif()
 
-# Find required packages
-find_package(OpenSSL REQUIRED)
+option(DISLMDB_USE_OPENSSL "Use OpenSSL instead of platform crypto" OFF)
+find_package(OpenSSL QUIET)
 find_package(Threads REQUIRED)
 
-# Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism
-    ${OPENSSL_INCLUDE_DIR}
 )
 
-# Define library sources
-set(DISLMDB_SOURCES
+set(LMDB_SOURCES src/mdb.c src/midl.c)
+add_library(lmdb STATIC ${LMDB_SOURCES})
+# Keep LMDB warnings quiet — third-party code
+target_compile_options(lmdb PRIVATE -w)
+
+set(ENHANCED_PBFT_SRCS
+    Enhanced-PBFT-mechanism/epdft.c
+    Enhanced-PBFT-mechanism/messaging.c
+    Enhanced-PBFT-mechanism/security_manager.c
+    Enhanced-PBFT-mechanism/blake3_ref.c
+    Enhanced-PBFT-mechanism/time_variant_blake3.c
+)
+
+set(DISLMDB_SRCS
     src/dislmdb.c
     src/utils/dislmdb_utils.c
-    # Add these when implemented
-    # src/consensus/dislmdb_consensus.c
-    # src/consensus/dislmdb_pbft.c
-    # src/network/dislmdb_network.c
-    # src/storage/dislmdb_storage.c
-)
-
-# Define the original LMDB sources
-set(LMDB_SOURCES
-    src/mdb.c
-    src/midl.c
-)
-
-# Create the LMDB static library
-add_library(lmdb STATIC ${LMDB_SOURCES})
-
-# Add Enhanced PBFT mechanism files
-set(ENHANCED_PBFT_SRCS
-    "${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism/epdft.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism/epdft.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism/messaging.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism/messaging.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism/security_manager.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism/security_manager.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/consensus/pbft_adapter.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/consensus/pbft_adapter.h"
-)
-
-# Add the adapter source files
-set(DISLMDB_SRCS
-    ${DISLMDB_SOURCES}
+    src/utils/dislmdb_crypto.c
+    src/utils/dislmdb_ops.c
+    src/utils/dislmdb_persist.c
+    src/network/dislmdb_network.c
+    src/consensus/dislmdb_consensus.c
+    src/consensus/pbft_adapter.c
     ${ENHANCED_PBFT_SRCS}
 )
 
-# Create the DisLMDB library target
 add_library(dislmdb SHARED ${DISLMDB_SRCS})
+target_compile_options(dislmdb PRIVATE ${DISLMDB_EXTRA_WARNINGS})
 
-# Set library properties
+if(DISLMDB_USE_OPENSSL AND OPENSSL_FOUND)
+    target_compile_definitions(dislmdb PRIVATE DISLMDB_USE_OPENSSL)
+    target_include_directories(dislmdb PRIVATE ${OPENSSL_INCLUDE_DIR})
+    target_link_libraries(dislmdb PRIVATE OpenSSL::Crypto)
+    message(STATUS "Crypto backend: OpenSSL")
+elseif(APPLE)
+    target_compile_definitions(dislmdb PRIVATE DISLMDB_USE_COMMONCRYPTO)
+    target_link_libraries(dislmdb PRIVATE "-framework Security")
+    message(STATUS "Crypto backend: Apple CommonCrypto/Security")
+elseif(OPENSSL_FOUND)
+    target_compile_definitions(dislmdb PRIVATE DISLMDB_USE_OPENSSL)
+    target_include_directories(dislmdb PRIVATE ${OPENSSL_INCLUDE_DIR})
+    target_link_libraries(dislmdb PRIVATE OpenSSL::Crypto)
+    message(STATUS "Crypto backend: OpenSSL (auto)")
+else()
+    message(FATAL_ERROR "No crypto backend available. Install OpenSSL or build on Apple.")
+endif()
+
 set_target_properties(dislmdb PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
-    PUBLIC_HEADER "include/dislmdb.h;include/dislmdb_consensus.h;include/dislmdb_network.h;include/dislmdb_errors.h"
+    PUBLIC_HEADER "include/dislmdb.h;include/dislmdb_consensus.h;include/dislmdb_network.h;include/dislmdb_errors.h;include/dislmdb_crypto.h"
 )
 
-# Link dependencies
 target_link_libraries(dislmdb
     PRIVATE lmdb
-    PRIVATE ${OPENSSL_LIBRARIES}
-    PRIVATE ${CMAKE_DL_LIBS}
     PRIVATE Threads::Threads
-    PRIVATE uuid
-    PRIVATE pthread
 )
 
-# Install rules
+if(UNIX AND NOT APPLE)
+    target_link_libraries(dislmdb PRIVATE uuid)
+endif()
+
 install(TARGETS dislmdb
     LIBRARY DESTINATION lib
     PUBLIC_HEADER DESTINATION include
 )
 
-# Example programs
 add_executable(basic_example examples/basic_example.c)
 target_link_libraries(basic_example dislmdb)
 
 add_executable(distributed_example examples/distributed_example.c)
 target_link_libraries(distributed_example dislmdb)
 
-# Create directories for examples
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+add_executable(bytecode_example examples/bytecode_example.c)
+target_link_libraries(bytecode_example dislmdb)
 
-# Testing
 enable_testing()
 
-# Create directories for tests
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-
-# Add test executable
 add_executable(dislmdb_test tests/dislmdb_test.c)
 target_link_libraries(dislmdb_test dislmdb)
+add_test(NAME dislmdb_basic_test COMMAND dislmdb_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-# Register tests
-add_test(NAME dislmdb_basic_test COMMAND dislmdb_test)
+add_executable(test_crypto tests/unit/test_crypto.c)
+target_link_libraries(test_crypto dislmdb)
+add_test(NAME unit_crypto COMMAND test_crypto)
 
-# Documentation
+add_executable(test_tvb3
+    tests/unit/test_tvb3.c
+    Enhanced-PBFT-mechanism/time_variant_blake3.c
+    Enhanced-PBFT-mechanism/blake3_ref.c)
+target_include_directories(test_tvb3 PRIVATE Enhanced-PBFT-mechanism)
+add_test(NAME unit_tvb3 COMMAND test_tvb3)
+
+add_executable(test_ops_persist tests/integration/test_ops_persist.c)
+target_link_libraries(test_ops_persist dislmdb)
+add_test(NAME integration_ops_persist COMMAND test_ops_persist WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_membership tests/integration/test_membership.c)
+target_link_libraries(test_membership dislmdb)
+add_test(NAME integration_membership COMMAND test_membership WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(e2e_runner tests/e2e/e2e_runner.c)
+target_link_libraries(e2e_runner dislmdb)
+
+add_test(
+    NAME e2e_golden
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/run_e2e.sh $<TARGET_FILE:e2e_runner>
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
+# Run the full suite as part of the default build (`cmake --build` / `make`)
+add_custom_target(check
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS dislmdb_test test_crypto test_tvb3 test_ops_persist test_membership e2e_runner
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running DisLMDB unit, integration, and e2e suites"
+)
+add_custom_target(build_and_test ALL DEPENDS check)
+
 find_package(Doxygen)
-if(DOXYGEN_FOUND)
-    # Set Doxygen configuration
-    set(DOXYGEN_INPUT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    set(DOXYGEN_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/docs)
+if(DOXYGEN_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in)
     set(DOXYGEN_CONFIG_FILE ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile)
-    
-    # Create Doxyfile
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in ${DOXYGEN_CONFIG_FILE} @ONLY)
-    
-    # Add custom target for documentation
     add_custom_target(docs
         ${DOXYGEN_EXECUTABLE} ${DOXYGEN_CONFIG_FILE}
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
@@ -179,14 +188,6 @@ if(DOXYGEN_FOUND)
     )
 endif()
 
-# Show summary
 message(STATUS "DisLMDB version: ${PROJECT_VERSION}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C Compiler: ${CMAKE_C_COMPILER}")
-message(STATUS "C Compiler ID: ${CMAKE_C_COMPILER_ID}")
-message(STATUS "C Compiler version: ${CMAKE_C_COMPILER_VERSION}")
-message(STATUS "OpenSSL found: ${OPENSSL_FOUND}")
-message(STATUS "OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
-message(STATUS "OpenSSL libraries: ${OPENSSL_LIBRARIES}")
-message(STATUS "Doxygen found: ${DOXYGEN_FOUND}")
-message(STATUS "Sanitizers enabled: ${ENABLE_SANITIZER}") 

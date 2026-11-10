@@ -1,483 +1,445 @@
 /**
  * @file pbft_adapter.c
- * @brief Implementation of the adapter for Enhanced PBFT Consensus Mechanism
- *
- * @copyright Copyright 2025 David Harmon, The Mapleseed Inc.
- * 
- * This software is proprietary and confidential.
- * Unauthorized copying, transfer, or use of this file, in source or binary form,
- * is strictly prohibited except under the terms of a commercial license agreement
- * with The Mapleseed Inc.
+ * @brief Bridge DisLMDB ↔ Enhanced PBFT (Rust-aligned C port)
  */
 
 #include "pbft_adapter.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-// Subscriber ID for this node in the broadcast channel
-static int global_subscriber_id = -1;
+#include "dislmdb_errors.h"
+#include "dislmdb_crypto.h"
 
-/**
- * @brief Callback function for handling committed messages from consensus
- * 
- * This function is called when a message is committed by the consensus protocol.
- * It applies the transaction to the local database.
- * 
- * @param data The committed data
- * @param size Size of the committed data
- * @param user_data User data (pointer to the environment)
- */
-static void dislmdb_pbft_commit_callback(const uint8_t *data, size_t size, void *user_data) {
-    DISLMDB_env *env = (DISLMDB_env *)user_data;
-    
-    // Log the commit
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", "Received committed transaction of size %zu", size);
-    
-    // Apply the transaction
-    int rc = dislmdb_pbft_apply_transaction(env, data, size);
-    if (rc != DISLMDB_SUCCESS) {
-        dislmdb_log(env, DISLMDB_LOG_ERROR, "PBFT", 
-                   "Failed to apply committed transaction: %s", dislmdb_strerror(rc));
-    }
-}
+#define BYTECODE_DBI_NAME "__dislmdb_bytecode__"
+#define TXN_MAGIC 0x4454584Eu
+#define BCOD_MAGIC 0x42434F44u
 
-/**
- * @brief Thread function for processing consensus broadcasts
- * 
- * This thread waits for committed messages from the broadcast channel
- * and passes them to the commit callback.
- * 
- * @param arg Pointer to the environment
- * @return Thread result code
- */
-static int dislmdb_pbft_broadcast_thread(void *arg) {
-    DISLMDB_env *env = (DISLMDB_env *)arg;
-    ConsensusCore *core = (ConsensusCore *)env->consensus_context;
-    
-    // Get the subscriber ID
-    int subscriber_id = global_subscriber_id;
-    
-    // Process broadcasts until stopped
+static void *broadcast_thread(void *arg)
+{
+    DISLMDB_env *env = arg;
+    ConsensusCore *core = env->consensus_context;
+    int subscriber_id = env->pbft_subscriber_id;
+
     while (env->consensus_running) {
         uint8_t *data = NULL;
         size_t data_size = 0;
-        struct timespec timeout = {.tv_sec = 1, .tv_nsec = 0}; // 1-second timeout
-        
-        // Wait for a broadcast
-        ConsensusError err = broadcast_channel_receive(
-            core->commit_channel, 
-            subscriber_id, 
-            &data, 
-            &data_size, 
-            &timeout
-        );
-        
-        // Check for errors
+        struct timespec timeout = {.tv_sec = 1, .tv_nsec = 0};
+
+        ConsensusError err = (ConsensusError)broadcast_channel_receive(
+            core->commit_channel, subscriber_id, &data, &data_size, &timeout);
+
         if (err == CONSENSUS_OK) {
-            // Call the commit callback
-            dislmdb_pbft_commit_callback(data, data_size, env);
-            
-            // Free the data if needed (depends on implementation)
-            // free(data);
+            int rc = dislmdb_pbft_apply_transaction(env, data, data_size);
+            if (rc != DISLMDB_SUCCESS) {
+                dislmdb_log(env, DISLMDB_LOG_ERROR, "PBFT",
+                            "Failed to apply committed transaction: %s",
+                            dislmdb_strerror(rc));
+            }
+            free(data);
         } else if (err != CONSENSUS_ERROR_TIMEOUT) {
-            // Log non-timeout errors
-            dislmdb_log(env, DISLMDB_LOG_ERROR, "PBFT", 
-                       "Error receiving broadcast: %d", err);
+            dislmdb_log(env, DISLMDB_LOG_ERROR, "PBFT",
+                        "Error receiving broadcast: %d", (int)err);
         }
     }
-    
-    return 0;
+    return NULL;
 }
 
-int dislmdb_pbft_init(DISLMDB_env *env) {
-    // Verify environment
+static void outbound_pbft(const PbftMessage *msg, void *user_data)
+{
+    DISLMDB_env *env = user_data;
+    if (!env || !msg) {
+        return;
+    }
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (pbft_message_serialize(msg, &wire, &wire_len) != 0) {
+        return;
+    }
+    DISLMDB_MESSAGE_TYPE dtype;
+    switch (msg->type) {
+        case MSG_PRE_PREPARE: dtype = DISLMDB_MESSAGE_PREPARE; break; /* closest public enum */
+        case MSG_PREPARE: dtype = DISLMDB_MESSAGE_PREPARE; break;
+        case MSG_COMMIT: dtype = DISLMDB_MESSAGE_COMMIT; break;
+        case MSG_VIEW_CHANGE: dtype = DISLMDB_MESSAGE_ELECTION; break;
+        default: dtype = DISLMDB_MESSAGE_CHECKPOINT; break;
+    }
+    DISLMDB_network_message nm;
+    if (dislmdb_network_create_message(&nm, dtype, wire, (uint32_t)wire_len, NULL) == DISLMDB_SUCCESS) {
+        strncpy(nm.header.sender_id, msg->from, sizeof(nm.header.sender_id) - 1);
+        (void)dislmdb_network_broadcast(env, &nm, DISLMDB_DEFAULT_NETWORK_TIMEOUT_MS);
+        dislmdb_network_free_message(&nm);
+    }
+    free(wire);
+}
+
+void dislmdb_convert_consensus_config(const DISLMDB_consensus_config *dislmdb_config,
+                                      ConsensusConfig *pbft_config)
+{
+    if (!dislmdb_config || !pbft_config) {
+        return;
+    }
+    *pbft_config = consensus_config_default();
+    uint32_t f = dislmdb_config->fault_tolerance;
+    pbft_config->fault_tolerance = f;
+    pbft_config->min_nodes = 3u * f + 1u;
+    if (pbft_config->min_nodes == 0) {
+        pbft_config->min_nodes = 1;
+    }
+    pbft_config->timeouts.prepare_timeout.tv_sec = dislmdb_config->timeout_ms / 1000;
+    pbft_config->timeouts.prepare_timeout.tv_nsec =
+        (long)(dislmdb_config->timeout_ms % 1000) * 1000000L;
+    pbft_config->timeouts.commit_timeout = pbft_config->timeouts.prepare_timeout;
+    pbft_config->timeouts.view_change_timeout.tv_sec =
+        dislmdb_config->election_timeout_max_ms / 1000;
+    pbft_config->timeouts.view_change_timeout.tv_nsec =
+        (long)(dislmdb_config->election_timeout_max_ms % 1000) * 1000000L;
+    pbft_config->timeouts.wait_pre_prepare_ms = dislmdb_config->timeout_ms;
+    pbft_config->timeouts.prepare_certificate_ms = dislmdb_config->timeout_ms;
+    pbft_config->timeouts.commit_certificate_ms = dislmdb_config->timeout_ms;
+    pbft_config->timeouts.view_change_resend_ms = dislmdb_config->election_timeout_max_ms;
+
+    uint64_t batch = dislmdb_config->max_batch_size ? dislmdb_config->max_batch_size : 1;
+    uint64_t msg = batch * (1024ull * 1024ull);
+    if (msg > DISLMDB_MAX_MESSAGE_SIZE) {
+        msg = DISLMDB_MAX_MESSAGE_SIZE;
+    }
+    pbft_config->max_message_size = (size_t)msg;
+    pbft_config->verify_signatures = false; /* digests are TV-B3 */
+    pbft_config->timeouts.enabled = dislmdb_config->enable_liveness;
+}
+
+static void on_network_message(const DISLMDB_network_message *message, void *user_data)
+{
+    dislmdb_pbft_message_handler(message, user_data);
+}
+
+int dislmdb_pbft_init(DISLMDB_env *env)
+{
     if (!env) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
-    // Create node ID from environment's node ID
+
     NodeId *node_id = node_id_create(env->local_node_id);
     if (!node_id) {
         return DISLMDB_ERR_MEMORY_ERROR;
     }
-    
-    // Set up consensus configuration based on DisLMDB settings
+
     ConsensusConfig config = consensus_config_default();
     dislmdb_convert_consensus_config(&env->config.consensus, &config);
-    
-    // Initialize security manager
+
+    /* Replica set: local + known peers (pad to 3f+1 with local-only if solo). */
+    strncpy(config.replica_ids[0], env->local_node_id, EPDFT_NODE_ID_LEN - 1);
+    config.replica_count = 1;
+    pthread_mutex_lock(&env->nodes_mutex);
+    for (uint32_t i = 0; i < env->node_count && config.replica_count < EPDFT_MAX_REPLICAS; i++) {
+        if (strncmp(env->nodes[i].node_id, env->local_node_id, EPDFT_NODE_ID_LEN) == 0) {
+            continue;
+        }
+        strncpy(config.replica_ids[config.replica_count], env->nodes[i].node_id,
+                EPDFT_NODE_ID_LEN - 1);
+        config.replica_count++;
+    }
+    pthread_mutex_unlock(&env->nodes_mutex);
+
+    if (config.replica_count < config.min_nodes) {
+        /* Solo / under-provisioned: force f=0 single-replica semantics */
+        config.fault_tolerance = 0;
+        config.min_nodes = 1;
+        config.replica_count = 1;
+    }
+
     SecurityConfig sec_config = security_config_default();
     SecurityManager *security = security_manager_create(&sec_config);
     if (!security) {
         node_id_destroy(node_id);
         return DISLMDB_ERR_MEMORY_ERROR;
     }
-    
-    // Create consensus core
+
     ConsensusCore *core = consensus_core_create(node_id, &config, security);
     if (!core) {
         security_manager_destroy(security);
         node_id_destroy(node_id);
         return DISLMDB_ERR_MEMORY_ERROR;
     }
-    
-    // Store in environment
+
+    consensus_core_set_outbound(core, outbound_pbft, env);
     env->consensus_context = core;
-    
-    // Subscribe to the broadcast channel
-    global_subscriber_id = broadcast_channel_subscribe(core->commit_channel);
-    if (global_subscriber_id < 0) {
+
+    int sub = broadcast_channel_subscribe(core->commit_channel);
+    if (sub < 0) {
         consensus_core_destroy(core);
         env->consensus_context = NULL;
         return DISLMDB_ERR_CONSENSUS_FAILED;
     }
-    
-    // Register network handlers
-    int rc = dislmdb_network_set_message_callback(env, dislmdb_pbft_message_handler, env);
+    env->pbft_subscriber_id = sub;
+    env->pbft_state.is_primary = consensus_core_is_primary(core);
+    env->pbft_state.f = config.fault_tolerance;
+    env->pbft_state.node_count = config.replica_count;
+    env->pbft_state.view = consensus_core_view(core);
+    env->pbft_state.sequence = (uint32_t)consensus_core_last_committed(core);
+    strncpy(env->pbft_state.primary_id, env->local_node_id,
+            sizeof(env->pbft_state.primary_id) - 1);
+
+    int rc = dislmdb_network_set_message_callback(env, on_network_message, env);
     if (rc != DISLMDB_SUCCESS) {
-        broadcast_channel_unsubscribe(core->commit_channel, global_subscriber_id);
+        broadcast_channel_unsubscribe(core->commit_channel, sub);
         consensus_core_destroy(core);
         env->consensus_context = NULL;
         return rc;
     }
-    
-    // Start the broadcast processing thread
+
     env->consensus_running = true;
-    if (pthread_create(&env->consensus_thread, NULL, 
-                      (void *(*)(void *))dislmdb_pbft_broadcast_thread, env) != 0) {
-        broadcast_channel_unsubscribe(core->commit_channel, global_subscriber_id);
+    if (pthread_create(&env->consensus_thread, NULL, broadcast_thread, env) != 0) {
+        broadcast_channel_unsubscribe(core->commit_channel, sub);
         consensus_core_destroy(core);
         env->consensus_context = NULL;
         env->consensus_running = false;
         return DISLMDB_ERR_THREAD_ERROR;
     }
-    
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", "Enhanced PBFT consensus initialized");
+
+    if (env->config.consensus.enable_liveness) {
+        consensus_core_start_liveness(core);
+    }
+    if (env->config.consensus.persist_state) {
+        (void)dislmdb_persist_load(env);
+    }
+
+    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT",
+                "Enhanced PBFT (TV-BLAKE3) initialized f=%u n=%u liveness=%d",
+                config.fault_tolerance, config.replica_count,
+                (int)env->config.consensus.enable_liveness);
     return DISLMDB_SUCCESS;
 }
 
-int dislmdb_pbft_shutdown(DISLMDB_env *env) {
+int dislmdb_pbft_shutdown(DISLMDB_env *env)
+{
     if (!env || !env->consensus_context) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
-    ConsensusCore *core = (ConsensusCore *)env->consensus_context;
-    
-    // Stop the broadcast thread
+    ConsensusCore *core = env->consensus_context;
     env->consensus_running = false;
     pthread_join(env->consensus_thread, NULL);
-    
-    // Unsubscribe from broadcasts
-    if (global_subscriber_id >= 0) {
-        broadcast_channel_unsubscribe(core->commit_channel, global_subscriber_id);
-        global_subscriber_id = -1;
+    if (env->pbft_subscriber_id >= 0) {
+        broadcast_channel_unsubscribe(core->commit_channel, env->pbft_subscriber_id);
+        env->pbft_subscriber_id = -1;
     }
-    
-    // Clean up consensus
     consensus_core_destroy(core);
     env->consensus_context = NULL;
-    
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", "Enhanced PBFT consensus shut down");
     return DISLMDB_SUCCESS;
 }
 
-void dislmdb_convert_consensus_config(const DISLMDB_consensus_config *dislmdb_config,
-                                     ConsensusConfig *pbft_config) {
-    if (!dislmdb_config || !pbft_config) {
-        return;
-    }
-    
-    // Set fault tolerance (f)
-    // In PBFT, we need 3f+1 nodes to tolerate f failures
-    pbft_config->fault_tolerance = (dislmdb_config->max_batch_size > 0) 
-                                  ? dislmdb_config->max_batch_size 
-                                  : 1;
-    
-    // Calculate minimum nodes
-    pbft_config->min_nodes = 3 * pbft_config->fault_tolerance + 1;
-    
-    // Set timeouts
-    pbft_config->timeouts.prepare_timeout.tv_sec = dislmdb_config->timeout_ms / 1000;
-    pbft_config->timeouts.prepare_timeout.tv_nsec = (dislmdb_config->timeout_ms % 1000) * 1000000;
-    
-    pbft_config->timeouts.commit_timeout.tv_sec = dislmdb_config->timeout_ms / 1000;
-    pbft_config->timeouts.commit_timeout.tv_nsec = (dislmdb_config->timeout_ms % 1000) * 1000000;
-    
-    pbft_config->timeouts.view_change_timeout.tv_sec = 
-        (dislmdb_config->election_timeout_max_ms / 1000);
-    pbft_config->timeouts.view_change_timeout.tv_nsec = 
-        (dislmdb_config->election_timeout_max_ms % 1000) * 1000000;
-    
-    // Set message size limits
-    pbft_config->max_message_size = (dislmdb_config->max_batch_size * 1024 * 1024);
-    
-    // Enable security features
-    pbft_config->verify_signatures = true;
-}
-
-typedef struct {
-    uint32_t txn_id;
-    uint32_t op_count;
-    uint8_t is_write_txn;
-    uint8_t is_distributed;
-    uint32_t db_count;
-    // Followed by operations data
-} TxnHeader;
-
-int dislmdb_pbft_serialize_transaction(DISLMDB_txn *txn, uint8_t **data, size_t *size) {
+int dislmdb_pbft_serialize_transaction(DISLMDB_txn *txn, uint8_t **data, size_t *size)
+{
     if (!txn || !data || !size) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
-    // Calculate size needed
-    size_t header_size = sizeof(TxnHeader);
-    size_t ops_size = 0;
-    
-    // TODO: Calculate size of operations data
-    // This will depend on the specific operations in the transaction
-    
-    // For now, use a simple approach for prototype
-    ops_size = txn->operation_count * 256; // Rough estimate
-    
-    // Allocate memory
-    size_t total_size = header_size + ops_size;
-    uint8_t *buffer = malloc(total_size);
-    if (!buffer) {
+    /* Prefer full operation log when puts/dels were recorded via dislmdb_put/del */
+    if (txn->pending_ops && txn->operation_count > 0) {
+        return dislmdb_serialize_pending_ops(txn, data, size);
+    }
+    /* Fallback marker envelope for empty / legacy write txns */
+    size_t total = 4 + 4 + 4 + 2 + 2 + 8 + 64 + DISLMDB_SHA256_DIGEST_LENGTH;
+    uint8_t *buf = calloc(1, total);
+    if (!buf) {
         return DISLMDB_ERR_MEMORY_ERROR;
     }
-    
-    // Fill header
-    TxnHeader *header = (TxnHeader *)buffer;
-    header->txn_id = (uint32_t)txn->start_time; // Use timestamp as ID
-    header->op_count = txn->operation_count;
-    header->is_write_txn = txn->is_write_txn ? 1 : 0;
-    header->is_distributed = txn->is_distributed ? 1 : 0;
-    header->db_count = txn->env->numdbs;
-    
-    // TODO: Serialize operations data
-    // This will depend on the specific operations in the transaction
-    
-    // For prototype, just fill with sample data
-    memset(buffer + header_size, 0xAA, ops_size);
-    
-    // Return data
-    *data = buffer;
-    *size = total_size;
-    
+    size_t o = 0;
+    dislmdb_write_u32(buf + o, TXN_MAGIC); o += 4;
+    dislmdb_write_u32(buf + o, 1); o += 4;
+    dislmdb_write_u32(buf + o, txn->operation_count); o += 4;
+    buf[o++] = txn->is_write_txn ? 1 : 0;
+    buf[o++] = txn->is_distributed ? 1 : 0;
+    buf[o++] = 0;
+    buf[o++] = 0;
+    dislmdb_write_u64(buf + o, txn->start_time); o += 8;
+    memcpy(buf + o, txn->txn_id, 64); o += 64;
+    uint8_t digest[32];
+    dislmdb_crypto_sha256(txn->txn_id, strnlen(txn->txn_id, sizeof(txn->txn_id)), digest);
+    memcpy(buf + o, digest, 32);
+    o += 32;
+    *data = buf;
+    *size = o;
     return DISLMDB_SUCCESS;
 }
 
-int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t size) {
-    if (!env || !data || size < sizeof(TxnHeader)) {
+int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t size)
+{
+    if (!env || !data) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
-    // Extract header
-    const TxnHeader *header = (const TxnHeader *)data;
-    
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", 
-               "Applying transaction: id=%u, op_count=%u, is_write=%u", 
-               header->txn_id, header->op_count, header->is_write_txn);
-    
-    // TODO: Apply operations from the transaction data
-    // This will depend on the specific operations in the transaction
-    
-    // For prototype, just log success
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", "Transaction applied successfully");
-    
-    return DISLMDB_SUCCESS;
+
+    if (size >= 12 && dislmdb_read_u32(data) == DISLMDB_OPLOG_MAGIC) {
+        int rc = dislmdb_apply_oplog_payload(env, data, size);
+        if (rc == DISLMDB_SUCCESS) {
+            env->consensus_commits++;
+            (void)dislmdb_persist_save(env);
+        }
+        return rc;
+    }
+
+    if (size >= 16 && dislmdb_read_u32(data) == BCOD_MAGIC) {
+        size_t o = 0;
+        (void)dislmdb_read_u32(data + o); o += 4;
+        uint32_t version = dislmdb_read_u32(data + o); o += 4;
+        if (version != 1) {
+            return DISLMDB_ERR_VERSION_MISMATCH;
+        }
+        uint32_t id_len = dislmdb_read_u32(data + o); o += 4;
+        if (id_len == 0 || id_len > 128 || o + id_len + 4 + 8 > size) {
+            return DISLMDB_ERR_MESSAGE_VALIDATION;
+        }
+        char bytecode_id[129];
+        memcpy(bytecode_id, data + o, id_len);
+        bytecode_id[id_len] = '\0';
+        o += id_len;
+        uint32_t options = dislmdb_read_u32(data + o); o += 4;
+        (void)dislmdb_read_u64(data + o); o += 8;
+        const uint8_t *bytecode = data + o;
+        size_t bytecode_size = size - o;
+
+        MDB_txn *txn = NULL;
+        int rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
+        if (rc != 0) {
+            return rc;
+        }
+        MDB_dbi dbi;
+        rc = mdb_dbi_open(txn, BYTECODE_DBI_NAME, MDB_CREATE, &dbi);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+        size_t stored_size = 4 + bytecode_size;
+        uint8_t *stored = malloc(stored_size);
+        if (!stored) {
+            mdb_txn_abort(txn);
+            return DISLMDB_ERR_MEMORY_ERROR;
+        }
+        dislmdb_write_u32(stored, options);
+        memcpy(stored + 4, bytecode, bytecode_size);
+        MDB_val key = {.mv_size = id_len, .mv_data = bytecode_id};
+        MDB_val val = {.mv_size = stored_size, .mv_data = stored};
+        rc = mdb_put(txn, dbi, &key, &val, 0);
+        free(stored);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+        return mdb_txn_commit(txn) == 0 ? DISLMDB_SUCCESS : rc;
+    }
+
+    if (size >= 8 && dislmdb_read_u32(data) == TXN_MAGIC) {
+        return DISLMDB_SUCCESS;
+    }
+    return DISLMDB_ERR_MESSAGE_VALIDATION;
 }
 
-int dislmdb_pbft_propose_transaction(DISLMDB_txn *txn) {
+int dislmdb_pbft_propose_transaction(DISLMDB_txn *txn)
+{
     if (!txn || !txn->env || !txn->env->consensus_context) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
-    // Only process write transactions
     if (!txn->is_write_txn) {
-        // No consensus needed for read-only transactions
         return DISLMDB_SUCCESS;
     }
-    
     DISLMDB_env *env = txn->env;
-    ConsensusCore *core = (ConsensusCore *)env->consensus_context;
-    
-    // Serialize the transaction
+    ConsensusCore *core = env->consensus_context;
+
     uint8_t *txn_data = NULL;
     size_t txn_size = 0;
     int rc = dislmdb_pbft_serialize_transaction(txn, &txn_data, &txn_size);
     if (rc != DISLMDB_SUCCESS) {
         return rc;
     }
-    
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", 
-               "Proposing transaction: size=%zu", txn_size);
-    
-    // Submit to consensus
+
     ConsensusError err = consensus_core_propose(core, txn_data, txn_size);
-    
-    // Free serialized data
     free(txn_data);
-    
-    // Check result
     if (err != CONSENSUS_OK) {
-        dislmdb_log(env, DISLMDB_LOG_ERROR, "PBFT", 
-                   "Failed to propose transaction: error=%d", err);
-        
-        // Map consensus error to DisLMDB error
         switch (err) {
-            case CONSENSUS_ERROR_NOT_LEADER:
-                return DISLMDB_ERR_NO_LEADER;
-            case CONSENSUS_ERROR_TIMEOUT:
-                return DISLMDB_ERR_CONSENSUS_TIMEOUT;
-            case CONSENSUS_ERROR_MEMORY_ERROR:
-                return DISLMDB_ERR_MEMORY_ERROR;
-            default:
-                return DISLMDB_ERR_CONSENSUS_FAILED;
+            case CONSENSUS_ERROR_NOT_LEADER: return DISLMDB_ERR_NO_LEADER;
+            case CONSENSUS_ERROR_TIMEOUT: return DISLMDB_ERR_CONSENSUS_TIMEOUT;
+            case CONSENSUS_ERROR_MEMORY_ERROR: return DISLMDB_ERR_MEMORY_ERROR;
+            case CONSENSUS_ERROR_MESSAGE_TOO_LARGE: return DISLMDB_ERR_BUFFER_OVERFLOW;
+            default: return DISLMDB_ERR_CONSENSUS_FAILED;
         }
     }
-    
+    env->pbft_state.sequence = (uint32_t)consensus_core_last_committed(core);
+    env->pbft_state.view = consensus_core_view(core);
+    env->pbft_state.is_primary = consensus_core_is_primary(core);
     return DISLMDB_SUCCESS;
 }
 
-void dislmdb_pbft_message_handler(const char *node_id, 
-                                 DISLMDB_MESSAGE_TYPE type,
-                                 const uint8_t *data, 
-                                 size_t data_size, 
-                                 void *user_data) {
-    DISLMDB_env *env = (DISLMDB_env *)user_data;
-    if (!env || !env->consensus_context || !node_id || !data) {
+void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *user_data)
+{
+    DISLMDB_env *env = user_data;
+    if (!env || !env->consensus_context || !message || !message->payload) {
         return;
     }
-    
-    ConsensusCore *core = (ConsensusCore *)env->consensus_context;
-    
-    // Map DisLMDB message type to PBFT message type
-    MessageType pbft_type;
-    switch (type) {
-        case DISLMDB_MESSAGE_PREPARE:
-            pbft_type = MSG_PREPARE;
-            break;
-        case DISLMDB_MESSAGE_COMMIT:
-            pbft_type = MSG_COMMIT;
-            break;
-        case DISLMDB_MESSAGE_CHECKPOINT:
-            // No direct mapping, use PRE_PREPARE as a placeholder
-            pbft_type = MSG_PRE_PREPARE;
-            break;
-        default:
-            // Unknown message type
-            dislmdb_log(env, DISLMDB_LOG_WARNING, "PBFT", 
-                       "Received unsupported message type: %d", type);
-            return;
+    ConsensusCore *core = env->consensus_context;
+    PbftMessage msg;
+    if (pbft_message_deserialize(message->payload, message->header.payload_size, &msg) != 0) {
+        return;
     }
-    
-    // Log the message
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", 
-               "Received message: type=%d, size=%zu, from=%s", 
-               type, data_size, node_id);
-    
-    // TODO: Convert DisLMDB message to PBFT message format
-    // This will depend on the specific message formats
-    
-    // For prototype, just acknowledge receipt
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", "Message processed");
+    ConsensusError err = consensus_core_handle_pbft(core, &msg);
+    if (err != CONSENSUS_OK) {
+        dislmdb_log(env, DISLMDB_LOG_WARNING, "PBFT",
+                    "Rejected inbound PBFT message from=%s err=%d",
+                    message->header.sender_id, (int)err);
+    }
+    pbft_message_clear(&msg);
 }
 
-int dislmdb_pbft_store_bytecode(DISLMDB_env *env, 
-                               const uint8_t *bytecode, 
-                               size_t bytecode_size,
-                               const char *bytecode_id,
-                               unsigned int options) {
+int dislmdb_pbft_store_bytecode(DISLMDB_env *env,
+                                const uint8_t *bytecode,
+                                size_t bytecode_size,
+                                const char *bytecode_id,
+                                unsigned int options)
+{
     if (!env || !env->consensus_context || !bytecode || !bytecode_id) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
     if (bytecode_size == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
-    ConsensusCore *core = (ConsensusCore *)env->consensus_context;
-    
-    // Check size limits
-    if (bytecode_size > core->config.max_message_size) {
-        return DISLMDB_ERR_BUFFER_OVERFLOW;
-    }
-    
-    // Create a metadata header for the bytecode
-    uint8_t metadata_header[256];
-    size_t metadata_size = 0;
-    
-    // Format: [Magic(4)] [Version(4)] [ID_Length(4)] [ID(var)] [Options(4)] [Timestamp(8)]
-    uint32_t magic = 0x42434F44; // "BCOD"
-    uint32_t version = 1;
-    uint32_t id_len = strlen(bytecode_id);
-    uint32_t opts = options;
-    uint64_t timestamp = time(NULL);
-    
-    // Check ID length
-    if (id_len > 128) {
+
+    ConsensusCore *core = env->consensus_context;
+    size_t id_len = strnlen(bytecode_id, 129);
+    if (id_len == 0 || id_len > 128) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    
-    // Build metadata
-    memcpy(metadata_header + metadata_size, &magic, sizeof(magic));
-    metadata_size += sizeof(magic);
-    
-    memcpy(metadata_header + metadata_size, &version, sizeof(version));
-    metadata_size += sizeof(version);
-    
-    memcpy(metadata_header + metadata_size, &id_len, sizeof(id_len));
-    metadata_size += sizeof(id_len);
-    
-    memcpy(metadata_header + metadata_size, bytecode_id, id_len);
-    metadata_size += id_len;
-    
-    memcpy(metadata_header + metadata_size, &opts, sizeof(opts));
-    metadata_size += sizeof(opts);
-    
-    memcpy(metadata_header + metadata_size, &timestamp, sizeof(timestamp));
-    metadata_size += sizeof(timestamp);
-    
-    // Allocate buffer for complete message
-    size_t total_size = metadata_size + bytecode_size;
-    uint8_t *buffer = malloc(total_size);
+
+    size_t meta = 4 + 4 + 4 + id_len + 4 + 8;
+    if (meta + bytecode_size > core->config.max_message_size) {
+        return DISLMDB_ERR_BUFFER_OVERFLOW;
+    }
+
+    uint8_t *buffer = malloc(meta + bytecode_size);
     if (!buffer) {
         return DISLMDB_ERR_MEMORY_ERROR;
     }
-    
-    // Combine metadata and bytecode
-    memcpy(buffer, metadata_header, metadata_size);
-    memcpy(buffer + metadata_size, bytecode, bytecode_size);
-    
-    dislmdb_log(env, DISLMDB_LOG_INFO, "PBFT", 
-               "Storing bytecode: id=%s, size=%zu", 
-               bytecode_id, bytecode_size);
-    
-    // Submit to consensus
-    ConsensusError err = consensus_core_propose(core, buffer, total_size);
-    
-    // Free buffer
-    free(buffer);
-    
-    // Check result
+    size_t o = 0;
+    dislmdb_write_u32(buffer + o, BCOD_MAGIC); o += 4;
+    dislmdb_write_u32(buffer + o, 1); o += 4;
+    dislmdb_write_u32(buffer + o, (uint32_t)id_len); o += 4;
+    memcpy(buffer + o, bytecode_id, id_len); o += id_len;
+    dislmdb_write_u32(buffer + o, options); o += 4;
+    dislmdb_write_u64(buffer + o, (uint64_t)time(NULL)); o += 8;
+    memcpy(buffer + o, bytecode, bytecode_size);
+
+    ConsensusError err = consensus_core_propose(core, buffer, meta + bytecode_size);
     if (err != CONSENSUS_OK) {
-        dislmdb_log(env, DISLMDB_LOG_ERROR, "PBFT", 
-                   "Failed to store bytecode: error=%d", err);
-        
-        // Map consensus error to DisLMDB error
+        free(buffer);
         switch (err) {
-            case CONSENSUS_ERROR_NOT_LEADER:
-                return DISLMDB_ERR_NO_LEADER;
-            case CONSENSUS_ERROR_TIMEOUT:
-                return DISLMDB_ERR_CONSENSUS_TIMEOUT;
-            case CONSENSUS_ERROR_MEMORY_ERROR:
-                return DISLMDB_ERR_MEMORY_ERROR;
-            default:
-                return DISLMDB_ERR_CONSENSUS_FAILED;
+            case CONSENSUS_ERROR_NOT_LEADER: return DISLMDB_ERR_NO_LEADER;
+            case CONSENSUS_ERROR_TIMEOUT: return DISLMDB_ERR_CONSENSUS_TIMEOUT;
+            case CONSENSUS_ERROR_MEMORY_ERROR: return DISLMDB_ERR_MEMORY_ERROR;
+            default: return DISLMDB_ERR_CONSENSUS_FAILED;
         }
     }
-    
-    return DISLMDB_SUCCESS;
-} 
+
+    /* Solo path commits synchronously via local dispatch; apply for durability. */
+    int arc = dislmdb_pbft_apply_transaction(env, buffer, meta + bytecode_size);
+    free(buffer);
+    return arc;
+}

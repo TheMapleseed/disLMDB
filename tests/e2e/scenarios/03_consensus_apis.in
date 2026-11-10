@@ -1,0 +1,13 @@
+# Checkpoint, state transfer, metrics after writes
+OPEN path=./e2e_work/03_consensus port=29703
+SET_KEY hex=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+BEGIN
+PUT db=state key=epoch value=1
+PUT db=state key=leader value=node-a
+COMMIT
+CHECKPOINT
+STATE_TRANSFER
+METRICS
+SYNC
+CLOSE
+ECHO scenario_03_complete

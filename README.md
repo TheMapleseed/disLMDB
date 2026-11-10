@@ -23,12 +23,34 @@ DisLMDB is a distributed version of the [Lightning Memory-Mapped Database (LMDB)
 
 ## Building
 
+Makefile (recommended on macOS; no Homebrew required):
+
 ```bash
-mkdir build
-cd build
-cmake ..
-make
+make          # builds libraries, examples, then runs unit + integration + e2e
+make lib      # libraries only
+make check    # re-run the full test suite
 ```
+
+CMake:
+
+```bash
+mkdir build && cd build
+cmake ..
+cmake --build .   # builds and runs CTest via the build_and_test target
+ctest --output-on-failure
+```
+
+### Tests
+
+| Layer | Location | Role |
+| --- | --- | --- |
+| Unit | `tests/unit/` | Crypto, AEAD, TV-BLAKE3 |
+| Integration | `tests/integration/`, `tests/dislmdb_test.c` | Ops, persist, membership, LMDB basics |
+| E2E | `tests/e2e/` | Scenario scripts vs golden `expected/*.out` |
+
+### Attribution
+
+See [TRIBUTE_HOWARD_CHU.md](TRIBUTE_HOWARD_CHU.md) for a tribute to Howard Chu, inventor of LMDB, documenting the English Wikipedia article on Lightning Memory-Mapped Database.
 
 ## Usage
 

@@ -34,6 +34,7 @@
 
 /* Import original LMDB types */
 #include "lmdb.h"
+#include "dislmdb_errors.h"
 
 /** @brief Version information for DisLMDB */
 #define DISLMDB_VERSION_MAJOR 0
@@ -88,6 +89,11 @@ typedef struct DISLMDB_network_config {
     bool is_seed_node;             /**< Whether this node is a seed node */
     char seed_nodes[10][256];      /**< List of seed node addresses */
     size_t seed_node_count;        /**< Number of seed nodes */
+    bool enable_message_auth;      /**< HMAC-authenticate framed messages */
+    uint8_t cluster_key[32];       /**< Shared cluster HMAC/AEAD key */
+    bool has_cluster_key;          /**< Whether cluster_key is populated */
+    bool enable_payload_encryption;/**< AES-CBC+HMAC payload encryption with cluster_key */
+    bool enable_tls;               /**< Request TLS (OpenSSL builds) or AEAD fallback */
 } DISLMDB_network_config;
 
 /** @brief Consensus configuration parameters */
@@ -99,7 +105,26 @@ typedef struct DISLMDB_consensus_config {
     uint32_t election_timeout_max_ms;      /**< Maximum election timeout */
     uint32_t max_batch_size;               /**< Maximum operations in a batch */
     uint32_t checkpoint_interval;          /**< Operations between checkpoints */
+    uint32_t fault_tolerance;              /**< PBFT f — tolerate f faulty nodes (needs 3f+1) */
+    bool enable_liveness;                  /**< Enable view-change timeouts */
+    bool persist_state;                    /**< Persist view/sequence/replicas to meta DB */
 } DISLMDB_consensus_config;
+
+/** @brief Runtime metrics for DisLMDB */
+typedef struct DISLMDB_metrics {
+    uint64_t total_commits;
+    uint64_t total_operations;
+    uint64_t total_sync_bytes;
+    uint64_t consensus_proposes;
+    uint64_t consensus_commits;
+    uint64_t view_changes;
+    uint64_t checkpoints;
+    uint64_t state_transfers;
+    uint32_t current_view;
+    uint64_t last_committed_seq;
+    uint32_t replica_count;
+    uint32_t active_connections;
+} DISLMDB_metrics;
 
 /** @brief Opaque structure for a distributed environment */
 typedef struct DISLMDB_env DISLMDB_env;
@@ -337,5 +362,46 @@ int dislmdb_get_bytecode(DISLMDB_env *env,
                         uint8_t *bytecode,
                         size_t *bytecode_size,
                         unsigned int *options);
+
+/**
+ * @brief Generate or install a shared cluster key (enables message auth)
+ *
+ * If key is NULL, a random 32-byte key is generated. The key is stored in the
+ * environment config and optionally persisted when consensus.persist_state is set.
+ */
+int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32]);
+
+/** @brief Copy the current cluster key (returns DISLMDB_ERR_NOT_INITIALIZED if unset) */
+int dislmdb_get_cluster_key(DISLMDB_env *env, uint8_t out[32]);
+
+/**
+ * @brief Distributed put — records the op for consensus replication
+ */
+int dislmdb_put(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data,
+                unsigned int flags);
+
+/**
+ * @brief Distributed delete — records the op for consensus replication
+ */
+int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data);
+
+/**
+ * @brief Open a named DBI within a distributed transaction (tracks name for replication)
+ */
+int dislmdb_dbi_open(DISLMDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *dbi);
+
+/** @brief Trigger a checkpoint of committed state */
+int dislmdb_checkpoint(DISLMDB_env *env);
+
+/** @brief Request state transfer from the current primary (or any peer) */
+int dislmdb_request_state_transfer(DISLMDB_env *env);
+
+/** @brief Read runtime metrics */
+int dislmdb_get_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics);
+
+/** @brief Reconfigure replica membership (propose CONFIG op when PBFT) */
+int dislmdb_reconfigure_replicas(DISLMDB_env *env,
+                                 const DISLMDB_node_addr *nodes,
+                                 size_t node_count);
 
 #endif /* DISLMDB_H */ 

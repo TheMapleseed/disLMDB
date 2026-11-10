@@ -1,0 +1,29 @@
+VERSION DisLMDB 0.1.0 major=0 minor=1 patch=0
+OPEN rc=0 err=Success
+SET_KEY rc=0 err=Success
+BEGIN rc=0 err=Success
+PUT rc=0 err=Success
+PUT rc=0 err=Success
+COMMIT rc=0 err=Success
+EXPECT_OK pass
+BEGIN rc=0 err=Success
+GET rc=0 value=one
+GET rc=0 value=two
+ABORT ok
+CHECKPOINT rc=0 err=Success
+METRICS commits=yes ops=yes ckpt=yes view=0 seq_nonzero=yes replicas=0
+BEGIN rc=0 err=Success
+DEL rc=0 err=Success
+COMMIT rc=0 err=Success
+BEGIN rc=0 err=Success
+GET rc=-30798 err=MDB_NOTFOUND: No matching key/data pair found
+ABORT ok
+CLOSE ok
+REOPEN rc=0 err=Success
+GET_KEY rc=0 hex=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+BEGIN rc=0 err=Success
+GET rc=0 value=one
+ABORT ok
+CLOSE ok
+ECHO scenario_01_complete
+E2E_DONE failures=0

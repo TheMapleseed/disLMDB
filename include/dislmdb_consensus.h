@@ -21,16 +21,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "dislmdb.h"
+#include "dislmdb_errors.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/** @brief Maximum size of a consensus message */
-#define DISLMDB_MAX_MESSAGE_SIZE 65536
-
-/** @brief Maximum number of nodes in a consensus group */
-#define DISLMDB_MAX_NODES 64
 
 /** @brief Size of the operation ID in bytes */
 #define DISLMDB_OP_ID_SIZE 16

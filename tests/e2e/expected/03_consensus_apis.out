@@ -1,0 +1,13 @@
+OPEN rc=0 err=Success
+SET_KEY rc=0 err=Success
+BEGIN rc=0 err=Success
+PUT rc=0 err=Success
+PUT rc=0 err=Success
+COMMIT rc=0 err=Success
+CHECKPOINT rc=0 err=Success
+STATE_TRANSFER rc=0 err=Success
+METRICS commits=yes ops=yes ckpt=yes view=0 seq_nonzero=yes replicas=0
+SYNC rc=0 err=Success
+CLOSE ok
+ECHO scenario_03_complete
+E2E_DONE failures=0

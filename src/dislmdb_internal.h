@@ -26,17 +26,12 @@
 
 #include "lmdb.h"
 #include "dislmdb.h"
+#include "dislmdb_errors.h"
 #include "dislmdb_consensus.h"
 #include "dislmdb_network.h"
 
 /** @brief Magic number for validation */
-#define DISLMDB_MAGIC 0x44697344  /* "DisD" */
-
-/** @brief Protocol version */
-#define DISLMDB_PROTOCOL_VERSION 1
-
-/** @brief Maximum length of error messages */
-#define DISLMDB_MAX_ERROR_LENGTH 256
+#define DISLMDB_MAGIC DISLMDB_MAGIC_NUMBER
 
 /** @brief Maximum number of log messages to keep */
 #define DISLMDB_MAX_LOG_MESSAGES 1000
@@ -94,6 +89,7 @@ struct DISLMDB_env {
     pthread_t consensus_thread;              /**< Consensus thread handle */
     bool consensus_running;                  /**< Whether the consensus thread is running */
     void *consensus_context;                 /**< Context for the consensus subsystem */
+    int pbft_subscriber_id;                  /**< Broadcast channel subscriber id */
     DISLMDB_pbft_state pbft_state;           /**< Current PBFT state */
     dislmdb_consensus_callback cons_callback; /**< Callback for consensus events */
     void *cons_callback_data;                /**< User data for consensus callback */
@@ -137,7 +133,28 @@ struct DISLMDB_env {
     uint64_t total_commits;                  /**< Total number of committed transactions */
     uint64_t total_operations;               /**< Total number of operations */
     uint64_t total_sync_bytes;               /**< Total bytes synchronized */
+    uint64_t consensus_proposes;
+    uint64_t consensus_commits;
+    uint64_t view_changes;
+    uint64_t checkpoints;
+    uint64_t state_transfers;
+
+    /* Cluster crypto */
+    uint8_t cluster_key[32];
+    bool has_cluster_key;
 };
+
+/** @brief Pending op recorded for replication */
+typedef struct DISLMDB_pending_op {
+    DISLMDB_OP_TYPE type;
+    char dbname[64];
+    uint8_t *key;
+    size_t key_len;
+    uint8_t *val;
+    size_t val_len;
+    unsigned int flags;
+    struct DISLMDB_pending_op *next;
+} DISLMDB_pending_op;
 
 /** @brief Internal transaction structure */
 struct DISLMDB_txn {
@@ -152,7 +169,22 @@ struct DISLMDB_txn {
     uint64_t start_time;         /**< Time when transaction was started */
     uint32_t operation_count;    /**< Number of operations in this transaction */
     char txn_id[64];             /**< Unique transaction ID */
+    DISLMDB_pending_op *pending_ops; /**< Ops to replicate */
+    char open_db_names[32][64];  /**< Names for opened DBIs */
+    MDB_dbi open_db_handles[32];
+    uint32_t open_db_count;
 };
+
+#define DISLMDB_META_DBI "__dislmdb_meta__"
+#define DISLMDB_OPLOG_MAGIC 0x4F504C47u /* OPLG */
+
+int dislmdb_persist_save(DISLMDB_env *env);
+int dislmdb_persist_load(DISLMDB_env *env);
+int dislmdb_serialize_pending_ops(const DISLMDB_txn *txn, uint8_t **out, size_t *out_len);
+int dislmdb_apply_oplog_payload(DISLMDB_env *env, const uint8_t *data, size_t size);
+void dislmdb_free_pending_ops(DISLMDB_txn *txn);
+int dislmdb_network_set_auth_key(DISLMDB_env *env, const uint8_t key[32]);
+int dislmdb_network_set_encryption(DISLMDB_env *env, bool enable);
 
 /**
  * @brief Log a message to the environment's log

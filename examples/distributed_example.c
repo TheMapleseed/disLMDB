@@ -39,6 +39,7 @@ void status_callback(const char *node_id,
                    DISLMDB_NODE_STATE old_state,
                    DISLMDB_NODE_STATE new_state,
                    void *user_data) {
+    (void)user_data;
     const char *states[] = {
         "UNKNOWN", "JOINING", "SYNCING", "NORMAL", "LEADER", 
         "FOLLOWER", "CANDIDATE", "LEAVING"

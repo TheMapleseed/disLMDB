@@ -1,0 +1,13 @@
+OPEN rc=0 err=Success
+SET_KEY rc=0 err=Success
+BYTECODE_STORE rc=0 err=Success
+BYTECODE_GET rc=0 size=10 hex=cafebabe000102030405
+SYNC rc=0 err=Success
+CHECKPOINT rc=0 err=Success
+METRICS commits=no ops=no ckpt=yes view=0 seq_nonzero=yes replicas=0
+CLOSE ok
+REOPEN rc=0 err=Success
+BYTECODE_GET rc=0 size=10 hex=cafebabe000102030405
+CLOSE ok
+ECHO scenario_02_complete
+E2E_DONE failures=0
