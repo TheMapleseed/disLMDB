@@ -28,14 +28,8 @@ int dislmdb_consensus_init(DISLMDB_env *env, const DISLMDB_consensus_config *con
         return DISLMDB_ERR_ALREADY_INITIALIZED;
     }
 
-    if (config->mechanism != DISLMDB_CONSENSUS_SOLO &&
-        config->mechanism != DISLMDB_CONSENSUS_RAFT) {
+    if (config->mechanism != DISLMDB_CONSENSUS_SOLO) {
         return DISLMDB_ERR_CONFIG;
-    }
-
-    if (config->mechanism == DISLMDB_CONSENSUS_RAFT) {
-        dislmdb_log(env, DISLMDB_LOG_WARNING, "CONSENSUS",
-                    "Raft not implemented; falling back to SOLO semantics");
     }
 
     solo_consensus_context *ctx = calloc(1, sizeof(*ctx));

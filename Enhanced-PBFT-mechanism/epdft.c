@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+/* qsort for canonical replica ordering */
 
 #include "dislmdb_crypto.h"
 
@@ -185,6 +186,39 @@ static void refresh_primary(ConsensusCore *core)
     char primary[EPDFT_NODE_ID_LEN];
     primary_id_for_view(&core->config, core->view, primary);
     core->is_primary = (strncmp(primary, core->node_id->id, EPDFT_NODE_ID_LEN) == 0);
+}
+
+static int replica_id_cmp(const void *a, const void *b)
+{
+    return strncmp((const char *)a, (const char *)b, EPDFT_NODE_ID_LEN);
+}
+
+void consensus_core_normalize_replicas(ConsensusCore *core)
+{
+    if (!core || core->config.replica_count <= 1) {
+        if (core) {
+            refresh_primary(core);
+        }
+        return;
+    }
+    pthread_mutex_lock(&core->lock);
+    qsort(core->config.replica_ids, core->config.replica_count,
+          EPDFT_NODE_ID_LEN, replica_id_cmp);
+    /* Deduplicate */
+    uint32_t w = 1;
+    for (uint32_t r = 1; r < core->config.replica_count; r++) {
+        if (strncmp(core->config.replica_ids[r], core->config.replica_ids[w - 1],
+                    EPDFT_NODE_ID_LEN) != 0) {
+            if (w != r) {
+                memcpy(core->config.replica_ids[w], core->config.replica_ids[r],
+                       EPDFT_NODE_ID_LEN);
+            }
+            w++;
+        }
+    }
+    core->config.replica_count = w;
+    refresh_primary(core);
+    pthread_mutex_unlock(&core->lock);
 }
 
 static Slot *slot_get(CoreImpl *impl, uint64_t sequence, bool create)
@@ -1234,14 +1268,13 @@ ConsensusError consensus_core_add_replica(ConsensusCore *core, const char *repli
     strncpy(core->config.replica_ids[core->config.replica_count], replica_id,
             EPDFT_NODE_ID_LEN - 1);
     core->config.replica_count++;
-    /* Keep configured f if still valid; otherwise clamp */
     uint32_t max_f = (core->config.replica_count - 1) / 3u;
     if (core->config.fault_tolerance > max_f) {
         core->config.fault_tolerance = max_f;
     }
     core->config.min_nodes = 3u * core->config.fault_tolerance + 1u;
-    refresh_primary(core);
     pthread_mutex_unlock(&core->lock);
+    consensus_core_normalize_replicas(core);
     return CONSENSUS_OK;
 }
 
@@ -1276,8 +1309,8 @@ ConsensusError consensus_core_remove_replica(ConsensusCore *core, const char *re
     if (core->config.min_nodes == 0) {
         core->config.min_nodes = 1;
     }
-    refresh_primary(core);
     pthread_mutex_unlock(&core->lock);
+    consensus_core_normalize_replicas(core);
     return CONSENSUS_OK;
 }
 

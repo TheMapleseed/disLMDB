@@ -44,7 +44,7 @@
 /** @brief The consensus mechanisms supported by DisLMDB */
 typedef enum DISLMDB_CONSENSUS_MECHANISM {
     DISLMDB_CONSENSUS_PBFT,        /**< Practical Byzantine Fault Tolerance */
-    DISLMDB_CONSENSUS_RAFT,        /**< Raft consensus algorithm (future support) */
+    DISLMDB_CONSENSUS_RAFT,        /**< Raft consensus (local Enhanced-Raft-mechanism) */
     DISLMDB_CONSENSUS_SOLO         /**< Single node mode (no distribution) */
 } DISLMDB_CONSENSUS_MECHANISM;
 
@@ -81,6 +81,18 @@ typedef struct DISLMDB_node_addr {
     char node_id[64];              /**< Unique node identifier */
 } DISLMDB_node_addr;
 
+/** @brief Wire transport for cluster traffic */
+typedef enum DISLMDB_TRANSPORT {
+    DISLMDB_TRANSPORT_TCP = 0,     /**< Reliable stream (default) */
+    DISLMDB_TRANSPORT_UDP = 1,     /**< Datagram path (WebTransport/QUIC-oriented substrate) */
+    /**
+     * Dual listen (TCP + UDP). Signalling (HELLO/JOIN, HEARTBEAT, ELECTION,
+     * LEAVE) prefers UDP; bulk/consensus data prefers TCP. Each path falls
+     * back to the other when the preferred medium is unavailable.
+     */
+    DISLMDB_TRANSPORT_BOTH = 2
+} DISLMDB_TRANSPORT;
+
 /** @brief Network configuration for DisLMDB */
 typedef struct DISLMDB_network_config {
     DISLMDB_node_addr *nodes;      /**< Array of known node addresses */
@@ -93,7 +105,12 @@ typedef struct DISLMDB_network_config {
     uint8_t cluster_key[32];       /**< Shared cluster HMAC/AEAD key */
     bool has_cluster_key;          /**< Whether cluster_key is populated */
     bool enable_payload_encryption;/**< AES-CBC+HMAC payload encryption with cluster_key */
-    bool enable_tls;               /**< Alias: enable payload AEAD (no TLS stack yet) */
+    bool enable_tls;               /**< Legacy alias: enables payload AEAD when mTLS off */
+    bool enable_mtls;              /**< Real mutual TLS 1.3 on the TCP path */
+    DISLMDB_TRANSPORT transport;   /**< TCP, UDP, or both */
+    char tls_cert_path[512];       /**< PEM leaf certificate (mTLS) */
+    char tls_key_path[512];        /**< PEM private key (mTLS) */
+    char tls_ca_path[512];         /**< PEM CA bundle for peer verification (mTLS) */
 } DISLMDB_network_config;
 
 /** @brief Consensus configuration parameters */
@@ -405,4 +422,4 @@ int dislmdb_reconfigure_replicas(DISLMDB_env *env,
                                  const DISLMDB_node_addr *nodes,
                                  size_t node_count);
 
-#endif /* DISLMDB_H */ 
+#endif /* DISLMDB_H */

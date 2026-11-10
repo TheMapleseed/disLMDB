@@ -122,7 +122,8 @@ int main(int argc, char *argv[]) {
     config.consensus.election_timeout_max_ms = 6000;
     config.consensus.max_batch_size = 100;
     config.consensus.checkpoint_interval = 1000;
-    
+    config.consensus.fault_tolerance = 0;
+
     /* Create environment */
     rc = dislmdb_env_create(&env);
     if (rc != 0) {
@@ -133,6 +134,15 @@ int main(int argc, char *argv[]) {
     
     printf("Environment created successfully\n");
     
+    /* Shared cluster key required for multi-node (fail-closed) */
+    if (seed_node_addr || is_seed) {
+        uint8_t cluster_key[32];
+        memset(cluster_key, 0x5A, sizeof(cluster_key));
+        memcpy(config.network.cluster_key, cluster_key, 32);
+        config.network.has_cluster_key = true;
+        config.network.enable_message_auth = true;
+    }
+
     /* Register status callback */
     rc = dislmdb_set_status_callback(env, status_callback, NULL);
     if (rc != 0) {
@@ -187,7 +197,7 @@ int main(int argc, char *argv[]) {
         sleep(3);
     }
     
-    /* Begin transaction */
+    /* Begin distributed write (dislmdb_put — not raw mdb_put) */
     rc = dislmdb_txn_begin(env, NULL, 0, &txn);
     if (rc != 0) {
         fprintf(stderr, "Error beginning transaction: %s\n",
@@ -198,14 +208,10 @@ int main(int argc, char *argv[]) {
     
     printf("Transaction started\n");
     
-    /* Get underlying LMDB transaction for database operations */
-    MDB_txn *mdb_txn = dislmdb_get_lmdb_txn(txn);
-    
-    /* Open database */
-    rc = mdb_dbi_open(mdb_txn, "testdb", MDB_CREATE, &dbi);
+    rc = dislmdb_dbi_open(txn, "testdb", MDB_CREATE, &dbi);
     if (rc != 0) {
         fprintf(stderr, "Error opening database: %s\n",
-                mdb_strerror(rc));
+                dislmdb_strerror(rc));
         dislmdb_txn_abort(txn);
         dislmdb_env_close(env);
         return 1;
@@ -213,7 +219,6 @@ int main(int argc, char *argv[]) {
     
     printf("Database opened\n");
     
-    /* Put data with node-specific key */
     char key_buffer[64];
     snprintf(key_buffer, sizeof(key_buffer), "key-from-%s", node_id);
     
@@ -221,21 +226,20 @@ int main(int argc, char *argv[]) {
     key.mv_size = strlen(key_buffer);
     key.mv_data = key_buffer;
     data.mv_size = strlen(node_id);
-    data.mv_data = (void*)node_id;
+    data.mv_data = (void *)node_id;
     
-    rc = mdb_put(mdb_txn, dbi, &key, &data, 0);
+    rc = dislmdb_put(txn, dbi, &key, &data, 0);
     if (rc != 0) {
         fprintf(stderr, "Error putting data: %s\n",
-                mdb_strerror(rc));
+                dislmdb_strerror(rc));
         dislmdb_txn_abort(txn);
         dislmdb_env_close(env);
         return 1;
     }
     
-    printf("Data inserted: key='%s', value='%s'\n", 
-           (char*)key.mv_data, (char*)data.mv_data);
+    printf("Data inserted: key='%s', value='%s'\n",
+           (char *)key.mv_data, (char *)data.mv_data);
     
-    /* Commit transaction */
     rc = dislmdb_txn_commit(txn);
     if (rc != 0) {
         fprintf(stderr, "Error committing transaction: %s\n",
@@ -244,19 +248,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    printf("Transaction committed\n");
+    printf("Transaction committed via consensus\n");
     printf("Node is running. Press Ctrl+C to exit.\n");
     
-    /* Main loop */
     while (running) {
-        /* Every 10 seconds, perform a read operation to check data */
         for (int i = 0; i < 10 && running; i++) {
             sleep(1);
         }
         
         if (!running) break;
         
-        /* Start a read transaction */
         rc = dislmdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
         if (rc != 0) {
             fprintf(stderr, "Error beginning read transaction: %s\n",
@@ -264,18 +265,15 @@ int main(int argc, char *argv[]) {
             continue;
         }
         
-        mdb_txn = dislmdb_get_lmdb_txn(txn);
-        
-        /* Open database */
-        rc = mdb_dbi_open(mdb_txn, "testdb", 0, &dbi);
+        rc = dislmdb_dbi_open(txn, "testdb", 0, &dbi);
         if (rc != 0) {
             fprintf(stderr, "Error opening database for reading: %s\n",
-                    mdb_strerror(rc));
+                    dislmdb_strerror(rc));
             dislmdb_txn_abort(txn);
             continue;
         }
         
-        /* Setup cursor */
+        MDB_txn *mdb_txn = dislmdb_get_lmdb_txn(txn);
         MDB_cursor *cursor;
         rc = mdb_cursor_open(mdb_txn, dbi, &cursor);
         if (rc != 0) {
@@ -285,15 +283,14 @@ int main(int argc, char *argv[]) {
             continue;
         }
         
-        /* Iterate through all keys */
         printf("\nDatabase contents:\n");
         printf("%-30s | %s\n", "Key", "Value");
         printf("------------------------------+------------------\n");
         
         while ((rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT)) == 0) {
-            printf("%-30.*s | %.*s\n", 
-                   (int)key.mv_size, (char*)key.mv_data,
-                   (int)data.mv_size, (char*)data.mv_data);
+            printf("%-30.*s | %.*s\n",
+                   (int)key.mv_size, (char *)key.mv_data,
+                   (int)data.mv_size, (char *)data.mv_data);
         }
         
         if (rc != MDB_NOTFOUND) {
@@ -301,11 +298,9 @@ int main(int argc, char *argv[]) {
                     mdb_strerror(rc));
         }
         
-        /* Close cursor and abort transaction */
         mdb_cursor_close(cursor);
         dislmdb_txn_abort(txn);
         
-        /* Get the current leader */
         char leader_id[64];
         rc = dislmdb_get_leader(env, leader_id, sizeof(leader_id));
         if (rc != 0) {
@@ -315,13 +310,12 @@ int main(int argc, char *argv[]) {
             printf("\nCurrent leader: %s\n", leader_id);
         }
         
-        /* Force sync with other nodes */
         rc = dislmdb_force_sync(env);
         if (rc != 0) {
             fprintf(stderr, "Error forcing sync: %s\n",
                     dislmdb_strerror(rc));
         } else {
-            printf("Force sync completed\n");
+            printf("Force sync / state transfer requested\n");
         }
     }
     

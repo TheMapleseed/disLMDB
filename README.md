@@ -6,7 +6,9 @@ DisLMDB is a distributed version of the [Lightning Memory-Mapped Database (LMDB)
 
 - **Distributed Database**: Synchronize operations across multiple nodes
 - **ACID Compliance**: Retains all the ACID properties of the original LMDB
-- **Byzantine Fault Tolerance**: Consensus protocol based on Practical Byzantine Fault Tolerance (PBFT)
+- **Byzantine Fault Tolerance**: Consensus via Enhanced-PBFT, plus local **Raft** (`DISLMDB_CONSENSUS_RAFT`)
+- **Transports**: TCP, UDP datagram, and **BOTH** (UDP signalling + TCP data, with fallback)
+- **mTLS 1.3**: Portable mutual TLS (`enable_mtls`) via vendored Mbed TLS — same stack on every host
 - **Modern C Implementation**: Written in modern C (C23 standard)
 - **Zero-Copy Design**: Inherits LMDB's zero-copy memory-mapped architecture for high performance
 - **Node Discovery and Management**: Automatic discovery and management of nodes in the cluster
@@ -16,20 +18,25 @@ DisLMDB is a distributed version of the [Lightning Memory-Mapped Database (LMDB)
 ## Requirements
 
 - C23 compatible compiler (GCC 13+ or Clang 16+)
-- OpenSSL development libraries (libssl-dev)
-- UUID development libraries (uuid-dev)
+- Vendored Mbed TLS under `third_party/mbedtls` (TLS 1.3 mTLS; no OS-specific TLS stack)
+- OpenSSL *libcrypto* on non-Apple hosts (hash/HMAC only), or Apple CommonCrypto on Darwin
+- UUID development libraries (`uuid-dev`) on Linux
 - POSIX-compliant operating system
-- CMake 3.16 or higher (for building)
+- CMake 3.16 or higher (optional; Makefile is the primary build)
 
 ## Building
 
 Makefile (recommended on macOS; no Homebrew required):
 
 ```bash
-make          # builds libraries, examples, then runs unit + integration + e2e
-make lib      # libraries only
-make check    # re-run the full test suite
+make                 # build + sandbox-safe suite (no LMDB mmap)
+make check-sandbox   # unit + mTLS/Raft rigs — safe in Cursor agent sandbox
+make check-integration  # cluster/e2e — needs a normal unsandboxed shell
+make check           # everything
+make lib             # libraries only
 ```
+
+Agent sandboxes block LMDB `mmap`. Use `make check-sandbox` / `tests/rig/` (shared `cluster_rig` covers multinode / UDP / Raft / fault scenarios in-memory); run `make check-integration` locally for full LMDB cluster proof.
 
 CMake:
 
@@ -45,8 +52,17 @@ ctest --output-on-failure
 | Layer | Location | Role |
 | --- | --- | --- |
 | Unit | `tests/unit/` | Crypto, AEAD, TV-BLAKE3 |
+| Rig (sandbox) | `tests/rig/` | In-memory multi-node consensus / mTLS / fault (no LMDB mmap) |
 | Integration | `tests/integration/`, `tests/dislmdb_test.c` | Ops, persist, membership, LMDB basics |
+| Orb (Docker) | `tests/orb/` | Join, spawn, shard-prefix on real containers (OrbStack/Docker) |
 | E2E | `tests/e2e/` | Scenario scripts vs golden `expected/*.out` |
+
+```bash
+make check-sandbox       # agent-safe
+make check-integration   # host LMDB
+make check-orb           # OrbStack / Docker cluster
+make check               # sandbox + unit + integration (+ e2e)
+```
 
 ### Attribution
 

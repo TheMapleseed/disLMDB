@@ -1,22 +1,35 @@
-# DisLMDB Makefile (no Homebrew / no CMake required on macOS)
-# Uses Apple CommonCrypto + uuid from the system SDK.
+# DisLMDB Makefile — portable POSIX build (no platform-localized TLS stacks).
+# mTLS 1.3: vendored Mbed TLS in third_party/mbedtls (same on every host).
+# Hash/HMAC: Apple CommonCrypto on Darwin, OpenSSL libcrypto elsewhere.
 # `make` / `make all` builds libraries, examples, and runs the full test suite.
 
 CC       ?= clang
 STD      ?= -std=c23
 CFLAGS   ?= -O2 -Wall -Wextra -Wpedantic $(STD) -fPIC
-CPPFLAGS += -Iinclude -Isrc -IEnhanced-PBFT-mechanism -DDISLMDB_USE_COMMONCRYPTO
+CPPFLAGS += -Iinclude -Isrc -IEnhanced-PBFT-mechanism -IEnhanced-Raft-mechanism \
+            -Ithird_party/mbedtls/include -DDISLMDB_USE_COMMONCRYPTO
 LDFLAGS  ?=
 LIBS     ?= -lpthread
+
+MBEDTLS_DIR := third_party/mbedtls
+MBEDTLS_LIBDIR := $(MBEDTLS_DIR)/library
+MBEDTLS_LIBS := \
+  $(MBEDTLS_LIBDIR)/libmbedtls.a \
+  $(MBEDTLS_LIBDIR)/libmbedx509.a \
+  $(MBEDTLS_LIBDIR)/libmbedcrypto.a
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   LIBS += -framework Security
   RPATH := -Wl,-rpath,@loader_path/../lib
+  SHARED_EXT := dylib
+  SHARED_FLAGS := -shared -install_name @rpath/libdislmdb.dylib
 else
   LIBS += -luuid -lcrypto
   CPPFLAGS := $(filter-out -DDISLMDB_USE_COMMONCRYPTO,$(CPPFLAGS)) -DDISLMDB_USE_OPENSSL
   RPATH := -Wl,-rpath,'$$ORIGIN/../lib'
+  SHARED_EXT := so
+  SHARED_FLAGS := -shared -Wl,-soname,libdislmdb.so
 endif
 
 BUILD    := build
@@ -31,38 +44,72 @@ DISLMDB_SRCS := \
   src/utils/dislmdb_ops.c \
   src/utils/dislmdb_persist.c \
   src/network/dislmdb_network.c \
+  src/network/dislmdb_mtls.c \
   src/consensus/dislmdb_consensus.c \
   src/consensus/pbft_adapter.c \
+  src/consensus/raft_adapter.c \
   Enhanced-PBFT-mechanism/epdft.c \
   Enhanced-PBFT-mechanism/messaging.c \
   Enhanced-PBFT-mechanism/security_manager.c \
   Enhanced-PBFT-mechanism/blake3_ref.c \
-  Enhanced-PBFT-mechanism/time_variant_blake3.c
+  Enhanced-PBFT-mechanism/time_variant_blake3.c \
+  Enhanced-Raft-mechanism/raft.c
 
 LMDB_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(LMDB_SRCS))
 DISLMDB_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(DISLMDB_SRCS))
 
-UNIT_TESTS := \
-  $(BINDIR)/test_crypto \
-  $(BINDIR)/test_tvb3
+# Sandbox-safe unit tests (no LMDB mmap)
+UNIT_SANDBOX_TESTS := \
+  $(BINDIR)/test_tvb3 \
+  $(BINDIR)/test_raft \
+  $(BINDIR)/test_mtls \
+  $(BINDIR)/test_transport_adapt
+
+# Needs libdislmdb but no env mmap in the happy path
+UNIT_LIB_TESTS := \
+  $(BINDIR)/test_crypto
+
+UNIT_TESTS := $(UNIT_SANDBOX_TESTS) $(UNIT_LIB_TESTS)
+
+# In-memory / TCP rigs — no LMDB env open (safe inside agent sandbox)
+RIG_TESTS := \
+  $(BINDIR)/test_mtls_tcp_rig \
+  $(BINDIR)/test_raft_bus_rig \
+  $(BINDIR)/test_cluster_rig
 
 INTEGRATION_TESTS := \
   $(BINDIR)/test_ops_persist \
-  $(BINDIR)/test_membership
+  $(BINDIR)/test_membership \
+  $(BINDIR)/test_multinode \
+  $(BINDIR)/test_udp \
+  $(BINDIR)/test_mixed \
+  $(BINDIR)/test_mtls_cluster \
+  $(BINDIR)/test_raft_udp \
+  $(BINDIR)/test_fault_tolerance
 
 BASIC_TEST := $(BINDIR)/dislmdb_test
 E2E_RUNNER := $(BINDIR)/e2e_runner
 
-.PHONY: all dirs lib examples test-bins check unit integration e2e test clean
+.PHONY: all dirs lib mbedtls examples test-bins check check-sandbox check-integration \
+        check-orb orb-bins unit unit-sandbox rig integration e2e test clean
 
-# Default: build everything, then run the full suite (unit + integration + e2e)
-all: lib examples test-bins check
+# Default: build + sandbox-safe suite (works under Cursor agent sandbox)
+all: lib examples test-bins check-sandbox
 
 dirs:
 	@mkdir -p $(LIBDIR) $(BINDIR) \
 	  $(OBJDIR)/src/utils $(OBJDIR)/src/network $(OBJDIR)/src/consensus \
-	  $(OBJDIR)/Enhanced-PBFT-mechanism \
+	  $(OBJDIR)/Enhanced-PBFT-mechanism $(OBJDIR)/Enhanced-Raft-mechanism \
 	  $(BUILD)/e2e_work
+
+# Portable TLS 1.3 stack (identical on every host)
+mbedtls: $(MBEDTLS_LIBS)
+
+$(MBEDTLS_LIBS):
+	@test -d $(MBEDTLS_DIR)/library || { \
+	  echo "error: missing $(MBEDTLS_DIR) — vendor Mbed TLS 3.6+ under third_party/mbedtls"; \
+	  exit 1; }
+	$(MAKE) -C $(MBEDTLS_LIBDIR) libmbedtls.a libmbedx509.a libmbedcrypto.a
 
 $(OBJDIR)/src/mdb.o $(OBJDIR)/src/midl.o: CPPFLAGS += -w
 
@@ -73,60 +120,129 @@ $(OBJDIR)/%.o: %.c
 $(LIBDIR)/liblmdb.a: $(LMDB_OBJS) | dirs
 	ar rcs $@ $^
 
-$(LIBDIR)/libdislmdb.dylib: $(DISLMDB_OBJS) $(LIBDIR)/liblmdb.a | dirs
-	$(CC) -shared -o $@ $(DISLMDB_OBJS) -L$(LIBDIR) -llmdb $(LIBS) $(LDFLAGS) \
-	  -install_name @rpath/libdislmdb.dylib
+$(LIBDIR)/libdislmdb.$(SHARED_EXT): $(DISLMDB_OBJS) $(LIBDIR)/liblmdb.a $(MBEDTLS_LIBS) | dirs
+	$(CC) $(SHARED_FLAGS) -o $@ $(DISLMDB_OBJS) -L$(LIBDIR) -llmdb \
+	  $(MBEDTLS_LIBS) $(LIBS) $(LDFLAGS)
 
-lib: $(LIBDIR)/liblmdb.a $(LIBDIR)/libdislmdb.dylib
+lib: $(LIBDIR)/liblmdb.a $(LIBDIR)/libdislmdb.$(SHARED_EXT)
 
 examples: $(BINDIR)/basic_example $(BINDIR)/distributed_example $(BINDIR)/bytecode_example
 
-$(BINDIR)/basic_example: examples/basic_example.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BINDIR)/basic_example: examples/basic_example.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
-$(BINDIR)/distributed_example: examples/distributed_example.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BINDIR)/distributed_example: examples/distributed_example.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
-$(BINDIR)/bytecode_example: examples/bytecode_example.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BINDIR)/bytecode_example: examples/bytecode_example.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
 # --- Test binaries ----------------------------------------------------------
 
-test-bins: $(BASIC_TEST) $(UNIT_TESTS) $(INTEGRATION_TESTS) $(E2E_RUNNER)
+test-bins: $(BASIC_TEST) $(UNIT_TESTS) $(RIG_TESTS) $(INTEGRATION_TESTS) $(E2E_RUNNER)
 
-$(BASIC_TEST): tests/dislmdb_test.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BASIC_TEST): tests/dislmdb_test.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
-$(BINDIR)/test_crypto: tests/unit/test_crypto.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BINDIR)/test_crypto: tests/unit/test_crypto.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
 $(BINDIR)/test_tvb3: tests/unit/test_tvb3.c Enhanced-PBFT-mechanism/time_variant_blake3.c \
 		Enhanced-PBFT-mechanism/blake3_ref.c | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LIBS)
 
-$(BINDIR)/test_ops_persist: tests/integration/test_ops_persist.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BINDIR)/test_raft: tests/unit/test_raft.c Enhanced-Raft-mechanism/raft.c | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_mtls: tests/unit/test_mtls.c src/network/dislmdb_mtls.c $(MBEDTLS_LIBS) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit/test_mtls.c src/network/dislmdb_mtls.c -o $@ \
+	  $(MBEDTLS_LIBS) $(LIBS)
+
+$(BINDIR)/test_transport_adapt: tests/unit/test_transport_adapt.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
-$(BINDIR)/test_membership: tests/integration/test_membership.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BINDIR)/test_mtls_tcp_rig: tests/rig/test_mtls_tcp_rig.c src/network/dislmdb_mtls.c $(MBEDTLS_LIBS) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/rig/test_mtls_tcp_rig.c src/network/dislmdb_mtls.c -o $@ \
+	  $(MBEDTLS_LIBS) $(LIBS)
+
+$(BINDIR)/test_raft_bus_rig: tests/rig/test_raft_bus_rig.c Enhanced-Raft-mechanism/raft.c | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_cluster_rig: tests/rig/test_cluster_rig.c tests/rig/cluster_rig.c \
+		Enhanced-Raft-mechanism/raft.c | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itests/rig $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_ops_persist: tests/integration/test_ops_persist.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
-$(E2E_RUNNER): tests/e2e/e2e_runner.c $(LIBDIR)/libdislmdb.dylib | dirs
+$(BINDIR)/test_membership: tests/integration/test_membership.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
-# --- Test execution (invoked by `all`) --------------------------------------
+$(BINDIR)/test_multinode: tests/integration/test_multinode.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
-unit: $(UNIT_TESTS)
+$(BINDIR)/test_udp: tests/integration/test_udp.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_mixed: tests/integration/test_mixed.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_mtls_cluster: tests/integration/test_mtls_cluster.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_udp: tests/integration/test_raft_udp.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_fault_tolerance: tests/integration/test_fault_tolerance.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(E2E_RUNNER): tests/e2e/e2e_runner.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
+# --- Test execution ---------------------------------------------------------
+
+unit-sandbox: $(UNIT_SANDBOX_TESTS)
 	@echo ""
-	@echo ">>>> Unit tests"
-	@$(BINDIR)/test_crypto
+	@echo ">>>> Unit (sandbox-safe, no LMDB mmap)"
 	@$(BINDIR)/test_tvb3
+	@$(BINDIR)/test_raft
+	@cd $(BUILD) && ./bin/test_mtls
+	@cd $(BUILD) && ./bin/test_transport_adapt
+
+rig: $(RIG_TESTS)
+	@echo ""
+	@echo ">>>> Rigs (mTLS TCP + Raft bus + multi-node cluster — no LMDB)"
+	@cd $(BUILD) && ./bin/test_mtls_tcp_rig
+	@cd $(BUILD) && ./bin/test_raft_bus_rig
+	@cd $(BUILD) && ./bin/test_cluster_rig
+
+# Agent / Cursor sandbox: no mmap required
+check-sandbox: unit-sandbox rig
+	@echo ""
+	@echo "Sandbox-safe suites PASSED (use 'make check-integration' outside the sandbox)."
+
+unit: unit-sandbox $(UNIT_LIB_TESTS)
+	@echo ""
+	@echo ">>>> Unit (lib-backed crypto)"
+	@$(BINDIR)/test_crypto
 
 integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@echo ""
-	@echo ">>>> Integration / basic tests"
+	@echo ">>>> Integration / basic tests (requires unsandboxed mmap)"
 	@cd $(BINDIR) && ./dislmdb_test
 	@cd $(BUILD) && ./bin/test_ops_persist
 	@cd $(BUILD) && ./bin/test_membership
+	@cd $(BUILD) && ./bin/test_multinode
+	@cd $(BUILD) && ./bin/test_udp
+	@cd $(BUILD) && ./bin/test_mixed
+	@cd $(BUILD) && ./bin/test_mtls_cluster
+	@cd $(BUILD) && ./bin/test_raft_udp
+	@cd $(BUILD) && ./bin/test_fault_tolerance
 
 e2e: $(E2E_RUNNER)
 	@echo ""
@@ -134,11 +250,32 @@ e2e: $(E2E_RUNNER)
 	@chmod +x tests/e2e/run_e2e.sh
 	@./tests/e2e/run_e2e.sh $(E2E_RUNNER)
 
-check: unit integration e2e
+check-integration: integration e2e
 	@echo ""
-	@echo "All DisLMDB suites PASSED."
+	@echo "Integration + e2e PASSED."
 
-test: check
+# OrbStack / Docker: real LMDB + join/spawn/shard (requires docker)
+orb-bins: $(BINDIR)/orb_node_agent $(BINDIR)/orb_ctl
+
+$(BINDIR)/orb_node_agent: tests/orb/node_agent.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
+$(BINDIR)/orb_ctl: tests/orb/orb_ctl.c | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LIBS)
+
+check-orb: orb-bins
+	@echo ""
+	@echo ">>>> OrbStack / Docker multi-node (join, spawn, shard-prefix)"
+	@chmod +x tests/orb/run_orb.sh
+	@ORB_CTL=$(BINDIR)/orb_ctl ./tests/orb/run_orb.sh all
+
+# Full suite for a normal terminal / CI (not agent sandbox)
+check: check-sandbox unit check-integration
+	@echo ""
+	@echo "All DisLMDB suites PASSED (add 'make check-orb' when Docker/OrbStack is available)."
+
+test: check-sandbox
 
 clean:
 	rm -rf $(BUILD)
+	-$(MAKE) -C $(MBEDTLS_LIBDIR) clean

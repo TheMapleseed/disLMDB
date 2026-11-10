@@ -141,6 +141,11 @@ int dislmdb_persist_load(DISLMDB_env *env)
     if (env->consensus_context && env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         ConsensusCore *core = env->consensus_context;
         consensus_core_restore(core, env->pbft_state.view, env->pbft_state.sequence);
+        if (env->has_cluster_key) {
+            security_manager_set_cluster_key(core->security, env->cluster_key);
+            core->config.verify_signatures = true;
+        }
+        consensus_core_normalize_replicas(core);
     }
     return DISLMDB_SUCCESS;
 }

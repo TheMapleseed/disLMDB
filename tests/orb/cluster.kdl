@@ -1,0 +1,75 @@
+// DisLMDB OrbStack / Docker multi-node topology + scenarios.
+// Source of truth for `tests/orb/run_orb.sh` (no YAML).
+
+cluster {
+    name "dislmdb-orb"
+    image "dislmdb-orb:local"
+    network "dislmdb-orb-net"
+    // Shared HMAC key for peer auth (test-only; 32 zero-padded hex bytes → 0x5A fill)
+    cluster_key_mode "fill-0x5A"
+    fault_tolerance 0
+    consensus "pbft"
+    // Default mixed mode: UDP signalling + TCP data (DISLMDB_TRANSPORT_BOTH)
+    transport "both"
+}
+
+// peer_port = DisLMDB wire; admin_port = line-oriented control plane (test harness only)
+node n0 {
+    hostname "n0"
+    peer_port 9876
+    admin_port 19876
+    seed true
+    data_dir "/data"
+}
+
+node n1 {
+    hostname "n1"
+    peer_port 9876
+    admin_port 19876
+    seed false
+    join "n0:9876"
+    data_dir "/data"
+}
+
+node n2 {
+    hostname "n2"
+    peer_port 9876
+    admin_port 19876
+    seed false
+    join "n0:9876"
+    data_dir "/data"
+}
+
+// Spawned mid-scenario (join / reconfigure)
+node n3 {
+    hostname "n3"
+    peer_port 9876
+    admin_port 19876
+    seed false
+    join "n0:9876"
+    data_dir "/data"
+    spawn_on_demand true
+}
+
+scenario replicate {
+    // Put on seed; expect on followers after sync
+    put node="n0" key="alpha" value="omega"
+    wait_get node="n1" key="alpha" value="omega" timeout_ms=8000
+    wait_get node="n2" key="alpha" value="omega" timeout_ms=8000
+}
+
+scenario join_spawn {
+    // Bring n3 online and wire it into the cluster
+    spawn "n3"
+    join from="n0" peer="n3" peer_port=9876 node_id="n3"
+    put node="n0" key="joined" value="yes"
+    wait_get node="n3" key="joined" value="yes" timeout_ms=12000
+}
+
+scenario shard_affinity {
+    // Convention until native shard API: prefix = shard id; verify placement reads
+    put node="n0" key="shardA/item1" value="a1"
+    put node="n0" key="shardB/item1" value="b1"
+    wait_get node="n1" key="shardA/item1" value="a1" timeout_ms=8000
+    wait_get node="n2" key="shardB/item1" value="b1" timeout_ms=8000
+}

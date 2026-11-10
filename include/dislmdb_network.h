@@ -229,6 +229,29 @@ int dislmdb_network_disconnect(DISLMDB_env *env,
                               const char *node_id);
 
 /**
+ * @brief Bind a connection's node_id once the peer's real identity is known
+ *
+ * Replaces empty or seed-* placeholders. Optionally updates listen port.
+ *
+ * @param env The distributed environment handle
+ * @param old_or_empty Previous connection label (may be seed-* or empty)
+ * @param real_node_id Canonical peer identity from HELLO
+ * @param listen_port Peer's listen port (0 to leave unchanged)
+ * @return 0 on success, non-zero on error
+ */
+int dislmdb_network_bind_peer_id(DISLMDB_env *env,
+                                 const char *old_or_empty,
+                                 const char *real_node_id,
+                                 uint16_t listen_port);
+
+/**
+ * @brief True for signalling traffic (HELLO/JOIN, HEARTBEAT, ELECTION, LEAVE)
+ *
+ * Under DISLMDB_TRANSPORT_BOTH these prefer UDP; data/consensus prefer TCP.
+ */
+bool dislmdb_network_is_signalling(DISLMDB_MESSAGE_TYPE type);
+
+/**
  * @brief Create a network message
  * 
  * @param message Output: The message structure to initialize

@@ -8,13 +8,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <pthread.h>
 
 #include "dislmdb_errors.h"
 #include "dislmdb_crypto.h"
+#include "dislmdb_network.h"
 
 #define BYTECODE_DBI_NAME "__dislmdb_bytecode__"
 #define TXN_MAGIC 0x4454584Eu
 #define BCOD_MAGIC 0x42434F44u
+#define HELO_MAGIC 0x48454C4Fu /* HELO */
 
 static void *broadcast_thread(void *arg)
 {
@@ -130,12 +134,17 @@ int dislmdb_pbft_init(DISLMDB_env *env)
     ConsensusConfig config = consensus_config_default();
     dislmdb_convert_consensus_config(&env->config.consensus, &config);
 
-    /* Replica set: local + known peers (pad to 3f+1 with local-only if solo). */
+    /* Replica set: local + known peers. Order is normalized (sorted) so every
+     * node computes the same primary for a given view. */
     strncpy(config.replica_ids[0], env->local_node_id, EPDFT_NODE_ID_LEN - 1);
     config.replica_count = 1;
     pthread_mutex_lock(&env->nodes_mutex);
     for (uint32_t i = 0; i < env->node_count && config.replica_count < EPDFT_MAX_REPLICAS; i++) {
         if (strncmp(env->nodes[i].node_id, env->local_node_id, EPDFT_NODE_ID_LEN) == 0) {
+            continue;
+        }
+        /* Skip unresolved seed placeholders — real IDs arrive via HELLO */
+        if (strncmp(env->nodes[i].node_id, "seed-", 5) == 0) {
             continue;
         }
         strncpy(config.replica_ids[config.replica_count], env->nodes[i].node_id,
@@ -145,10 +154,9 @@ int dislmdb_pbft_init(DISLMDB_env *env)
     pthread_mutex_unlock(&env->nodes_mutex);
 
     if (config.replica_count < config.min_nodes) {
-        /* Solo / under-provisioned: force f=0 single-replica semantics */
+        /* Solo / under-provisioned: force f=0 until peers join via HELLO */
         config.fault_tolerance = 0;
         config.min_nodes = 1;
-        config.replica_count = 1;
     }
 
     SecurityConfig sec_config = security_config_default();
@@ -167,6 +175,7 @@ int dislmdb_pbft_init(DISLMDB_env *env)
 
     consensus_core_set_outbound(core, outbound_pbft, env);
     env->consensus_context = core;
+    consensus_core_normalize_replicas(core);
     if (env->has_cluster_key) {
         security_manager_set_cluster_key(core->security, env->cluster_key);
     }
@@ -344,6 +353,69 @@ int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t
     return DISLMDB_ERR_MESSAGE_VALIDATION;
 }
 
+static int wait_committed_after(ConsensusCore *core, uint64_t before, uint32_t timeout_ms)
+{
+    uint64_t start = (uint64_t)time(NULL) * 1000ull;
+    while (consensus_core_last_committed(core) <= before) {
+        uint64_t now = (uint64_t)time(NULL) * 1000ull;
+        if (now - start > timeout_ms) {
+            return DISLMDB_ERR_CONSENSUS_TIMEOUT;
+        }
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    return DISLMDB_SUCCESS;
+}
+
+typedef struct {
+    DISLMDB_env *env;
+    uint8_t *data;
+    size_t size;
+} forwarded_propose_job;
+
+static void *forwarded_propose_thread(void *arg)
+{
+    forwarded_propose_job *job = arg;
+    if (job && job->env && job->env->consensus_context) {
+        ConsensusError err = consensus_core_propose(job->env->consensus_context,
+                                                   job->data, job->size);
+        if (err != CONSENSUS_OK) {
+            dislmdb_log(job->env, DISLMDB_LOG_WARNING, "PBFT",
+                        "Forwarded write propose failed err=%d", (int)err);
+        }
+    }
+    if (job) {
+        free(job->data);
+        free(job);
+    }
+    return NULL;
+}
+
+static int forward_oplog_to_primary(DISLMDB_env *env, const uint8_t *data, size_t size)
+{
+    ConsensusCore *core = env->consensus_context;
+    char primary[EPDFT_NODE_ID_LEN];
+    consensus_core_primary_id(core, primary);
+    if (primary[0] == '\0' ||
+        strncmp(primary, env->local_node_id, EPDFT_NODE_ID_LEN) == 0) {
+        return DISLMDB_ERR_NO_LEADER;
+    }
+    uint64_t before = consensus_core_last_committed(core);
+    DISLMDB_network_message nm;
+    int rc = dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_SYNC_REQUEST,
+                                            data, (uint32_t)size, primary);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    strncpy(nm.header.sender_id, env->local_node_id, sizeof(nm.header.sender_id) - 1);
+    rc = dislmdb_network_send(env, &nm, primary, env->config.consensus.timeout_ms);
+    dislmdb_network_free_message(&nm);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    return wait_committed_after(core, before, env->config.consensus.timeout_ms);
+}
+
 int dislmdb_pbft_propose_transaction(DISLMDB_txn *txn)
 {
     if (!txn || !txn->env || !txn->env->consensus_context) {
@@ -363,16 +435,41 @@ int dislmdb_pbft_propose_transaction(DISLMDB_txn *txn)
     }
 
     ConsensusError err = consensus_core_propose(core, txn_data, txn_size);
-    free(txn_data);
-    if (err != CONSENSUS_OK) {
+    if (err == CONSENSUS_ERROR_NOT_LEADER) {
+        /* Forward oplog to the current primary and wait for cluster commit */
+        rc = forward_oplog_to_primary(env, txn_data, txn_size);
+        if (rc != DISLMDB_SUCCESS) {
+            free(txn_data);
+            return rc;
+        }
+    } else if (err != CONSENSUS_OK) {
+        free(txn_data);
         switch (err) {
-            case CONSENSUS_ERROR_NOT_LEADER: return DISLMDB_ERR_NO_LEADER;
             case CONSENSUS_ERROR_TIMEOUT: return DISLMDB_ERR_CONSENSUS_TIMEOUT;
             case CONSENSUS_ERROR_MEMORY_ERROR: return DISLMDB_ERR_MEMORY_ERROR;
             case CONSENSUS_ERROR_MESSAGE_TOO_LARGE: return DISLMDB_ERR_BUFFER_OVERFLOW;
             default: return DISLMDB_ERR_CONSENSUS_FAILED;
         }
     }
+
+    /*
+     * Cluster has a commit certificate. Drop the staging LMDB write txn first
+     * (LMDB allows only one writer) then apply the oplog so durability matches
+     * followers. Apply is idempotent if the commit-channel worker also runs.
+     */
+    if (txn->mdb_txn) {
+        mdb_txn_abort(txn->mdb_txn);
+        txn->mdb_txn = NULL;
+    }
+    if (txn_size >= 12 && dislmdb_read_u32(txn_data) == DISLMDB_OPLOG_MAGIC) {
+        rc = dislmdb_pbft_apply_transaction(env, txn_data, txn_size);
+        if (rc != DISLMDB_SUCCESS) {
+            free(txn_data);
+            return rc;
+        }
+    }
+    free(txn_data);
+
     env->pbft_state.sequence = (uint32_t)consensus_core_last_committed(core);
     env->pbft_state.view = consensus_core_view(core);
     env->pbft_state.is_primary = consensus_core_is_primary(core);
@@ -380,10 +477,181 @@ int dislmdb_pbft_propose_transaction(DISLMDB_txn *txn)
     return DISLMDB_SUCCESS;
 }
 
+static void replace_seed_node_id(DISLMDB_env *env, const char *real_id,
+                                 const char *hostname, uint16_t port)
+{
+    pthread_mutex_lock(&env->nodes_mutex);
+    for (uint32_t i = 0; i < env->node_count; i++) {
+        if (strncmp(env->nodes[i].node_id, "seed-", 5) != 0) {
+            continue;
+        }
+        bool same_host = (hostname && hostname[0] != '\0' &&
+                          strcmp(env->nodes[i].hostname, hostname) == 0);
+        bool same_port = (port != 0 && env->nodes[i].port == port);
+        if (same_host || same_port || env->nodes[i].port == port) {
+            strncpy(env->nodes[i].node_id, real_id, sizeof(env->nodes[i].node_id) - 1);
+            env->nodes[i].node_id[sizeof(env->nodes[i].node_id) - 1] = '\0';
+            if (hostname && hostname[0] != '\0') {
+                strncpy(env->nodes[i].hostname, hostname, sizeof(env->nodes[i].hostname) - 1);
+            }
+            if (port != 0) {
+                env->nodes[i].port = port;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&env->nodes_mutex);
+}
+
+static void handle_hello(DISLMDB_env *env, const DISLMDB_network_message *message)
+{
+    if (!message->payload || message->header.payload_size < 4 + 2 + 1) {
+        return;
+    }
+    const uint8_t *p = message->payload;
+    if (dislmdb_read_u32(p) != HELO_MAGIC) {
+        return;
+    }
+    uint16_t peer_port = dislmdb_read_u16(p + 4);
+    uint8_t id_len = p[6];
+    if ((size_t)7 + id_len > message->header.payload_size || id_len == 0 || id_len >= 64) {
+        return;
+    }
+    char peer_id[64];
+    memset(peer_id, 0, sizeof(peer_id));
+    memcpy(peer_id, p + 7, id_len);
+
+    /* Ignore self-advertisements */
+    if (strncmp(peer_id, env->local_node_id, 63) == 0) {
+        return;
+    }
+
+    DISLMDB_node_addr addr;
+    memset(&addr, 0, sizeof(addr));
+    strncpy(addr.node_id, peer_id, sizeof(addr.node_id) - 1);
+    strncpy(addr.hostname, "127.0.0.1", sizeof(addr.hostname) - 1);
+    addr.port = peer_port;
+
+    /* Prefer hostname already known on the wire connection */
+    DISLMDB_connection_info ci;
+    if (message->header.sender_id[0] != '\0' &&
+        dislmdb_network_get_connection_info(env, message->header.sender_id, &ci) == DISLMDB_SUCCESS) {
+        if (ci.hostname[0] != '\0') {
+            strncpy(addr.hostname, ci.hostname, sizeof(addr.hostname) - 1);
+        }
+    } else if (dislmdb_network_get_connection_info(env, peer_id, &ci) == DISLMDB_SUCCESS) {
+        if (ci.hostname[0] != '\0') {
+            strncpy(addr.hostname, ci.hostname, sizeof(addr.hostname) - 1);
+        }
+    }
+
+    bool already_known = false;
+    pthread_mutex_lock(&env->nodes_mutex);
+    for (uint32_t i = 0; i < env->node_count; i++) {
+        if (strncmp(env->nodes[i].node_id, peer_id, 63) == 0) {
+            already_known = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&env->nodes_mutex);
+
+    replace_seed_node_id(env, peer_id, addr.hostname, peer_port);
+    (void)dislmdb_network_bind_peer_id(env, message->header.sender_id, peer_id, peer_port);
+    (void)dislmdb_add_node_internal(env, &addr);
+
+    if (env->consensus_context) {
+        (void)consensus_core_add_replica(env->consensus_context, peer_id);
+        consensus_core_recompute_faults(env->consensus_context,
+                                       env->config.consensus.fault_tolerance);
+    }
+    dislmdb_log(env, DISLMDB_LOG_INFO, "HELLO",
+                "Learned peer id=%s port=%u", peer_id, (unsigned)peer_port);
+
+    /* One-shot reply so the peer can drop its seed-* label (avoid HELLO loops) */
+    if (!already_known) {
+        (void)dislmdb_pbft_send_hello(env, peer_id);
+    }
+}
+
+int dislmdb_pbft_send_hello(DISLMDB_env *env, const char *target_node_id)
+{
+    if (!env) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    size_t id_len = strnlen(env->local_node_id, 63);
+    uint8_t buf[4 + 2 + 1 + 64];
+    size_t o = 0;
+    dislmdb_write_u32(buf + o, HELO_MAGIC); o += 4;
+    dislmdb_write_u16(buf + o, env->config.network.local_port
+                                    ? env->config.network.local_port
+                                    : DISLMDB_DEFAULT_PORT);
+    o += 2;
+    buf[o++] = (uint8_t)id_len;
+    memcpy(buf + o, env->local_node_id, id_len);
+    o += id_len;
+
+    DISLMDB_network_message nm;
+    const char *target = (target_node_id && target_node_id[0] != '\0') ? target_node_id : NULL;
+    int rc = dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_JOIN, buf, (uint32_t)o, target);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    strncpy(nm.header.sender_id, env->local_node_id, sizeof(nm.header.sender_id) - 1);
+
+    if (!target) {
+        rc = dislmdb_network_broadcast(env, &nm, DISLMDB_DEFAULT_NETWORK_TIMEOUT_MS);
+    } else {
+        rc = dislmdb_network_send(env, &nm, target, DISLMDB_DEFAULT_NETWORK_TIMEOUT_MS);
+        if (rc != DISLMDB_SUCCESS) {
+            rc = dislmdb_network_broadcast(env, &nm, DISLMDB_DEFAULT_NETWORK_TIMEOUT_MS);
+        }
+    }
+    dislmdb_network_free_message(&nm);
+    return rc;
+}
+
 void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *user_data)
 {
     DISLMDB_env *env = user_data;
-    if (!env || !env->consensus_context || !message || !message->payload) {
+    if (!env || !message) {
+        return;
+    }
+
+    /* Membership HELLO */
+    if (message->header.type == DISLMDB_MESSAGE_JOIN) {
+        handle_hello(env, message);
+        return;
+    }
+
+    /* Client write forwarded to primary — never block the network thread */
+    if (message->header.type == DISLMDB_MESSAGE_SYNC_REQUEST &&
+        env->consensus_context && message->payload) {
+        ConsensusCore *core = env->consensus_context;
+        if (consensus_core_is_primary(core)) {
+            forwarded_propose_job *job = malloc(sizeof(*job));
+            if (!job) {
+                return;
+            }
+            job->env = env;
+            job->size = message->header.payload_size;
+            job->data = malloc(job->size ? job->size : 1);
+            if (!job->data) {
+                free(job);
+                return;
+            }
+            memcpy(job->data, message->payload, job->size);
+            pthread_t th;
+            if (pthread_create(&th, NULL, forwarded_propose_thread, job) != 0) {
+                free(job->data);
+                free(job);
+                return;
+            }
+            pthread_detach(th);
+        }
+        return;
+    }
+
+    if (!env->consensus_context || !message->payload) {
         return;
     }
     ConsensusCore *core = env->consensus_context;
@@ -391,8 +659,6 @@ void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *
     if (pbft_message_deserialize(message->payload, message->header.payload_size, &msg) != 0) {
         return;
     }
-    /* Bind replica identity to the authenticated transport sender, not the
-     * attacker-controlled PBFT `from` field inside the payload. */
     if (message->header.sender_id[0] != '\0') {
         if (msg.from[0] != '\0' &&
             strncmp(msg.from, message->header.sender_id, EPDFT_NODE_ID_LEN) != 0) {

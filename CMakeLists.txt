@@ -48,14 +48,26 @@ if(ENABLE_SANITIZER)
     endif()
 endif()
 
-option(DISLMDB_USE_OPENSSL "Use OpenSSL instead of platform crypto" OFF)
+option(DISLMDB_USE_OPENSSL "Use OpenSSL for hash/HMAC (non-Apple hosts)" OFF)
 find_package(OpenSSL QUIET)
 find_package(Threads REQUIRED)
+
+# Portable mTLS 1.3 — vendored Mbed TLS (identical on every host)
+set(MBEDTLS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls)
+if(NOT EXISTS ${MBEDTLS_DIR}/library/CMakeLists.txt AND NOT EXISTS ${MBEDTLS_DIR}/library/Makefile)
+    message(FATAL_ERROR "Vendored Mbed TLS missing at ${MBEDTLS_DIR}")
+endif()
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(${MBEDTLS_DIR} ${CMAKE_BINARY_DIR}/mbedtls EXCLUDE_FROM_ALL)
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-PBFT-mechanism
+    ${CMAKE_CURRENT_SOURCE_DIR}/Enhanced-Raft-mechanism
+    ${MBEDTLS_DIR}/include
 )
 
 set(LMDB_SOURCES src/mdb.c src/midl.c)
@@ -78,30 +90,36 @@ set(DISLMDB_SRCS
     src/utils/dislmdb_ops.c
     src/utils/dislmdb_persist.c
     src/network/dislmdb_network.c
+    src/network/dislmdb_mtls.c
     src/consensus/dislmdb_consensus.c
     src/consensus/pbft_adapter.c
+    src/consensus/raft_adapter.c
+    Enhanced-Raft-mechanism/raft.c
     ${ENHANCED_PBFT_SRCS}
 )
 
 add_library(dislmdb SHARED ${DISLMDB_SRCS})
 target_compile_options(dislmdb PRIVATE ${DISLMDB_EXTRA_WARNINGS})
 
+target_link_libraries(dislmdb PRIVATE mbedtls mbedx509 mbedcrypto)
+message(STATUS "mTLS backend: vendored Mbed TLS 1.3 (portable)")
+
 if(DISLMDB_USE_OPENSSL AND OPENSSL_FOUND)
     target_compile_definitions(dislmdb PRIVATE DISLMDB_USE_OPENSSL)
     target_include_directories(dislmdb PRIVATE ${OPENSSL_INCLUDE_DIR})
     target_link_libraries(dislmdb PRIVATE OpenSSL::Crypto)
-    message(STATUS "Crypto backend: OpenSSL")
+    message(STATUS "Hash/HMAC backend: OpenSSL")
 elseif(APPLE)
     target_compile_definitions(dislmdb PRIVATE DISLMDB_USE_COMMONCRYPTO)
     target_link_libraries(dislmdb PRIVATE "-framework Security")
-    message(STATUS "Crypto backend: Apple CommonCrypto/Security")
+    message(STATUS "Hash/HMAC backend: CommonCrypto")
 elseif(OPENSSL_FOUND)
     target_compile_definitions(dislmdb PRIVATE DISLMDB_USE_OPENSSL)
     target_include_directories(dislmdb PRIVATE ${OPENSSL_INCLUDE_DIR})
     target_link_libraries(dislmdb PRIVATE OpenSSL::Crypto)
-    message(STATUS "Crypto backend: OpenSSL (auto)")
+    message(STATUS "Hash/HMAC backend: OpenSSL (auto)")
 else()
-    message(FATAL_ERROR "No crypto backend available. Install OpenSSL or build on Apple.")
+    message(FATAL_ERROR "No hash/HMAC backend. Install OpenSSL libcrypto or build on Apple.")
 endif()
 
 set_target_properties(dislmdb PROPERTIES
@@ -158,6 +176,44 @@ add_executable(test_membership tests/integration/test_membership.c)
 target_link_libraries(test_membership dislmdb)
 add_test(NAME integration_membership COMMAND test_membership WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_multinode tests/integration/test_multinode.c)
+target_link_libraries(test_multinode dislmdb)
+add_test(NAME integration_multinode COMMAND test_multinode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_udp tests/integration/test_udp.c)
+target_link_libraries(test_udp dislmdb)
+add_test(NAME integration_udp COMMAND test_udp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_mixed tests/integration/test_mixed.c)
+target_link_libraries(test_mixed dislmdb)
+add_test(NAME integration_mixed COMMAND test_mixed WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_transport_adapt tests/unit/test_transport_adapt.c)
+target_link_libraries(test_transport_adapt dislmdb)
+add_test(NAME unit_transport_adapt COMMAND test_transport_adapt)
+
+add_executable(test_mtls_cluster tests/integration/test_mtls_cluster.c)
+target_link_libraries(test_mtls_cluster dislmdb)
+add_test(NAME integration_mtls_cluster COMMAND test_mtls_cluster WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_udp tests/integration/test_raft_udp.c)
+target_link_libraries(test_raft_udp dislmdb)
+add_test(NAME integration_raft_udp COMMAND test_raft_udp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_fault_tolerance tests/integration/test_fault_tolerance.c)
+target_link_libraries(test_fault_tolerance dislmdb)
+add_test(NAME integration_fault_tolerance COMMAND test_fault_tolerance WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft tests/unit/test_raft.c Enhanced-Raft-mechanism/raft.c)
+target_include_directories(test_raft PRIVATE Enhanced-Raft-mechanism)
+target_link_libraries(test_raft PRIVATE Threads::Threads)
+add_test(NAME unit_raft COMMAND test_raft)
+
+add_executable(test_mtls tests/unit/test_mtls.c src/network/dislmdb_mtls.c)
+target_include_directories(test_mtls PRIVATE ${MBEDTLS_DIR}/include src/network)
+target_link_libraries(test_mtls PRIVATE mbedtls mbedx509 mbedcrypto Threads::Threads)
+add_test(NAME unit_mtls COMMAND test_mtls WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(e2e_runner tests/e2e/e2e_runner.c)
 target_link_libraries(e2e_runner dislmdb)
 
@@ -170,7 +226,9 @@ add_test(
 # Run the full suite as part of the default build (`cmake --build` / `make`)
 add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS dislmdb_test test_crypto test_tvb3 test_ops_persist test_membership e2e_runner
+    DEPENDS dislmdb_test test_crypto test_tvb3 test_raft test_mtls test_transport_adapt
+            test_ops_persist test_membership test_multinode test_udp test_mixed
+            test_mtls_cluster test_raft_udp test_fault_tolerance e2e_runner
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running DisLMDB unit, integration, and e2e suites"
 )

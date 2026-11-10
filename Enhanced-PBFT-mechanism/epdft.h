@@ -140,6 +140,9 @@ ConsensusError consensus_core_request_state(ConsensusCore *core, uint64_t after_
 ConsensusError consensus_core_add_replica(ConsensusCore *core, const char *replica_id);
 ConsensusError consensus_core_remove_replica(ConsensusCore *core, const char *replica_id);
 
+/** Lexicographically sort replica_ids so every node shares the same primary rotation. */
+void consensus_core_normalize_replicas(ConsensusCore *core);
+
 /** Restore durable consensus counters after restart. */
 void consensus_core_restore(ConsensusCore *core, uint64_t view, uint64_t last_committed);
 
