@@ -7,7 +7,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 #include <errno.h>
 /* qsort for canonical replica ordering */
 
@@ -59,6 +58,10 @@ typedef struct CoreImpl {
     bool propose_inflight;
     uint64_t propose_seq;
     pthread_cond_t commit_cv;
+    /* PREPARE deferred until PRE-PREPARE has been outbound (primary path) */
+    bool in_pp_dispatch;
+    bool defer_prepare;
+    PbftMessage deferred_prepare;
 } CoreImpl;
 
 
@@ -306,6 +309,36 @@ static ConsensusError dispatch(ConsensusCore *core, const PbftMessage *msg)
     PbftMessage signed_msg = *msg;
     /* Deep-copy is not needed for data pointer — same lifetime as caller */
     sign_message(core, &signed_msg);
+    /*
+     * For PRE-PREPARE: run local handling first (install slot + data), outbound
+     * PRE-PREPARE, then outbound the nested PREPARE. Nested dispatch used to
+     * emit PREPARE on the wire before PRE-PREPARE; followers dropped it (no
+     * slot) and lost quorum when a replica was down. Early-PREPARE buffering
+     * in on_prepare is the safety net for residual reordering.
+     */
+    if (signed_msg.type == MSG_PRE_PREPARE) {
+        CoreImpl *impl = core->impl;
+        if (impl) {
+            impl->in_pp_dispatch = true;
+        }
+        ConsensusError local = consensus_core_handle_pbft(core, &signed_msg);
+        if (impl) {
+            impl->in_pp_dispatch = false;
+        }
+        if (core->outbound) {
+            core->outbound(&signed_msg, core->outbound_user);
+        }
+        if (local == CONSENSUS_OK && impl && impl->defer_prepare) {
+            impl->defer_prepare = false;
+            PbftMessage prep = impl->deferred_prepare;
+            memset(&impl->deferred_prepare, 0, sizeof(impl->deferred_prepare));
+            ConsensusError perr = dispatch(core, &prep);
+            if (perr != CONSENSUS_OK) {
+                local = perr;
+            }
+        }
+        return local;
+    }
     ConsensusError local = consensus_core_handle_pbft(core, &signed_msg);
     if (core->outbound) {
         core->outbound(&signed_msg, core->outbound_user);
@@ -519,10 +552,23 @@ static ConsensusError on_pre_prepare(ConsensusCore *core, const PbftMessage *msg
     }
 
     PbftMessage prepare;
+    PbftMessage commit;
     memset(&prepare, 0, sizeof(prepare));
+    memset(&commit, 0, sizeof(commit));
     bool send_prepare = false;
+    bool send_commit = false;
+    uint8_t *commit_data = NULL;
+    size_t commit_len = 0;
+    bool executed = false;
+    uint32_t q = consensus_config_quorum(&core->config);
 
     if (!slot->sent_prepare) {
+        /* Early PREPAREs may have filled digest already — require agreement */
+        if (slot->prepare_bits != 0 &&
+            !security_manager_digest_eq(slot->digest, msg->digest)) {
+            pthread_mutex_unlock(&core->lock);
+            return CONSENSUS_OK;
+        }
         if (!slot->data && msg->data_len > 0) {
             slot->data = malloc(msg->data_len);
             if (!slot->data) {
@@ -543,14 +589,75 @@ static ConsensusError on_pre_prepare(ConsensusCore *core, const PbftMessage *msg
         prepare.sequence = msg->sequence;
         memcpy(prepare.digest, msg->digest, SECURITY_DIGEST_LEN);
         strncpy(prepare.from, core->node_id->id, sizeof(prepare.from) - 1);
-        send_prepare = true;
+        if (impl->in_pp_dispatch) {
+            /* Primary propose path: flush PREPARE after PRE-PREPARE outbound */
+            impl->deferred_prepare = prepare;
+            impl->defer_prepare = true;
+            send_prepare = false;
+        } else {
+            send_prepare = true;
+        }
+        /*
+         * Followers: buffered early votes may already meet quorum now that
+         * the payload is installed. Primary propose path defers PREPARE and
+         * must not emit COMMIT before PRE-PREPARE hits the wire.
+         */
+        if (!impl->in_pp_dispatch) {
+            uint32_t prepares = (uint32_t)__builtin_popcountll(slot->prepare_bits);
+            if (prepares >= q && !slot->sent_commit) {
+                slot->sent_commit = true;
+                if (self >= 0) {
+                    slot->commit_bits |= (1ull << self);
+                }
+                commit.type = MSG_COMMIT;
+                commit.view = msg->view;
+                commit.sequence = msg->sequence;
+                memcpy(commit.digest, slot->digest, SECURITY_DIGEST_LEN);
+                strncpy(commit.from, core->node_id->id, sizeof(commit.from) - 1);
+                send_commit = true;
+            }
+            uint32_t commits = (uint32_t)__builtin_popcountll(slot->commit_bits);
+            if (commits >= q && !slot->executed) {
+                slot->executed = true;
+                if (slot->data_len > 0 && slot->data) {
+                    commit_data = malloc(slot->data_len);
+                    if (commit_data) {
+                        memcpy(commit_data, slot->data, slot->data_len);
+                        commit_len = slot->data_len;
+                    }
+                }
+                if (msg->sequence > core->last_committed_seq) {
+                    core->last_committed_seq = msg->sequence;
+                }
+                history_push(impl, msg->sequence, commit_data, commit_len);
+                core->metrics.commits++;
+                if (impl->propose_inflight && impl->propose_seq == msg->sequence) {
+                    impl->propose_inflight = false;
+                }
+                slot_clear(slot);
+                executed = true;
+                arm_liveness(core, LIVE_WAIT_PRE_PREPARE,
+                             core->config.timeouts.wait_pre_prepare_ms);
+                pthread_cond_broadcast(&impl->commit_cv);
+            }
+        }
     }
     pthread_mutex_unlock(&core->lock);
 
-    if (send_prepare) {
-        return dispatch(core, &prepare);
+    if (executed) {
+        if (commit_data && commit_len > 0) {
+            (void)broadcast_channel_publish(core->commit_channel, commit_data, commit_len);
+        }
+        free(commit_data);
     }
-    return CONSENSUS_OK;
+    ConsensusError err = CONSENSUS_OK;
+    if (send_prepare) {
+        err = dispatch(core, &prepare);
+    }
+    if (send_commit && err == CONSENSUS_OK) {
+        err = dispatch(core, &commit);
+    }
+    return err;
 }
 
 static ConsensusError on_prepare(ConsensusCore *core, const PbftMessage *msg)
@@ -571,14 +678,31 @@ static ConsensusError on_prepare(ConsensusCore *core, const PbftMessage *msg)
         return CONSENSUS_OK;
     }
     CoreImpl *impl = core->impl;
+    /*
+     * PREPAREs may arrive before PRE-PREPARE when nested dispatch outbounds
+     * PREPARE first, or when duplicate TCP paths reorder. Accept early votes
+     * into a digest-keyed slot; PRE-PREPARE later fills payload.
+     */
     Slot *slot = slot_get(impl, msg->sequence, false);
-    if (!slot || !security_manager_digest_eq(slot->digest, msg->digest)) {
+    if (!slot) {
+        slot = slot_get(impl, msg->sequence, true);
+        if (!slot) {
+            pthread_mutex_unlock(&core->lock);
+            return CONSENSUS_ERROR_MEMORY_ERROR;
+        }
+        memcpy(slot->digest, msg->digest, SECURITY_DIGEST_LEN);
+    } else if (!security_manager_digest_eq(slot->digest, msg->digest)) {
         pthread_mutex_unlock(&core->lock);
         return CONSENSUS_OK;
     }
     slot->prepare_bits |= (1ull << from_i);
+    /*
+     * Do not form a prepare certificate until PRE-PREPARE has installed the
+     * payload (sent_prepare). Early PREPAREs are buffered so reordering cannot
+     * commit an empty slot and skip the real oplog.
+     */
     uint32_t prepares = (uint32_t)__builtin_popcountll(slot->prepare_bits);
-    if (prepares >= q && !slot->sent_commit) {
+    if (slot->sent_prepare && prepares >= q && !slot->sent_commit) {
         slot->sent_commit = true;
         int self = replica_index(&core->config, core->node_id->id);
         if (self >= 0) {
@@ -624,7 +748,8 @@ static ConsensusError on_commit(ConsensusCore *core, const PbftMessage *msg)
     }
     slot->commit_bits |= (1ull << from_i);
     uint32_t commits = (uint32_t)__builtin_popcountll(slot->commit_bits);
-    if (commits >= q) {
+    /* Require PRE-PREPARE acceptance so we never commit a payload-less slot */
+    if (commits >= q && slot->sent_prepare && !slot->executed) {
         slot->executed = true;
         if (slot->data_len > 0 && slot->data) {
             commit_data = malloc(slot->data_len);
@@ -1220,6 +1345,26 @@ void consensus_core_stop_liveness(ConsensusCore *core)
     }
     impl->live_running = false;
     pthread_join(impl->live_thread, NULL);
+}
+
+ConsensusError consensus_core_trigger_view_change(ConsensusCore *core)
+{
+    if (!core || !core->impl) {
+        return CONSENSUS_ERROR_INVALID_PARAMETER;
+    }
+    pthread_mutex_lock(&core->lock);
+    uint64_t nv = core->view + 1;
+    uint64_t stable = core->last_committed_seq;
+    pthread_mutex_unlock(&core->lock);
+
+    PbftMessage vc;
+    memset(&vc, 0, sizeof(vc));
+    vc.type = MSG_VIEW_CHANGE;
+    vc.view = nv;
+    vc.last_stable_seq = stable;
+    strncpy(vc.from, core->node_id->id, sizeof(vc.from) - 1);
+    /* Local handle via dispatch counts the switch in on_view_change when quorum met. */
+    return dispatch(core, &vc);
 }
 
 ConsensusError consensus_core_checkpoint(ConsensusCore *core)

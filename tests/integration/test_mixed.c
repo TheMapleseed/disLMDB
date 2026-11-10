@@ -41,7 +41,7 @@ static int open_both(DISLMDB_env **out, const char *path, const char *name,
     cfg.network.transport = DISLMDB_TRANSPORT_BOTH;
     cfg.network.has_cluster_key = true;
     cfg.network.enable_message_auth = true;
-    cfg.network.enable_payload_encryption = false;
+    cfg.network.enable_payload_encryption = true;
     cfg.network.enable_mtls = false;
     memcpy(cfg.network.cluster_key, key, 32);
     if (peers && npeers) {

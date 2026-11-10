@@ -197,8 +197,16 @@ int dislmdb_consensus_get_operation_status(DISLMDB_env *env,
                                           const DISLMDB_op_id *id,
                                           DISLMDB_consensus_result *result);
 
+/**
+ * @brief Copy the most recently recorded consensus operation id
+ *
+ * Populated by SOLO propose and PBFT/Raft commit recording.
+ * @return DISLMDB_ERR_NOT_INITIALIZED when no op has been recorded yet
+ */
+int dislmdb_consensus_get_last_op_id(DISLMDB_env *env, DISLMDB_op_id *id);
+
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* DISLMDB_CONSENSUS_H */ 
+#endif /* DISLMDB_CONSENSUS_H */

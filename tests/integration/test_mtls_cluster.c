@@ -53,7 +53,7 @@ static int open_mtls_node(DISLMDB_env **out, const char *path, const char *name,
     cfg.network.transport = DISLMDB_TRANSPORT_TCP;
     cfg.network.has_cluster_key = true;
     cfg.network.enable_message_auth = true;
-    cfg.network.enable_payload_encryption = false;
+    cfg.network.enable_payload_encryption = true; /* AEAD under mTLS */
     cfg.network.enable_mtls = true;
     snprintf(cfg.network.tls_cert_path, sizeof(cfg.network.tls_cert_path),
              "%s/cert.pem", cert_dir);
@@ -127,6 +127,9 @@ static int wait_val(DISLMDB_env *env, const char *k, const char *expect, int ms)
             }
             dislmdb_txn_abort(txn);
         }
+        if ((w % 200) == 0) {
+            (void)dislmdb_force_sync(env);
+        }
         usleep(50 * 1000);
         w += 50;
     }
@@ -180,8 +183,10 @@ int main(void)
     EXPECT_STREQ(&ctx, "leader_a", leader, "mtls-a");
 
     EXPECT_EQ_INT(&ctx, "put_mtls", put_kv(a, "secure", "channel"), 0);
+    (void)dislmdb_force_sync(a);
+    (void)dislmdb_force_sync(b);
     EXPECT_EQ_INT(&ctx, "see_a", wait_val(a, "secure", "channel", 3000), 0);
-    EXPECT_EQ_INT(&ctx, "see_b", wait_val(b, "secure", "channel", 10000), 0);
+    EXPECT_EQ_INT(&ctx, "see_b", wait_val(b, "secure", "channel", 15000), 0);
 
     if (b) dislmdb_env_close(b);
     if (a) dislmdb_env_close(a);

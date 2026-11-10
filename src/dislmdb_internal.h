@@ -139,9 +139,18 @@ struct DISLMDB_env {
     uint64_t checkpoints;
     uint64_t state_transfers;
 
+    /* Last recorded consensus op (for get_last_op_id / status follow-up) */
+    DISLMDB_op_id last_op_id;
+    bool has_last_op_id;
+
     /* Cluster crypto */
     uint8_t cluster_key[32];
     bool has_cluster_key;
+
+    /* Shard map (key-prefix → owner affinity) */
+    pthread_mutex_t shard_mutex;
+    DISLMDB_shard_desc shards[DISLMDB_MAX_SHARDS];
+    uint32_t shard_count;
 };
 
 /** @brief Pending op recorded for replication */
@@ -177,12 +186,35 @@ struct DISLMDB_txn {
 
 #define DISLMDB_META_DBI "__dislmdb_meta__"
 #define DISLMDB_OPLOG_MAGIC 0x4F504C47u /* OPLG */
+#define DISLMDB_SMAP_MAGIC 0x534D4150u  /* SMAP — shard map consensus blob */
+#define DISLMDB_LEAV_MAGIC 0x4C454156u  /* LEAV — graceful leave */
+#define DISLMDB_DQGM_MAGIC 0x4451474Du  /* DQGM — UDP datagram session envelope */
+#define DISLMDB_DGRAM_ENVELOPE_V1_SIZE 16 /* magic+ver+flags+stream+cid */
+#define DISLMDB_DGRAM_ENVELOPE_V2_SIZE 24 /* v1 + pkt_num (QUIC-oriented) */
+#define DISLMDB_DGRAM_ENVELOPE_SIZE DISLMDB_DGRAM_ENVELOPE_V2_SIZE
+#define DISLMDB_DQGM_VERSION 2
 
 int dislmdb_persist_save(DISLMDB_env *env);
 int dislmdb_persist_load(DISLMDB_env *env);
 int dislmdb_serialize_pending_ops(const DISLMDB_txn *txn, uint8_t **out, size_t *out_len);
 int dislmdb_apply_oplog_payload(DISLMDB_env *env, const uint8_t *data, size_t size);
+/** Install shard map locally (no consensus propose). */
+int dislmdb_shard_map_install(DISLMDB_env *env,
+                              const DISLMDB_shard_desc *shards,
+                              size_t count);
+/** Apply a committed SMAP consensus payload. */
+int dislmdb_shard_map_apply_payload(DISLMDB_env *env, const uint8_t *data, size_t size);
+/** Encode shard descriptors into an owned SMAP buffer. */
+int dislmdb_shard_map_encode(const DISLMDB_shard_desc *shards,
+                             size_t count,
+                             uint8_t **out,
+                             size_t *out_len);
 void dislmdb_free_pending_ops(DISLMDB_txn *txn);
+/** Record a consensus outcome into the env operation-status ring. */
+void dislmdb_record_consensus_result(DISLMDB_env *env,
+                                     const DISLMDB_op_id *op_id,
+                                     DISLMDB_OP_TYPE type,
+                                     const DISLMDB_consensus_result *result);
 int dislmdb_network_set_auth_key(DISLMDB_env *env, const uint8_t key[32]);
 int dislmdb_network_set_encryption(DISLMDB_env *env, bool enable);
 

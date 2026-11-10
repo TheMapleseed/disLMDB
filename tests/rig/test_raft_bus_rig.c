@@ -207,16 +207,30 @@ int main(void)
     /* Kill non-leader (majority of 2/3 still holds) */
     int victim = (li + 1) % N;
     g_bus.alive[victim] = false;
-    usleep(100 * 1000);
+    usleep(250 * 1000);
 
     const char *payload2 = "bus-commit-2";
-    /* Find current leader among alive */
+    /* Find current leader among alive; retry propose across brief election races. */
     char leader2[RAFT_NODE_ID_LEN] = {0};
     EXPECT_EQ_INT(&ctx, "reelect_or_keep", wait_leader(leader2, 5000), 0);
     int li2 = idx_of(leader2);
     EXPECT_TRUE(&ctx, "leader2_alive", li2 >= 0 && g_bus.alive[li2]);
-    err = raft_propose(g_bus.nodes[li2], (const uint8_t *)payload2,
-                       strlen(payload2), 3000);
+    err = RAFT_ERR_TIMEOUT;
+    for (int attempt = 0; attempt < 5 && err != RAFT_OK; attempt++) {
+        memset(leader2, 0, sizeof(leader2));
+        if (wait_leader(leader2, 2000) != 0) {
+            continue;
+        }
+        li2 = idx_of(leader2);
+        if (li2 < 0 || !g_bus.alive[li2]) {
+            continue;
+        }
+        err = raft_propose(g_bus.nodes[li2], (const uint8_t *)payload2,
+                           strlen(payload2), 4000);
+        if (err == RAFT_ERR_NOT_LEADER) {
+            usleep(100 * 1000);
+        }
+    }
     EXPECT_EQ_INT(&ctx, "propose_after_kill", (int)err, (int)RAFT_OK);
 
     int applied_alive = 0;

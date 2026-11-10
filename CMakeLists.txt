@@ -89,6 +89,7 @@ set(DISLMDB_SRCS
     src/utils/dislmdb_crypto.c
     src/utils/dislmdb_ops.c
     src/utils/dislmdb_persist.c
+    src/utils/dislmdb_shard.c
     src/network/dislmdb_network.c
     src/network/dislmdb_mtls.c
     src/consensus/dislmdb_consensus.c
@@ -172,9 +173,17 @@ add_executable(test_ops_persist tests/integration/test_ops_persist.c)
 target_link_libraries(test_ops_persist dislmdb)
 add_test(NAME integration_ops_persist COMMAND test_ops_persist WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_op_status tests/integration/test_op_status.c)
+target_link_libraries(test_op_status dislmdb)
+add_test(NAME integration_op_status COMMAND test_op_status WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_membership tests/integration/test_membership.c)
 target_link_libraries(test_membership dislmdb)
 add_test(NAME integration_membership COMMAND test_membership WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_shard_map tests/integration/test_shard_map.c)
+target_link_libraries(test_shard_map dislmdb)
+add_test(NAME integration_shard_map COMMAND test_shard_map WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_multinode tests/integration/test_multinode.c)
 target_link_libraries(test_multinode dislmdb)
@@ -200,6 +209,42 @@ add_executable(test_raft_udp tests/integration/test_raft_udp.c)
 target_link_libraries(test_raft_udp dislmdb)
 add_test(NAME integration_raft_udp COMMAND test_raft_udp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_raft_tcp tests/integration/test_raft_tcp.c)
+target_link_libraries(test_raft_tcp dislmdb)
+add_test(NAME integration_raft_tcp COMMAND test_raft_tcp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_both tests/integration/test_raft_both.c)
+target_link_libraries(test_raft_both dislmdb)
+add_test(NAME integration_raft_both COMMAND test_raft_both WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_mtls tests/integration/test_raft_mtls.c)
+target_link_libraries(test_raft_mtls dislmdb)
+add_test(NAME integration_raft_mtls COMMAND test_raft_mtls WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_mtls_tcp tests/integration/test_raft_mtls_tcp.c)
+target_link_libraries(test_raft_mtls_tcp dislmdb)
+add_test(NAME integration_raft_mtls_tcp COMMAND test_raft_mtls_tcp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_fault tests/integration/test_raft_fault.c)
+target_link_libraries(test_raft_fault dislmdb)
+add_test(NAME integration_raft_fault COMMAND test_raft_fault WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_stage tests/integration/test_raft_stage.c)
+target_link_libraries(test_raft_stage dislmdb)
+add_test(NAME integration_raft_stage COMMAND test_raft_stage WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_membership_it tests/integration/test_raft_membership.c)
+target_link_libraries(test_raft_membership_it dislmdb)
+add_test(NAME integration_raft_membership COMMAND test_raft_membership_it WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_leave tests/integration/test_raft_leave.c)
+target_link_libraries(test_raft_leave dislmdb)
+add_test(NAME integration_raft_leave COMMAND test_raft_leave WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_pbft_viewchange tests/integration/test_pbft_viewchange.c)
+target_link_libraries(test_pbft_viewchange dislmdb)
+add_test(NAME integration_pbft_viewchange COMMAND test_pbft_viewchange WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_fault_tolerance tests/integration/test_fault_tolerance.c)
 target_link_libraries(test_fault_tolerance dislmdb)
 add_test(NAME integration_fault_tolerance COMMAND test_fault_tolerance WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -208,6 +253,11 @@ add_executable(test_raft tests/unit/test_raft.c Enhanced-Raft-mechanism/raft.c)
 target_include_directories(test_raft PRIVATE Enhanced-Raft-mechanism)
 target_link_libraries(test_raft PRIVATE Threads::Threads)
 add_test(NAME unit_raft COMMAND test_raft)
+
+add_executable(test_raft_membership tests/unit/test_raft_membership.c Enhanced-Raft-mechanism/raft.c)
+target_include_directories(test_raft_membership PRIVATE Enhanced-Raft-mechanism)
+target_link_libraries(test_raft_membership PRIVATE Threads::Threads)
+add_test(NAME unit_raft_membership COMMAND test_raft_membership)
 
 add_executable(test_mtls tests/unit/test_mtls.c src/network/dislmdb_mtls.c)
 target_include_directories(test_mtls PRIVATE ${MBEDTLS_DIR}/include src/network)
@@ -226,9 +276,13 @@ add_test(
 # Run the full suite as part of the default build (`cmake --build` / `make`)
 add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS dislmdb_test test_crypto test_tvb3 test_raft test_mtls test_transport_adapt
-            test_ops_persist test_membership test_multinode test_udp test_mixed
-            test_mtls_cluster test_raft_udp test_fault_tolerance e2e_runner
+    DEPENDS dislmdb_test test_crypto test_tvb3 test_raft test_raft_membership
+            test_mtls test_transport_adapt
+            test_ops_persist test_op_status test_membership test_shard_map test_multinode test_udp test_mixed
+            test_mtls_cluster test_raft_udp test_raft_tcp test_raft_both
+            test_raft_mtls test_raft_mtls_tcp test_raft_fault test_raft_stage
+            test_raft_membership_it test_raft_leave test_pbft_viewchange
+            test_fault_tolerance e2e_runner
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running DisLMDB unit, integration, and e2e suites"
 )

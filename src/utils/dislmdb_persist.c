@@ -15,6 +15,10 @@
 #define META_KEY_SEQ "last_committed_seq"
 #define META_KEY_CK "cluster_key"
 #define META_KEY_REPLICAS "replicas"
+#define META_KEY_SHARDS "shard_map"
+
+/* Packed shard: count u32 + N * (64 + 128 + 64) */
+#define SHARD_PACK_SIZE (DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN + 64)
 
 int dislmdb_persist_save(DISLMDB_env *env)
 {
@@ -91,6 +95,36 @@ int dislmdb_persist_save(DISLMDB_env *env)
         mdb_txn_abort(txn);
         return rc;
     }
+
+    pthread_mutex_lock(&env->shard_mutex);
+    uint32_t sc = env->shard_count;
+    size_t ssize = 4 + (size_t)sc * SHARD_PACK_SIZE;
+    uint8_t *sbuf = calloc(1, ssize ? ssize : 4);
+    if (!sbuf) {
+        pthread_mutex_unlock(&env->shard_mutex);
+        mdb_txn_abort(txn);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    dislmdb_write_u32(sbuf, sc);
+    for (uint32_t i = 0; i < sc; i++) {
+        size_t o = 4 + (size_t)i * SHARD_PACK_SIZE;
+        memcpy(sbuf + o, env->shards[i].shard_id, DISLMDB_SHARD_ID_LEN);
+        memcpy(sbuf + o + DISLMDB_SHARD_ID_LEN, env->shards[i].key_prefix,
+               DISLMDB_SHARD_PREFIX_LEN);
+        memcpy(sbuf + o + DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN,
+               env->shards[i].owner_node_id, 64);
+    }
+    pthread_mutex_unlock(&env->shard_mutex);
+    k.mv_size = strlen(META_KEY_SHARDS);
+    k.mv_data = (void *)META_KEY_SHARDS;
+    v.mv_size = ssize;
+    v.mv_data = sbuf;
+    rc = mdb_put(txn, dbi, &k, &v, 0);
+    free(sbuf);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return rc;
+    }
     return mdb_txn_commit(txn);
 }
 
@@ -135,6 +169,33 @@ int dislmdb_persist_load(DISLMDB_env *env)
         env->config.network.has_cluster_key = true;
         env->config.network.enable_message_auth = true;
         memcpy(env->config.network.cluster_key, env->cluster_key, 32);
+    }
+    k.mv_size = strlen(META_KEY_SHARDS);
+    k.mv_data = (void *)META_KEY_SHARDS;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 4) {
+        uint32_t sc = dislmdb_read_u32(v.mv_data);
+        size_t need = 4 + (size_t)sc * SHARD_PACK_SIZE;
+        if (sc <= DISLMDB_MAX_SHARDS && v.mv_size >= need) {
+            pthread_mutex_lock(&env->shard_mutex);
+            memset(env->shards, 0, sizeof(env->shards));
+            env->shard_count = sc;
+            for (uint32_t i = 0; i < sc; i++) {
+                size_t o = 4 + (size_t)i * SHARD_PACK_SIZE;
+                memcpy(env->shards[i].shard_id, (uint8_t *)v.mv_data + o,
+                       DISLMDB_SHARD_ID_LEN);
+                env->shards[i].shard_id[DISLMDB_SHARD_ID_LEN - 1] = '\0';
+                memcpy(env->shards[i].key_prefix,
+                       (uint8_t *)v.mv_data + o + DISLMDB_SHARD_ID_LEN,
+                       DISLMDB_SHARD_PREFIX_LEN);
+                env->shards[i].key_prefix[DISLMDB_SHARD_PREFIX_LEN - 1] = '\0';
+                memcpy(env->shards[i].owner_node_id,
+                       (uint8_t *)v.mv_data + o + DISLMDB_SHARD_ID_LEN +
+                           DISLMDB_SHARD_PREFIX_LEN,
+                       64);
+                env->shards[i].owner_node_id[63] = '\0';
+            }
+            pthread_mutex_unlock(&env->shard_mutex);
+        }
     }
     mdb_txn_abort(txn);
 

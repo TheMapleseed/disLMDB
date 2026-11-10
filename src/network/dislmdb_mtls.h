@@ -50,6 +50,9 @@ int dislmdb_mtls_send(dislmdb_mtls_session *s, const void *buf, size_t len);
 int dislmdb_mtls_recv(dislmdb_mtls_session *s, void *buf, size_t len, size_t *got);
 void dislmdb_mtls_session_close(dislmdb_mtls_session *s);
 
+/** @brief True if mbedtls has buffered application data (select may not wake). */
+bool dislmdb_mtls_pending(const dislmdb_mtls_session *s);
+
 /** @brief True if this build provides real TLS 1.3 mTLS */
 bool dislmdb_mtls_available(void);
 

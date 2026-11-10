@@ -181,6 +181,7 @@ static void destroy_mutexes(DISLMDB_env *e)
     pthread_mutex_destroy(&e->nodes_mutex);
     pthread_mutex_destroy(&e->status_mutex);
     pthread_mutex_destroy(&e->log_mutex);
+    pthread_mutex_destroy(&e->shard_mutex);
 }
 
 int dislmdb_env_create(DISLMDB_env **env)
@@ -205,7 +206,8 @@ int dislmdb_env_create(DISLMDB_env **env)
         pthread_mutex_init(&e->oplog_mutex, NULL) != 0 ||
         pthread_mutex_init(&e->nodes_mutex, NULL) != 0 ||
         pthread_mutex_init(&e->status_mutex, NULL) != 0 ||
-        pthread_mutex_init(&e->log_mutex, NULL) != 0) {
+        pthread_mutex_init(&e->log_mutex, NULL) != 0 ||
+        pthread_mutex_init(&e->shard_mutex, NULL) != 0) {
         mdb_env_close(e->mdb_env);
         free(e);
         return DISLMDB_ERR_THREAD_ERROR;
@@ -412,16 +414,15 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
             return rc;
         }
         dislmdb_log(env, DISLMDB_LOG_INFO, "INIT", "Enhanced PBFT consensus initialized");
-        (void)dislmdb_pbft_send_hello(env, "");
     } else if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        /* Stage 1: arm Raft + JOIN handler; elections stay off until mesh engages. */
         rc = dislmdb_raft_init(env);
         if (rc != DISLMDB_SUCCESS) {
             dislmdb_set_error(env, rc, "Failed to initialize Raft consensus");
             env_open_cleanup(env, true, true, false);
             return rc;
         }
-        dislmdb_log(env, DISLMDB_LOG_INFO, "INIT", "Raft consensus initialized");
-        (void)dislmdb_pbft_send_hello(env, "");
+        dislmdb_log(env, DISLMDB_LOG_INFO, "INIT", "Raft consensus armed (pre-start)");
     } else {
         rc = dislmdb_consensus_init(env, &env->config.consensus);
         if (rc != DISLMDB_SUCCESS) {
@@ -436,7 +437,9 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
         if (env->config.network.enable_payload_encryption || env->config.network.enable_tls) {
             (void)dislmdb_network_set_encryption(env, true);
         }
-        if (env->consensus_context) {
+        /* consensus_context is ConsensusCore* only for PBFT; Raft/solo use other types */
+        if (env->consensus_context &&
+            env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
             ConsensusCore *core = env->consensus_context;
             security_manager_set_cluster_key(core->security, env->cluster_key);
             core->config.verify_signatures = true;
@@ -446,11 +449,28 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
         (void)dislmdb_persist_load(env);
         if (env->has_cluster_key) {
             (void)dislmdb_network_set_auth_key(env, env->cluster_key);
-            if (env->consensus_context) {
+            if (env->consensus_context &&
+                env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
                 ConsensusCore *core = env->consensus_context;
                 security_manager_set_cluster_key(core->security, env->cluster_key);
                 core->config.verify_signatures = true;
             }
+        }
+    }
+
+    /* Stage 2: announce on the wire so peers bind real ids before consensus runs. */
+    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT ||
+        env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        (void)dislmdb_pbft_send_hello(env, "");
+    }
+
+    /* Stage 3 (Raft): start elections after HELLO; raft_start waits for mesh. */
+    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        rc = dislmdb_raft_start(env);
+        if (rc != DISLMDB_SUCCESS) {
+            dislmdb_set_error(env, rc, "Failed to start Raft after cluster engage");
+            env_open_cleanup(env, true, true, true);
+            return rc;
         }
     }
 
@@ -791,12 +811,21 @@ int dislmdb_update_node_state(DISLMDB_env *env, const char *node_id,
 
 int dislmdb_remove_node(DISLMDB_env *env, const char *node_id)
 {
+    if (!env || env->magic != DISLMDB_MAGIC || !node_id || node_id[0] == '\0') {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (strncmp(node_id, env->local_node_id, 63) == 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
     uint32_t index;
     int rc = dislmdb_find_node(env, node_id, &index);
     if (rc != DISLMDB_SUCCESS) {
         return rc;
     }
+    (void)dislmdb_update_node_state(env, node_id, DISLMDB_NODE_STATE_LEAVING);
+    (void)dislmdb_pbft_send_leave(env, node_id);
     (void)dislmdb_network_disconnect(env, node_id);
+
     if (env->consensus_context &&
         env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         ConsensusError err = consensus_core_remove_replica(env->consensus_context, node_id);
@@ -804,14 +833,27 @@ int dislmdb_remove_node(DISLMDB_env *env, const char *node_id)
             dislmdb_log(env, DISLMDB_LOG_WARNING, "NODE",
                         "consensus_core_remove_replica(%s) -> %d", node_id, (int)err);
         }
+    } else if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        int rrc = dislmdb_raft_remove_peer(env, node_id);
+        if (rrc != DISLMDB_SUCCESS && rrc != DISLMDB_ERR_IN_PROGRESS &&
+            rrc != DISLMDB_ERR_NO_LEADER) {
+            dislmdb_log(env, DISLMDB_LOG_WARNING, "NODE",
+                        "raft_remove_peer(%s) -> %d", node_id, rrc);
+        }
     }
 
+    /* Re-resolve index — membership propose may have raced with table edits. */
+    if (dislmdb_find_node(env, node_id, &index) != DISLMDB_SUCCESS) {
+        return dislmdb_persist_save(env);
+    }
     pthread_mutex_lock(&env->nodes_mutex);
     for (uint32_t i = index; i + 1 < env->node_count; i++) {
         env->nodes[i] = env->nodes[i + 1];
         env->node_states[i] = env->node_states[i + 1];
     }
-    env->node_count--;
+    if (env->node_count > 0) {
+        env->node_count--;
+    }
     pthread_mutex_unlock(&env->nodes_mutex);
     (void)dislmdb_persist_save(env);
     return DISLMDB_SUCCESS;
@@ -908,7 +950,46 @@ int dislmdb_store_bytecode(DISLMDB_env *env,
     if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         return dislmdb_pbft_store_bytecode(env, bytecode, bytecode_size, bytecode_id, options);
     }
-    return DISLMDB_ERR_NOT_IMPLEMENTED;
+    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        return dislmdb_raft_store_bytecode(env, bytecode, bytecode_size, bytecode_id, options);
+    }
+    /* SOLO: durable local store (same on-disk layout as consensus apply). */
+    size_t id_len = strnlen(bytecode_id, 129);
+    if (id_len == 0 || id_len > 128 || bytecode_size == 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    MDB_txn *txn = NULL;
+    int rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return rc;
+    }
+    MDB_dbi dbi;
+    rc = mdb_dbi_open(txn, BYTECODE_DBI_NAME, MDB_CREATE, &dbi);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return rc;
+    }
+    size_t stored_size = 4 + bytecode_size;
+    uint8_t *stored = malloc(stored_size);
+    if (!stored) {
+        mdb_txn_abort(txn);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    dislmdb_write_u32(stored, options);
+    memcpy(stored + 4, bytecode, bytecode_size);
+    MDB_val key = {.mv_size = id_len, .mv_data = (void *)bytecode_id};
+    MDB_val val = {.mv_size = stored_size, .mv_data = stored};
+    rc = mdb_put(txn, dbi, &key, &val, 0);
+    free(stored);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return rc;
+    }
+    rc = mdb_txn_commit(txn);
+    if (rc == 0) {
+        env->total_operations++;
+    }
+    return rc;
 }
 
 int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32])
@@ -927,7 +1008,8 @@ int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32])
     env->config.network.has_cluster_key = true;
     env->config.network.enable_message_auth = true;
     memcpy(env->config.network.cluster_key, env->cluster_key, 32);
-    if (env->consensus_context) {
+    if (env->consensus_context &&
+        env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         ConsensusCore *core = env->consensus_context;
         security_manager_set_cluster_key(core->security, env->cluster_key);
         core->config.verify_signatures = true;
@@ -958,13 +1040,18 @@ int dislmdb_checkpoint(DISLMDB_env *env)
     if (!env || env->magic != DISLMDB_MAGIC) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    if (env->config.consensus.mechanism != DISLMDB_CONSENSUS_PBFT || !env->consensus_context) {
-        return DISLMDB_ERR_NOT_IMPLEMENTED;
+    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        return dislmdb_raft_checkpoint(env);
     }
-    ConsensusError err = consensus_core_checkpoint(env->consensus_context);
-    if (err != CONSENSUS_OK) {
-        return DISLMDB_ERR_CHECKPOINT_FAILED;
+    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT && env->consensus_context) {
+        ConsensusError err = consensus_core_checkpoint(env->consensus_context);
+        if (err != CONSENSUS_OK) {
+            return DISLMDB_ERR_CHECKPOINT_FAILED;
+        }
+        env->checkpoints++;
+        return dislmdb_persist_save(env);
     }
+    /* SOLO / unarmed: flush meta + bump checkpoint counter */
     env->checkpoints++;
     return dislmdb_persist_save(env);
 }
@@ -1037,12 +1124,17 @@ int dislmdb_reconfigure_replicas(DISLMDB_env *env,
     if (node_count > DISLMDB_MAX_NODES) {
         return DISLMDB_ERR_MAX_NODES;
     }
+    if (env->consensus_context &&
+        env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        return dislmdb_raft_reconfigure(env, nodes, node_count);
+    }
     for (size_t i = 0; i < node_count; i++) {
         int rc = dislmdb_add_node(env, &nodes[i]);
         if (rc != DISLMDB_SUCCESS) {
             return rc;
         }
-        if (env->consensus_context) {
+        if (env->consensus_context &&
+            env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
             (void)consensus_core_add_replica(env->consensus_context, nodes[i].node_id);
         }
     }

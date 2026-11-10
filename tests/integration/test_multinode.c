@@ -41,7 +41,7 @@ static int open_node(DISLMDB_env **out, const char *path, const char *name,
     cfg.network.local_port = port;
     cfg.network.has_cluster_key = true;
     cfg.network.enable_message_auth = true;
-    cfg.network.enable_payload_encryption = false;
+    cfg.network.enable_payload_encryption = true; /* real cluster: AEAD payloads */
     memcpy(cfg.network.cluster_key, key, 32);
     if (peers && peer_count > 0) {
         cfg.network.nodes = (DISLMDB_node_addr *)peers;

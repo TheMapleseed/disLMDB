@@ -11,6 +11,9 @@
 #include "dislmdb_internal.h"
 #include "dislmdb_errors.h"
 #include "dislmdb_crypto.h"
+#include "pbft_adapter.h"
+#include "raft_adapter.h"
+#include "../../Enhanced-PBFT-mechanism/epdft.h"
 
 typedef struct solo_consensus_context {
     DISLMDB_pbft_state state;
@@ -86,11 +89,13 @@ int dislmdb_consensus_propose(DISLMDB_env *env,
         if (dislmdb_crypto_sha256(operation->data, operation->data_size, digest) != 0) {
             result->status = DISLMDB_CONSENSUS_REJECTED;
             result->error_code = DISLMDB_ERR_DIGEST_MISMATCH;
+            dislmdb_record_consensus_result(env, &operation->id, operation->type, result);
             return DISLMDB_ERR_DIGEST_MISMATCH;
         }
         if (!dislmdb_crypto_secure_eq(digest, operation->digest, DISLMDB_SHA256_DIGEST_LENGTH)) {
             result->status = DISLMDB_CONSENSUS_REJECTED;
             result->error_code = DISLMDB_ERR_DIGEST_MISMATCH;
+            dislmdb_record_consensus_result(env, &operation->id, operation->type, result);
             return DISLMDB_ERR_DIGEST_MISMATCH;
         }
     }
@@ -106,6 +111,8 @@ int dislmdb_consensus_propose(DISLMDB_env *env,
     result->commit_time = dislmdb_get_time_ms();
     result->node_count = 1;
     result->agree_count = 1;
+
+    dislmdb_record_consensus_result(env, &operation->id, operation->type, result);
 
     if (ctx->callback) {
         ctx->callback(operation, result, ctx->callback_data);
@@ -150,8 +157,26 @@ int dislmdb_consensus_generate_op_id(DISLMDB_env *env, DISLMDB_op_id *id)
 
 int dislmdb_consensus_trigger_view_change(DISLMDB_env *env)
 {
-    if (!env) {
+    if (!env || env->magic != DISLMDB_MAGIC) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        return dislmdb_raft_force_election(env);
+    }
+    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
+        if (!env->consensus_context) {
+            return DISLMDB_ERR_NOT_INITIALIZED;
+        }
+        ConsensusCore *core = env->consensus_context;
+        ConsensusError err = consensus_core_trigger_view_change(core);
+        if (err != CONSENSUS_OK) {
+            return DISLMDB_ERR_CONSENSUS_FAILED;
+        }
+        /* Core metrics.view_changes is authoritative; sync local mirror. */
+        env->pbft_state.view = (uint32_t)consensus_core_view(core);
+        env->pbft_state.is_primary = consensus_core_is_primary(core);
+        consensus_core_primary_id(core, env->pbft_state.primary_id);
+        return DISLMDB_SUCCESS;
     }
     /* SOLO: already primary */
     env->pbft_state.is_primary = true;
@@ -164,13 +189,32 @@ int dislmdb_consensus_get_operation_status(DISLMDB_env *env,
                                            const DISLMDB_op_id *id,
                                            DISLMDB_consensus_result *result)
 {
-    (void)env;
-    (void)id;
-    if (!result) {
+    if (!env || env->magic != DISLMDB_MAGIC || !id || !result) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
     memset(result, 0, sizeof(*result));
-    result->status = DISLMDB_CONSENSUS_UNKNOWN;
-    result->error_code = DISLMDB_ERR_NOT_IMPLEMENTED;
-    return DISLMDB_ERR_NOT_IMPLEMENTED;
+    DISLMDB_operation_log_entry entry;
+    int rc = dislmdb_find_operation_log_entry(env, id, &entry);
+    if (rc != DISLMDB_SUCCESS) {
+        result->status = DISLMDB_CONSENSUS_UNKNOWN;
+        result->error_code = DISLMDB_SUCCESS;
+        return DISLMDB_SUCCESS;
+    }
+    *result = entry.result;
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_consensus_get_last_op_id(DISLMDB_env *env, DISLMDB_op_id *id)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !id) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    pthread_mutex_lock(&env->oplog_mutex);
+    if (!env->has_last_op_id) {
+        pthread_mutex_unlock(&env->oplog_mutex);
+        return DISLMDB_ERR_NOT_INITIALIZED;
+    }
+    *id = env->last_op_id;
+    pthread_mutex_unlock(&env->oplog_mutex);
+    return DISLMDB_SUCCESS;
 }

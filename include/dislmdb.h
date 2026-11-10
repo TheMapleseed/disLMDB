@@ -84,7 +84,7 @@ typedef struct DISLMDB_node_addr {
 /** @brief Wire transport for cluster traffic */
 typedef enum DISLMDB_TRANSPORT {
     DISLMDB_TRANSPORT_TCP = 0,     /**< Reliable stream (default) */
-    DISLMDB_TRANSPORT_UDP = 1,     /**< Datagram path (WebTransport/QUIC-oriented substrate) */
+    DISLMDB_TRANSPORT_UDP = 1,     /**< Datagram path with DQGM v2 session envelope (QUIC/WT substrate) */
     /**
      * Dual listen (TCP + UDP). Signalling (HELLO/JOIN, HEARTBEAT, ELECTION,
      * LEAVE) prefers UDP; bulk/consensus data prefers TCP. Each path falls
@@ -104,7 +104,7 @@ typedef struct DISLMDB_network_config {
     bool enable_message_auth;      /**< HMAC-authenticate framed messages */
     uint8_t cluster_key[32];       /**< Shared cluster HMAC/AEAD key */
     bool has_cluster_key;          /**< Whether cluster_key is populated */
-    bool enable_payload_encryption;/**< AES-CBC+HMAC payload encryption with cluster_key */
+    bool enable_payload_encryption;/**< AEAD payload seal/open with cluster_key (default on) */
     bool enable_tls;               /**< Legacy alias: enables payload AEAD when mTLS off */
     bool enable_mtls;              /**< Real mutual TLS 1.3 on the TCP path */
     DISLMDB_TRANSPORT transport;   /**< TCP, UDP, or both */
@@ -141,8 +141,25 @@ typedef struct DISLMDB_metrics {
     uint32_t current_view;
     uint64_t last_committed_seq;
     uint32_t replica_count;
-    uint32_t active_connections;
+    uint32_t active_connections; /**< Live CONNECTED peers (from network stats) */
 } DISLMDB_metrics;
+
+/** @brief Maximum entries in a shard map */
+#define DISLMDB_MAX_SHARDS 64
+/** @brief Shard id / key-prefix field sizes */
+#define DISLMDB_SHARD_ID_LEN 64
+#define DISLMDB_SHARD_PREFIX_LEN 128
+
+/**
+ * @brief One shard: keys matching key_prefix (longest match wins) affinity to owner.
+ *
+ * Replaces the orb key-prefix convention with an explicit, queryable map.
+ */
+typedef struct DISLMDB_shard_desc {
+    char shard_id[DISLMDB_SHARD_ID_LEN];       /**< Stable shard identifier */
+    char key_prefix[DISLMDB_SHARD_PREFIX_LEN]; /**< Key prefix owned by this shard */
+    char owner_node_id[64];                    /**< Affinity / primary owner node */
+} DISLMDB_shard_desc;
 
 /** @brief Opaque structure for a distributed environment */
 typedef struct DISLMDB_env DISLMDB_env;
@@ -294,6 +311,10 @@ int dislmdb_add_node(DISLMDB_env *env, const DISLMDB_node_addr *node_addr);
  * @param node_id The ID of the node to remove
  * @return 0 on success, non-zero on error
  */
+/**
+ * @brief Remove a peer: broadcast LEAVE, disconnect, update consensus membership.
+ * Raft leaders also run joint-consensus shrink; PBFT drops the replica locally.
+ */
 int dislmdb_remove_node(DISLMDB_env *env, const char *node_id);
 
 /**
@@ -417,9 +438,49 @@ int dislmdb_request_state_transfer(DISLMDB_env *env);
 /** @brief Read runtime metrics */
 int dislmdb_get_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics);
 
-/** @brief Reconfigure replica membership (propose CONFIG op when PBFT) */
+/**
+ * @brief Reconfigure replica membership
+ *
+ * PBFT: adds replicas to the local / consensus tables.
+ * Raft: joint-consensus membership change (Cold,new → Cnew) on the leader.
+ */
 int dislmdb_reconfigure_replicas(DISLMDB_env *env,
                                  const DISLMDB_node_addr *nodes,
                                  size_t node_count);
+
+/**
+ * @brief Install / propose a shard map.
+ *
+ * Solo: local install + meta persist.
+ * Raft/PBFT (running): consensus blob (SMAP); apply on commit.
+ * Empty prefixes and duplicate shard_ids are rejected. Longest prefix wins on lookup.
+ */
+int dislmdb_shard_map_set(DISLMDB_env *env,
+                          const DISLMDB_shard_desc *shards,
+                          size_t count);
+
+/** @brief Copy up to max_out shard descriptors; writes total count to *out_count. */
+int dislmdb_shard_map_get(DISLMDB_env *env,
+                          DISLMDB_shard_desc *out,
+                          size_t max_out,
+                          size_t *out_count);
+
+/**
+ * @brief Resolve owner node id for a key via longest-prefix shard match.
+ * @return DISLMDB_ERR_NODE_NOT_FOUND when no shard matches.
+ */
+int dislmdb_shard_lookup(DISLMDB_env *env,
+                         const void *key,
+                         size_t key_len,
+                         char owner_node_id[64]);
+
+/**
+ * @brief Resolve shard_id for a key via longest-prefix match.
+ * @return DISLMDB_ERR_NODE_NOT_FOUND when no shard matches.
+ */
+int dislmdb_shard_lookup_id(DISLMDB_env *env,
+                            const void *key,
+                            size_t key_len,
+                            char shard_id[DISLMDB_SHARD_ID_LEN]);
 
 #endif /* DISLMDB_H */

@@ -12,8 +12,11 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
@@ -50,15 +53,46 @@ bool dislmdb_mtls_available(void)
     return true;
 }
 
-/** Avoid SIGPIPE on close_notify / write-after-peer-close (portable). */
+#define MTLS_IO_TIMEOUT_MS 2000
+#define MTLS_HANDSHAKE_DEADLINE_MS 8000
+
+/** Avoid SIGPIPE; bound I/O so handshake/send cannot stall forever. */
 static void mtls_prepare_fd(int fd)
 {
 #if defined(SO_NOSIGPIPE)
     int on = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
-#else
-    (void)fd;
 #endif
+    struct timeval tv;
+    tv.tv_sec = MTLS_IO_TIMEOUT_MS / 1000;
+    tv.tv_usec = (MTLS_IO_TIMEOUT_MS % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+static uint64_t mtls_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static int mtls_wait_fd(int fd, int want_write, uint64_t deadline_ms)
+{
+    uint64_t now = mtls_now_ms();
+    if (now >= deadline_ms) {
+        return -1;
+    }
+    uint64_t left = deadline_ms - now;
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+    struct timeval tv = {
+        .tv_sec = (time_t)(left / 1000ull),
+        .tv_usec = (suseconds_t)((left % 1000ull) * 1000ull)};
+    int rc = want_write ? select(fd + 1, NULL, &fds, NULL, &tv)
+                        : select(fd + 1, &fds, NULL, NULL, &tv);
+    return rc > 0 ? 0 : -1;
 }
 
 static int mtls_net_send(void *ctx, const unsigned char *buf, size_t len)
@@ -73,7 +107,8 @@ static int mtls_net_send(void *ctx, const unsigned char *buf, size_t len)
     int ret = (int)write(net->fd, buf, len);
 #endif
     if (ret < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
+            errno == ETIMEDOUT) {
             return MBEDTLS_ERR_SSL_WANT_WRITE;
         }
         if (errno == EPIPE || errno == ECONNRESET) {
@@ -86,7 +121,25 @@ static int mtls_net_send(void *ctx, const unsigned char *buf, size_t len)
 
 static int mtls_net_recv(void *ctx, unsigned char *buf, size_t len)
 {
-    return mbedtls_net_recv(ctx, buf, len);
+    mbedtls_net_context *net = (mbedtls_net_context *)ctx;
+    if (!net || net->fd < 0) {
+        return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+    }
+    int ret = (int)recv(net->fd, buf, len, 0);
+    if (ret < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
+            errno == ETIMEDOUT) {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+        if (errno == ECONNRESET) {
+            return MBEDTLS_ERR_NET_CONN_RESET;
+        }
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    if (ret == 0) {
+        return MBEDTLS_ERR_NET_CONN_RESET;
+    }
+    return ret;
 }
 
 static char *dup_path(const char *p)
@@ -277,13 +330,28 @@ static int handshake_on_fd(dislmdb_mtls_ctx *ctx, int tcp_fd, int endpoint,
 
     mbedtls_ssl_set_bio(&s->ssl, &s->net, mtls_net_send, mtls_net_recv, NULL);
 
+    uint64_t deadline = mtls_now_ms() + MTLS_HANDSHAKE_DEADLINE_MS;
     int ret;
     while ((ret = mbedtls_ssl_handshake(&s->ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            s->owns_fd = 0;
-            dislmdb_mtls_session_close(s);
-            return -1;
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+            if (mtls_wait_fd(tcp_fd, 0, deadline) != 0) {
+                s->owns_fd = 0;
+                dislmdb_mtls_session_close(s);
+                return -1;
+            }
+            continue;
         }
+        if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (mtls_wait_fd(tcp_fd, 1, deadline) != 0) {
+                s->owns_fd = 0;
+                dislmdb_mtls_session_close(s);
+                return -1;
+            }
+            continue;
+        }
+        s->owns_fd = 0;
+        dislmdb_mtls_session_close(s);
+        return -1;
     }
 
     if (mbedtls_ssl_get_verify_result(&s->ssl) != 0) {
@@ -314,16 +382,27 @@ int dislmdb_mtls_send(dislmdb_mtls_session *s, const void *buf, size_t len)
     if (!s || !buf || len == 0) {
         return -1;
     }
+    uint64_t deadline = mtls_now_ms() + MTLS_IO_TIMEOUT_MS;
     size_t off = 0;
     while (off < len) {
         int n = mbedtls_ssl_write(&s->ssl, (const unsigned char *)buf + off, len - off);
-        if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if (n == MBEDTLS_ERR_SSL_WANT_READ) {
+            if (mtls_wait_fd(s->net.fd, 0, deadline) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (mtls_wait_fd(s->net.fd, 1, deadline) != 0) {
+                return -1;
+            }
             continue;
         }
         if (n <= 0) {
             return -1;
         }
         off += (size_t)n;
+        deadline = mtls_now_ms() + MTLS_IO_TIMEOUT_MS;
     }
     return 0;
 }
@@ -333,9 +412,19 @@ int dislmdb_mtls_recv(dislmdb_mtls_session *s, void *buf, size_t len, size_t *go
     if (!s || !buf || !got || len == 0) {
         return -1;
     }
+    uint64_t deadline = mtls_now_ms() + MTLS_IO_TIMEOUT_MS;
     for (;;) {
         int n = mbedtls_ssl_read(&s->ssl, (unsigned char *)buf, len);
-        if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if (n == MBEDTLS_ERR_SSL_WANT_READ) {
+            if (mtls_wait_fd(s->net.fd, 0, deadline) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (mtls_wait_fd(s->net.fd, 1, deadline) != 0) {
+                return -1;
+            }
             continue;
         }
         if (n <= 0) {
@@ -344,6 +433,15 @@ int dislmdb_mtls_recv(dislmdb_mtls_session *s, void *buf, size_t len, size_t *go
         *got = (size_t)n;
         return 0;
     }
+}
+
+bool dislmdb_mtls_pending(const dislmdb_mtls_session *s)
+{
+    if (!s) {
+        return false;
+    }
+    return mbedtls_ssl_check_pending(&s->ssl) != 0 ||
+           mbedtls_ssl_get_bytes_avail(&s->ssl) > 0;
 }
 
 void dislmdb_mtls_session_close(dislmdb_mtls_session *s)

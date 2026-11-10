@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -34,6 +35,12 @@ typedef struct net_connection {
     int fd;
     uint16_t listen_port;   /* peer listen port (for reconnect / HELLO) */
     dislmdb_mtls_session *tls; /* non-NULL when enable_mtls wrapped this TCP fd */
+    pthread_mutex_t io_lock;   /* serialize framed TCP/TLS read vs write */
+    bool io_lock_ready;
+    uint64_t peer_dgram_cid; /* bound DQGM session id from peer */
+    bool peer_cid_bound;     /* true once first DQGM cid observed */
+    uint64_t peer_last_pkt;  /* highest accepted DQGM pkt_num (v2) */
+    bool peer_pkt_seen;      /* true once a v2 pkt_num was accepted */
     DISLMDB_connection_info info;
 } net_connection;
 
@@ -41,6 +48,8 @@ typedef struct network_context {
     DISLMDB_env *env;
     int listen_fd;
     int udp_fd;                 /* datagram socket when transport includes UDP */
+    int wake_r;                 /* self-pipe read — wakes select on shutdown */
+    int wake_w;                 /* self-pipe write */
     DISLMDB_TRANSPORT transport;
     pthread_t thread;
     bool running;
@@ -52,6 +61,8 @@ typedef struct network_context {
     bool encrypt_payloads;
     bool mtls_enabled;
     dislmdb_mtls_ctx *mtls;
+    uint64_t dgram_cid;           /* DQGM session id (QUIC/WT substrate) */
+    uint64_t dgram_pkt_num;       /* outbound DQGM packet number (v2) */
     uint64_t start_ms;
     uint64_t last_heartbeat_ms;
 } network_context;
@@ -65,14 +76,20 @@ static int set_nonblocking(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+/* Bound peer I/O so a half-open/dead TCP peer cannot stall the net thread. */
+#define NET_IO_TIMEOUT_MS 200
+
 static void prepare_tcp_fd(int fd)
 {
 #if defined(SO_NOSIGPIPE)
     int on = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
-#else
-    (void)fd;
 #endif
+    struct timeval tv;
+    tv.tv_sec = NET_IO_TIMEOUT_MS / 1000;
+    tv.tv_usec = (NET_IO_TIMEOUT_MS % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 static int send_all_raw(int fd, const void *buf, size_t len)
@@ -86,12 +103,17 @@ static int send_all_raw(int fd, const void *buf, size_t len)
         ssize_t n = send(fd, p + sent, len - sent, 0);
 #endif
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Wait until writable rather than dropping the peer */
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
+                /* Short wait then fail — do not burn seconds on a dead peer */
                 fd_set wfds;
                 FD_ZERO(&wfds);
                 FD_SET(fd, &wfds);
-                struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+                struct timeval tv = {
+                    .tv_sec = NET_IO_TIMEOUT_MS / 1000,
+                    .tv_usec = (NET_IO_TIMEOUT_MS % 1000) * 1000};
                 if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
                     return -1;
                 }
@@ -114,11 +136,16 @@ static int recv_all_raw(int fd, void *buf, size_t len)
     while (got < len) {
         ssize_t n = recv(fd, p + got, len - got, 0);
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
                 fd_set rfds;
                 FD_ZERO(&rfds);
                 FD_SET(fd, &rfds);
-                struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+                struct timeval tv = {
+                    .tv_sec = NET_IO_TIMEOUT_MS / 1000,
+                    .tv_usec = (NET_IO_TIMEOUT_MS % 1000) * 1000};
                 if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
                     return -1;
                 }
@@ -237,13 +264,37 @@ static uint32_t payload_checksum(const uint8_t *payload, uint32_t size)
 
 static int find_conn_by_id(network_context *ctx, const char *node_id)
 {
+    int best = -1;
+    int fallback = -1;
+    uint64_t best_score = 0;
     for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
-        if (ctx->connections[i].in_use &&
-            strcmp(ctx->connections[i].info.node_id, node_id) == 0) {
-            return i;
+        if (!ctx->connections[i].in_use ||
+            strcmp(ctx->connections[i].info.node_id, node_id) != 0) {
+            continue;
+        }
+        if (fallback < 0) {
+            fallback = i;
+        }
+        if (ctx->connections[i].fd < 0 ||
+            ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTED) {
+            continue;
+        }
+        /*
+         * Rank by proven traffic, not outbound bit — a silent dialed socket
+         * must not beat a busy accepted stream for the same peer.
+         */
+        uint64_t score = ctx->connections[i].info.last_activity_time;
+        score += (uint64_t)ctx->connections[i].info.messages_sent * 10000ull;
+        score += (uint64_t)ctx->connections[i].info.messages_received * 100ull;
+        if (ctx->connections[i].outbound) {
+            score += 1ull; /* weak tie-break only */
+        }
+        if (best < 0 || score >= best_score) {
+            best = i;
+            best_score = score;
         }
     }
-    return -1;
+    return best >= 0 ? best : fallback;
 }
 
 bool dislmdb_network_is_signalling(DISLMDB_MESSAGE_TYPE type)
@@ -354,25 +405,61 @@ static int write_framed_adapt(network_context *ctx, int idx,
     if (primary < 0) {
         return DISLMDB_ERR_NETWORK;
     }
+    bool lock_io = (primary != ctx->udp_fd && ctx->connections[idx].io_lock_ready);
+    if (lock_io) {
+        pthread_mutex_lock(&ctx->connections[idx].io_lock);
+    }
     int rc = write_framed(ctx, primary, message);
     if (rc == DISLMDB_SUCCESS) {
+        if (lock_io) {
+            pthread_mutex_unlock(&ctx->connections[idx].io_lock);
+        }
         return rc;
     }
     int alt = pick_fallback_fd(ctx, idx, primary);
     if (alt < 0 || alt == primary) {
+        if (lock_io) {
+            pthread_mutex_unlock(&ctx->connections[idx].io_lock);
+        }
         return rc;
     }
     if (used_fd_out) {
         *used_fd_out = alt;
     }
-    return write_framed(ctx, alt, message);
+    /* Fallback may switch TCP↔UDP; only hold io lock for TCP */
+    if (lock_io && alt == ctx->udp_fd) {
+        pthread_mutex_unlock(&ctx->connections[idx].io_lock);
+        lock_io = false;
+    }
+    rc = write_framed(ctx, alt, message);
+    if (lock_io) {
+        pthread_mutex_unlock(&ctx->connections[idx].io_lock);
+    }
+    return rc;
+}
+
+static void ensure_io_lock(net_connection *c)
+{
+    if (!c->io_lock_ready) {
+        if (pthread_mutex_init(&c->io_lock, NULL) == 0) {
+            c->io_lock_ready = true;
+        }
+    }
 }
 
 static int alloc_conn(network_context *ctx)
 {
     for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
         if (!ctx->connections[i].in_use) {
+            bool had_lock = ctx->connections[i].io_lock_ready;
+            pthread_mutex_t saved = ctx->connections[i].io_lock;
             memset(&ctx->connections[i], 0, sizeof(ctx->connections[i]));
+            if (had_lock) {
+                ctx->connections[i].io_lock = saved;
+                ctx->connections[i].io_lock_ready = true;
+            } else {
+                ensure_io_lock(&ctx->connections[i]);
+            }
             ctx->connections[i].in_use = true;
             ctx->connections[i].outbound = false;
             ctx->connections[i].listen_port = 0;
@@ -383,11 +470,26 @@ static int alloc_conn(network_context *ctx)
     return -1;
 }
 
+/** Authoritative count — avoids drift when CONNECTING slots close or peers dedupe. */
+static uint32_t recount_active_connections_locked(const network_context *ctx)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        if (ctx->connections[i].in_use &&
+            ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTED) {
+            n++;
+        }
+    }
+    return n;
+}
+
 static void close_conn(network_context *ctx, int idx)
 {
     if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use) {
         return;
     }
+    bool was_connected =
+        (ctx->connections[idx].info.state == DISLMDB_CONNECTION_CONNECTED);
     if (ctx->connections[idx].tls) {
         dislmdb_mtls_session_close(ctx->connections[idx].tls);
         ctx->connections[idx].tls = NULL;
@@ -404,21 +506,60 @@ static void close_conn(network_context *ctx, int idx)
         ctx->connections[idx].info.hostname[0] != '\0' &&
         ctx->connections[idx].listen_port != 0) {
         ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
-        if (ctx->stats.active_connections > 0) {
+        if (was_connected && ctx->stats.active_connections > 0) {
             ctx->stats.active_connections--;
+        } else {
+            ctx->stats.active_connections = recount_active_connections_locked(ctx);
         }
         return;
     }
     ctx->connections[idx].in_use = false;
-    if (ctx->stats.active_connections > 0) {
+    ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+    if (was_connected && ctx->stats.active_connections > 0) {
         ctx->stats.active_connections--;
+    } else {
+        ctx->stats.active_connections = recount_active_connections_locked(ctx);
     }
+}
+
+/** Another live TCP slot already reaches this peer (by id and/or host:port). */
+static int find_other_live_peer(network_context *ctx, int self_idx,
+                               const char *node_id, const char *hostname,
+                               uint16_t port)
+{
+    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        if (i == self_idx || !ctx->connections[i].in_use) {
+            continue;
+        }
+        if (ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTED &&
+            ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTING) {
+            continue;
+        }
+        if (ctx->connections[i].fd < 0) {
+            continue;
+        }
+        if (node_id && node_id[0] != '\0' &&
+            ctx->connections[i].info.node_id[0] != '\0' &&
+            strncmp(ctx->connections[i].info.node_id, node_id, 63) == 0) {
+            return i;
+        }
+        if (hostname && hostname[0] != '\0' && port != 0 &&
+            strcmp(ctx->connections[i].info.hostname, hostname) == 0) {
+            uint16_t op = ctx->connections[i].listen_port
+                              ? ctx->connections[i].listen_port
+                              : ctx->connections[i].info.port;
+            if (op == port) {
+                return i;
+            }
+        }
+    }
+    return -1;
 }
 
 static int try_reconnect(network_context *ctx, int idx)
 {
-    /* Caller may hold ctx->lock; do not block on mTLS handshake under the lock.
-     * TCP connect is short; handshake runs after unlock in send_heartbeats. */
+    /* Caller may hold ctx->lock — use nonblocking connect so a dead peer
+     * cannot stall the network thread / serialize broadcasts. */
     net_connection *c = &ctx->connections[idx];
     if (!c->in_use || !c->outbound || c->fd >= 0) {
         return -1;
@@ -426,11 +567,18 @@ static int try_reconnect(network_context *ctx, int idx)
     if (c->info.hostname[0] == '\0' || c->listen_port == 0) {
         return -1;
     }
+    /* Do not dial a second TCP/mTLS path when inbound (or another slot) is live.
+     * Duplicate sockets split Raft votes / PBFT broadcasts onto a silent peer. */
+    if (find_other_live_peer(ctx, idx, c->info.node_id, c->info.hostname,
+                             c->listen_port) >= 0) {
+        return -1;
+    }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
     }
     prepare_tcp_fd(fd);
+    (void)set_nonblocking(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -448,16 +596,42 @@ static int try_reconnect(network_context *ctx, int idx)
                sizeof(addr.sin_addr));
         freeaddrinfo(res);
     }
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    int cr = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (cr != 0 && errno != EINPROGRESS && errno != EALREADY) {
         close(fd);
         ctx->stats.connection_failures++;
         return -1;
     }
-    /* Stash fd; mark connecting so we finish mTLS outside the lock */
+    /* Stash fd; finish (poll + optional mTLS) outside the lock */
     c->fd = fd;
     c->tls = NULL;
     c->info.state = DISLMDB_CONNECTION_CONNECTING;
-    return 1; /* needs mtls finish */
+    return 1; /* needs finish_reconnect_mtls */
+}
+
+/**
+ * Poll nonblocking connect without stalling the net thread.
+ * Returns 0 if established, 1 if still in progress, -1 on failure.
+ */
+static int poll_connect_ready(int fd)
+{
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 0};
+    int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+    if (sel < 0) {
+        return -1;
+    }
+    if (sel == 0) {
+        return 1; /* still connecting — retry next heartbeat */
+    }
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0 || soerr != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 /** Finish CONNECTING → CONNECTED. Must NOT be called with ctx->lock held when mTLS is on. */
@@ -465,7 +639,6 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
 {
     int fd = -1;
     char host[256];
-    bool need_mtls = false;
 
     pthread_mutex_lock(&ctx->lock);
     net_connection *c = &ctx->connections[idx];
@@ -473,29 +646,73 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
         pthread_mutex_unlock(&ctx->lock);
         return -1;
     }
-    if (!ctx->mtls_enabled) {
-        c->info.state = DISLMDB_CONNECTION_CONNECTED;
-        c->info.connect_time = dislmdb_get_time_ms();
-        c->info.last_activity_time = c->info.connect_time;
+    fd = c->fd;
+    strncpy(host, c->info.hostname, sizeof(host) - 1);
+    host[sizeof(host) - 1] = '\0';
+    bool need_mtls = ctx->mtls_enabled;
+    pthread_mutex_unlock(&ctx->lock);
+
+    int pr = poll_connect_ready(fd);
+    if (pr == 1) {
+        return -1; /* leave CONNECTING; try again next heartbeat */
+    }
+    if (pr != 0) {
+        close(fd);
+        pthread_mutex_lock(&ctx->lock);
+        if (ctx->connections[idx].in_use) {
+            ctx->connections[idx].fd = -1;
+            ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            ctx->stats.connection_failures++;
+        }
+        pthread_mutex_unlock(&ctx->lock);
+        return -1;
+    }
+
+    if (!need_mtls) {
+        pthread_mutex_lock(&ctx->lock);
+        if (!ctx->connections[idx].in_use ||
+            ctx->connections[idx].info.state != DISLMDB_CONNECTION_CONNECTING ||
+            ctx->connections[idx].fd != fd) {
+            pthread_mutex_unlock(&ctx->lock);
+            close(fd);
+            return -1;
+        }
+        if (find_other_live_peer(ctx, idx, ctx->connections[idx].info.node_id,
+                                 ctx->connections[idx].info.hostname,
+                                 ctx->connections[idx].listen_port) >= 0) {
+            ctx->connections[idx].fd = -1;
+            ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            pthread_mutex_unlock(&ctx->lock);
+            close(fd);
+            return 0;
+        }
+        ensure_io_lock(&ctx->connections[idx]);
+        ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+        ctx->connections[idx].info.connect_time = dislmdb_get_time_ms();
+        ctx->connections[idx].info.last_activity_time =
+            ctx->connections[idx].info.connect_time;
         ctx->stats.active_connections++;
         pthread_mutex_unlock(&ctx->lock);
         return 0;
     }
-    fd = c->fd;
-    strncpy(host, c->info.hostname, sizeof(host) - 1);
-    host[sizeof(host) - 1] = '\0';
-    c->fd = -1; /* lend to handshake */
-    need_mtls = true;
+
+    pthread_mutex_lock(&ctx->lock);
+    if (!ctx->connections[idx].in_use ||
+        ctx->connections[idx].info.state != DISLMDB_CONNECTION_CONNECTING ||
+        ctx->connections[idx].fd != fd) {
+        pthread_mutex_unlock(&ctx->lock);
+        close(fd);
+        return -1;
+    }
+    ctx->connections[idx].fd = -1; /* lend to handshake */
     pthread_mutex_unlock(&ctx->lock);
 
-    if (!need_mtls) {
-        return 0;
-    }
     dislmdb_mtls_session *tls = NULL;
     if (mtls_wrap_client(ctx, fd, host, &tls) != 0) {
         close(fd);
         pthread_mutex_lock(&ctx->lock);
         if (ctx->connections[idx].in_use) {
+            ctx->connections[idx].fd = -1;
             ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
             ctx->stats.connection_failures++;
         }
@@ -508,6 +725,25 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
         dislmdb_mtls_session_close(tls);
         return -1;
     }
+    /* If an inbound (or other) path is already live for this peer, keep
+     * that one and drop this reconnect — avoids dual sockets under mTLS. */
+    int other = find_other_live_peer(ctx, idx, ctx->connections[idx].info.node_id,
+                                     ctx->connections[idx].info.hostname,
+                                     ctx->connections[idx].listen_port);
+    if (other >= 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        dislmdb_mtls_session_close(tls);
+        close(fd);
+        pthread_mutex_lock(&ctx->lock);
+        if (ctx->connections[idx].in_use) {
+            ctx->connections[idx].fd = -1;
+            ctx->connections[idx].tls = NULL;
+            ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+        }
+        pthread_mutex_unlock(&ctx->lock);
+        return 0;
+    }
+    ensure_io_lock(&ctx->connections[idx]);
     ctx->connections[idx].fd = fd;
     ctx->connections[idx].tls = tls;
     ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
@@ -671,9 +907,10 @@ static int write_framed(network_context *ctx, int fd,
         }
     }
 
-    /* UDP path: assemble one datagram (WebTransport/QUIC-oriented substrate) */
+    /* UDP path: DQGM v2 session envelope + framed message (QUIC/WT substrate). */
     if (ctx->udp_fd >= 0 && fd == ctx->udp_fd) {
-        size_t total = NET_HEADER_WIRE_SIZE + wire_size + NET_HMAC_SIZE;
+        size_t body = NET_HEADER_WIRE_SIZE + wire_size + NET_HMAC_SIZE;
+        size_t total = DISLMDB_DGRAM_ENVELOPE_V2_SIZE + body;
         if (total > 65507) {
             free(sealed);
             return DISLMDB_ERR_BUFFER_OVERFLOW;
@@ -683,11 +920,28 @@ static int write_framed(network_context *ctx, int fd,
             free(sealed);
             return DISLMDB_ERR_MEMORY_ERROR;
         }
-        memcpy(dgram, header_buf, NET_HEADER_WIRE_SIZE);
-        if (wire_size > 0 && wire_payload) {
-            memcpy(dgram + NET_HEADER_WIRE_SIZE, wire_payload, wire_size);
+        uint64_t pkt;
+        pthread_mutex_lock(&ctx->lock);
+        if (ctx->dgram_pkt_num == 0) {
+            ctx->dgram_pkt_num = 1;
         }
-        memcpy(dgram + NET_HEADER_WIRE_SIZE + wire_size, hmac, NET_HMAC_SIZE);
+        pkt = ctx->dgram_pkt_num++;
+        pthread_mutex_unlock(&ctx->lock);
+        dislmdb_write_u32(dgram, DISLMDB_DQGM_MAGIC);
+        dgram[4] = DISLMDB_DQGM_VERSION; /* v2: includes pkt_num */
+        dgram[5] = 0; /* flags */
+        /* stream_id: 0 = signalling, 1 = bulk/data (WebTransport-oriented) */
+        uint16_t stream = dislmdb_network_is_signalling(message->header.type) ? 0u : 1u;
+        dislmdb_write_u16(dgram + 6, stream);
+        dislmdb_write_u64(dgram + 8, ctx->dgram_cid);
+        dislmdb_write_u64(dgram + 16, pkt);
+        memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE, header_buf, NET_HEADER_WIRE_SIZE);
+        if (wire_size > 0 && wire_payload) {
+            memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE + NET_HEADER_WIRE_SIZE,
+                   wire_payload, wire_size);
+        }
+        memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE + NET_HEADER_WIRE_SIZE + wire_size,
+               hmac, NET_HMAC_SIZE);
         free(sealed);
         struct sockaddr_in to;
         memset(&to, 0, sizeof(to));
@@ -871,6 +1125,12 @@ static void *network_thread(void *arg)
             FD_SET(ctx->listen_fd, &rfds);
             maxfd = ctx->listen_fd;
         }
+        if (ctx->wake_r >= 0) {
+            FD_SET(ctx->wake_r, &rfds);
+            if (ctx->wake_r > maxfd) {
+                maxfd = ctx->wake_r;
+            }
+        }
 
         pthread_mutex_lock(&ctx->lock);
         if (ctx->udp_fd >= 0) {
@@ -891,7 +1151,8 @@ static void *network_thread(void *arg)
         }
         pthread_mutex_unlock(&ctx->lock);
 
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+        /* Short poll so shutdown cannot sit in select for a full second */
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 250000};
         int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (ready < 0) {
             if (errno == EINTR) {
@@ -899,6 +1160,17 @@ static void *network_thread(void *arg)
             }
             dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "select failed: %s", strerror(errno));
             break;
+        }
+        if (!ctx->running) {
+            break;
+        }
+        if (ctx->wake_r >= 0 && FD_ISSET(ctx->wake_r, &rfds)) {
+            uint8_t drain[64];
+            while (read(ctx->wake_r, drain, sizeof(drain)) > 0) {
+            }
+            if (!ctx->running) {
+                break;
+            }
         }
         if (ready == 0) {
             send_heartbeats(ctx);
@@ -915,32 +1187,70 @@ static void *network_thread(void *arg)
             ssize_t n = recvfrom(ctx->udp_fd, dgram, sizeof(dgram), 0,
                                  (struct sockaddr *)&peer, &plen);
             if (n > (ssize_t)(NET_HEADER_WIRE_SIZE + NET_HMAC_SIZE)) {
+                /* Strip DQGM session envelope when present (v1 legacy + v2 pkt_num). */
+                const uint8_t *frame = dgram;
+                size_t frame_len = (size_t)n;
+                bool has_dqgm = false;
+                bool has_pkt = false;
+                uint64_t dqgm_cid = 0;
+                uint64_t dqgm_pkt = 0;
+                if (frame_len >= DISLMDB_DGRAM_ENVELOPE_V1_SIZE &&
+                    dislmdb_read_u32(dgram) == DISLMDB_DQGM_MAGIC) {
+                    uint8_t ver = dgram[4];
+                    if (ver == 2 && frame_len >= DISLMDB_DGRAM_ENVELOPE_V2_SIZE) {
+                        has_dqgm = true;
+                        has_pkt = true;
+                        dqgm_cid = dislmdb_read_u64(dgram + 8);
+                        dqgm_pkt = dislmdb_read_u64(dgram + 16);
+                        frame = dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE;
+                        frame_len -= DISLMDB_DGRAM_ENVELOPE_V2_SIZE;
+                    } else if (ver == 1) {
+                        has_dqgm = true;
+                        dqgm_cid = dislmdb_read_u64(dgram + 8);
+                        frame = dgram + DISLMDB_DGRAM_ENVELOPE_V1_SIZE;
+                        frame_len -= DISLMDB_DGRAM_ENVELOPE_V1_SIZE;
+                    }
+                }
+                if (frame_len <= (size_t)(NET_HEADER_WIRE_SIZE + NET_HMAC_SIZE)) {
+                    continue;
+                }
                 /* In-memory framed parse from datagram */
                 DISLMDB_network_message msg;
                 memset(&msg, 0, sizeof(msg));
-                /* Temporarily treat as a contiguous frame via a pipe-free path:
-                 * unpack header + payload + HMAC using the same layout as write_framed. */
                 uint8_t hdr[NET_HEADER_WIRE_SIZE];
-                memcpy(hdr, dgram, NET_HEADER_WIRE_SIZE);
+                memcpy(hdr, frame, NET_HEADER_WIRE_SIZE);
                 unpack_header(hdr, &msg.header);
                 uint32_t psz = msg.header.payload_size;
                 size_t need = NET_HEADER_WIRE_SIZE + psz + NET_HMAC_SIZE;
-                if (psz <= DISLMDB_MAX_MESSAGE_SIZE && (size_t)n >= need) {
+                if (psz <= DISLMDB_MAX_MESSAGE_SIZE && frame_len >= need) {
                     if (psz > 0) {
                         msg.payload = malloc(psz);
                         if (msg.payload) {
-                            memcpy(msg.payload, dgram + NET_HEADER_WIRE_SIZE, psz);
+                            memcpy(msg.payload, frame + NET_HEADER_WIRE_SIZE, psz);
                         }
                     }
                     bool auth_ok = true;
                     if (ctx->auth_enabled) {
                         uint8_t expect[NET_HMAC_SIZE];
-                        memcpy(expect, dgram + NET_HEADER_WIRE_SIZE + psz, NET_HMAC_SIZE);
+                        memcpy(expect, frame + NET_HEADER_WIRE_SIZE + psz, NET_HMAC_SIZE);
                         uint8_t mac[NET_HMAC_SIZE];
-                        if (dislmdb_crypto_hmac_sha256(ctx->auth_key, 32, dgram,
+                        if (dislmdb_crypto_hmac_sha256(ctx->auth_key, 32, frame,
                                                        NET_HEADER_WIRE_SIZE + psz, mac) != 0 ||
                             !dislmdb_crypto_secure_eq(mac, expect, NET_HMAC_SIZE)) {
                             auth_ok = false;
+                        }
+                    }
+                    if (auth_ok && (msg.header.flags & 0x1u) != 0 &&
+                        ctx->encrypt_payloads && msg.payload && psz > 0) {
+                        uint8_t *plain = NULL;
+                        size_t plain_len = 0;
+                        if (dislmdb_aead_open(ctx->auth_key, msg.payload, psz,
+                                              &plain, &plain_len) != 0) {
+                            auth_ok = false;
+                        } else {
+                            free(msg.payload);
+                            msg.payload = plain;
+                            msg.header.payload_size = (uint32_t)plain_len;
                         }
                     }
                     if (auth_ok) {
@@ -999,16 +1309,38 @@ static void *network_thread(void *arg)
                                         sizeof(ctx->connections[idx].info.hostname) - 1);
                             }
                         }
+                        bool cid_ok = true;
+                        if (idx >= 0 && has_dqgm) {
+                            if (!ctx->connections[idx].peer_cid_bound) {
+                                ctx->connections[idx].peer_dgram_cid = dqgm_cid;
+                                ctx->connections[idx].peer_cid_bound = true;
+                            } else if (ctx->connections[idx].peer_dgram_cid != dqgm_cid) {
+                                /* Session CID mismatch — drop (QUIC/WT bind) */
+                                cid_ok = false;
+                                ctx->stats.total_errors++;
+                            }
+                            if (cid_ok && has_pkt) {
+                                if (ctx->connections[idx].peer_pkt_seen &&
+                                    dqgm_pkt <= ctx->connections[idx].peer_last_pkt) {
+                                    /* Replay / stale packet — drop */
+                                    cid_ok = false;
+                                    ctx->stats.total_errors++;
+                                } else {
+                                    ctx->connections[idx].peer_last_pkt = dqgm_pkt;
+                                    ctx->connections[idx].peer_pkt_seen = true;
+                                }
+                            }
+                        }
                         if (idx >= 0 && msg.header.sender_id[0] != '\0') {
-                            char *cid = ctx->connections[idx].info.node_id;
-                            if (cid[0] == '\0' || strncmp(cid, "seed-", 5) == 0) {
-                                strncpy(cid, msg.header.sender_id, 63);
+                            char *nid = ctx->connections[idx].info.node_id;
+                            if (nid[0] == '\0' || strncmp(nid, "seed-", 5) == 0) {
+                                strncpy(nid, msg.header.sender_id, 63);
                             }
                             ctx->connections[idx].info.last_activity_time = dislmdb_get_time_ms();
                             ctx->connections[idx].info.messages_received++;
                         }
                         pthread_mutex_unlock(&ctx->lock);
-                        if (msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
+                        if (cid_ok && msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
                             dispatch_message(ctx, &msg);
                         }
                     }
@@ -1023,8 +1355,8 @@ static void *network_thread(void *arg)
             int cfd = accept(ctx->listen_fd, (struct sockaddr *)&peer, &plen);
             if (cfd >= 0) {
                 prepare_tcp_fd(cfd);
-                /* Keep accepted sockets blocking: select gates readiness,
-                 * but frames may arrive in multiple segments. */
+                (void)set_nonblocking(cfd);
+                /* Nonblocking + select: frames may span multiple reads. */
                 dislmdb_mtls_session *tls = NULL;
                 if (mtls_wrap_server(ctx, cfd, &tls) != 0) {
                     close(cfd);
@@ -1058,6 +1390,7 @@ static void *network_thread(void *arg)
                         }
                     }
                     if (idx >= 0) {
+                        ensure_io_lock(&ctx->connections[idx]);
                         ctx->connections[idx].fd = cfd;
                         ctx->connections[idx].tls = tls;
                         ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
@@ -1081,19 +1414,35 @@ static void *network_thread(void *arg)
 
         for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
             int fd = -1;
+            dislmdb_mtls_session *tls = NULL;
+            bool have_io = false;
             pthread_mutex_lock(&ctx->lock);
             if (ctx->connections[i].in_use) {
                 fd = ctx->connections[i].fd;
+                tls = ctx->connections[i].tls;
+                have_io = ctx->connections[i].io_lock_ready;
             }
             pthread_mutex_unlock(&ctx->lock);
             /* Shared UDP socket is drained above — never stream-read it. */
-            if (fd < 0 || fd == ctx->udp_fd || !FD_ISSET(fd, &rfds)) {
+            if (fd < 0 || fd == ctx->udp_fd) {
+                continue;
+            }
+            /* TLS may have app data buffered after TCP is drained — select alone misses it. */
+            bool sock_ready = (fd <= maxfd) && FD_ISSET(fd, &rfds);
+            bool tls_ready = tls && dislmdb_mtls_pending(tls);
+            if (!sock_ready && !tls_ready) {
                 continue;
             }
 
             DISLMDB_network_message msg;
             memset(&msg, 0, sizeof(msg));
+            if (have_io) {
+                pthread_mutex_lock(&ctx->connections[i].io_lock);
+            }
             int rc = read_framed(ctx, fd, &msg);
+            if (have_io) {
+                pthread_mutex_unlock(&ctx->connections[i].io_lock);
+            }
             if (rc != DISLMDB_SUCCESS) {
                 pthread_mutex_lock(&ctx->lock);
                 ctx->stats.total_errors++;
@@ -1119,6 +1468,48 @@ static void *network_thread(void *arg)
                 dispatch_message(ctx, &msg);
             }
             free(msg.payload);
+
+            /* Drain remaining TLS app-data without waiting for select */
+            while (ctx->mtls_enabled) {
+                pthread_mutex_lock(&ctx->lock);
+                if (!ctx->connections[i].in_use) {
+                    pthread_mutex_unlock(&ctx->lock);
+                    break;
+                }
+                tls = ctx->connections[i].tls;
+                fd = ctx->connections[i].fd;
+                have_io = ctx->connections[i].io_lock_ready;
+                pthread_mutex_unlock(&ctx->lock);
+                if (fd < 0 || !tls || !dislmdb_mtls_pending(tls)) {
+                    break;
+                }
+                memset(&msg, 0, sizeof(msg));
+                if (have_io) {
+                    pthread_mutex_lock(&ctx->connections[i].io_lock);
+                }
+                rc = read_framed(ctx, fd, &msg);
+                if (have_io) {
+                    pthread_mutex_unlock(&ctx->connections[i].io_lock);
+                }
+                if (rc != DISLMDB_SUCCESS) {
+                    break;
+                }
+                pthread_mutex_lock(&ctx->lock);
+                if (msg.header.sender_id[0] != '\0') {
+                    char *cid = ctx->connections[i].info.node_id;
+                    if (cid[0] == '\0' || strncmp(cid, "seed-", 5) == 0) {
+                        strncpy(cid, msg.header.sender_id,
+                                sizeof(ctx->connections[i].info.node_id) - 1);
+                    }
+                }
+                ctx->connections[i].info.last_activity_time = dislmdb_get_time_ms();
+                ctx->connections[i].info.messages_received++;
+                pthread_mutex_unlock(&ctx->lock);
+                if (msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
+                    dispatch_message(ctx, &msg);
+                }
+                free(msg.payload);
+            }
         }
     }
 
@@ -1141,8 +1532,32 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
     ctx->env = env;
     ctx->listen_fd = -1;
     ctx->udp_fd = -1;
+    ctx->wake_r = -1;
+    ctx->wake_w = -1;
     ctx->transport = config->transport;
     ctx->start_ms = dislmdb_get_time_ms();
+    {
+        uint8_t dig[32];
+        char seed[96];
+        snprintf(seed, sizeof(seed), "%s:%u",
+                 env->local_node_id,
+                 (unsigned)(config->local_port ? config->local_port : DISLMDB_DEFAULT_PORT));
+        if (dislmdb_crypto_sha256(seed, strnlen(seed, sizeof(seed)), dig) == 0) {
+            ctx->dgram_cid = dislmdb_read_u64(dig);
+        } else {
+            ctx->dgram_cid = ctx->start_ms ^ (uint64_t)getpid();
+        }
+        ctx->dgram_pkt_num = 1;
+    }
+    {
+        int wake[2] = {-1, -1};
+        if (pipe(wake) == 0) {
+            (void)set_nonblocking(wake[0]);
+            (void)set_nonblocking(wake[1]);
+            ctx->wake_r = wake[0];
+            ctx->wake_w = wake[1];
+        }
+    }
     /*
      * Auth/encryption activate once a cluster key is installed. Preferring
      * enable_message_auth without a key is allowed for solo bring-up; multi-node
@@ -1231,6 +1646,12 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
             if (ctx->listen_fd >= 0) {
                 close(ctx->listen_fd);
             }
+            if (ctx->wake_r >= 0) {
+                close(ctx->wake_r);
+            }
+            if (ctx->wake_w >= 0) {
+                close(ctx->wake_w);
+            }
             pthread_mutex_destroy(&ctx->lock);
             if (ctx->mtls) {
                 dislmdb_mtls_destroy(ctx->mtls);
@@ -1246,6 +1667,12 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
             if (ctx->listen_fd >= 0) {
                 close(ctx->listen_fd);
             }
+            if (ctx->wake_r >= 0) {
+                close(ctx->wake_r);
+            }
+            if (ctx->wake_w >= 0) {
+                close(ctx->wake_w);
+            }
             pthread_mutex_destroy(&ctx->lock);
             if (ctx->mtls) {
                 dislmdb_mtls_destroy(ctx->mtls);
@@ -1258,6 +1685,12 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
     }
 
     if (ctx->listen_fd < 0 && ctx->udp_fd < 0) {
+        if (ctx->wake_r >= 0) {
+            close(ctx->wake_r);
+        }
+        if (ctx->wake_w >= 0) {
+            close(ctx->wake_w);
+        }
         pthread_mutex_destroy(&ctx->lock);
         if (ctx->mtls) {
             dislmdb_mtls_destroy(ctx->mtls);
@@ -1276,6 +1709,12 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         }
         if (ctx->udp_fd >= 0) {
             close(ctx->udp_fd);
+        }
+        if (ctx->wake_r >= 0) {
+            close(ctx->wake_r);
+        }
+        if (ctx->wake_w >= 0) {
+            close(ctx->wake_w);
         }
         env->network_context = NULL;
         env->network_running = false;
@@ -1323,6 +1762,11 @@ int dislmdb_network_shutdown(DISLMDB_env *env)
     network_context *ctx = env->network_context;
     ctx->running = false;
     env->network_running = false;
+    /* Kick select so join does not wait for the poll timeout */
+    if (ctx->wake_w >= 0) {
+        uint8_t b = 1;
+        (void)write(ctx->wake_w, &b, 1);
+    }
     pthread_join(ctx->thread, NULL);
 
     pthread_mutex_lock(&ctx->lock);
@@ -1336,6 +1780,14 @@ int dislmdb_network_shutdown(DISLMDB_env *env)
     if (ctx->udp_fd >= 0) {
         close(ctx->udp_fd);
         ctx->udp_fd = -1;
+    }
+    if (ctx->wake_r >= 0) {
+        close(ctx->wake_r);
+        ctx->wake_r = -1;
+    }
+    if (ctx->wake_w >= 0) {
+        close(ctx->wake_w);
+        ctx->wake_w = -1;
     }
     pthread_mutex_unlock(&ctx->lock);
 
@@ -1417,15 +1869,58 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
     char ids[NET_MAX_CONNECTIONS][64];
     int n = 0;
     pthread_mutex_lock(&ctx->lock);
+    /* Collect unique peer ids then resolve each via find_conn_by_id scoring */
+    char seen[NET_MAX_CONNECTIONS][64];
+    int nseen = 0;
     for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
         if (!ctx->connections[i].in_use) {
             continue;
         }
-        if (ctx->connections[i].fd < 0 && !conn_can_udp(ctx, i)) {
+        const char *nid = ctx->connections[i].info.node_id;
+        if (nid[0] == '\0') {
+            /* Anonymous live slot — include once by index */
+            if (ctx->connections[i].info.state == DISLMDB_CONNECTION_CLOSED ||
+                ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTING ||
+                ctx->connections[i].info.state == DISLMDB_CONNECTION_DISCONNECTING) {
+                continue;
+            }
+            if (ctx->connections[i].fd < 0 && !conn_can_udp(ctx, i)) {
+                continue;
+            }
+            idxs[n] = i;
+            ids[n][0] = '\0';
+            n++;
             continue;
         }
-        idxs[n] = i;
-        strncpy(ids[n], ctx->connections[i].info.node_id, sizeof(ids[n]) - 1);
+        bool dup = false;
+        for (int j = 0; j < nseen; j++) {
+            if (strcmp(seen[j], nid) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        strncpy(seen[nseen], nid, sizeof(seen[nseen]) - 1);
+        seen[nseen][sizeof(seen[nseen]) - 1] = '\0';
+        nseen++;
+    }
+    for (int s = 0; s < nseen; s++) {
+        int idx = find_conn_by_id(ctx, seen[s]);
+        if (idx < 0) {
+            continue;
+        }
+        if (ctx->connections[idx].info.state == DISLMDB_CONNECTION_CLOSED ||
+            ctx->connections[idx].info.state == DISLMDB_CONNECTION_CONNECTING ||
+            ctx->connections[idx].info.state == DISLMDB_CONNECTION_DISCONNECTING) {
+            continue;
+        }
+        if (ctx->connections[idx].fd < 0 && !conn_can_udp(ctx, idx)) {
+            continue;
+        }
+        idxs[n] = idx;
+        strncpy(ids[n], seen[s], sizeof(ids[n]) - 1);
         ids[n][sizeof(ids[n]) - 1] = '\0';
         n++;
     }
@@ -1452,6 +1947,11 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
             }
         } else {
             ctx->stats.total_messages_sent++;
+            if (idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+                ctx->connections[idxs[i]].in_use) {
+                ctx->connections[idxs[i]].info.messages_sent++;
+                ctx->connections[idxs[i]].info.last_activity_time = dislmdb_get_time_ms();
+            }
         }
         pthread_mutex_unlock(&ctx->lock);
     }
@@ -1508,6 +2008,8 @@ int dislmdb_network_get_stats(DISLMDB_env *env, DISLMDB_network_stats *stats)
     }
     network_context *ctx = env->network_context;
     pthread_mutex_lock(&ctx->lock);
+    /* Heal any counter drift from dial dedupe / CONNECTING closes. */
+    ctx->stats.active_connections = recount_active_connections_locked(ctx);
     *stats = ctx->stats;
     stats->uptime_ms = dislmdb_get_time_ms() - ctx->start_ms;
     pthread_mutex_unlock(&ctx->lock);
@@ -1526,7 +2028,9 @@ int dislmdb_network_get_connected_nodes(DISLMDB_env *env,
     size_t n = 0;
     pthread_mutex_lock(&ctx->lock);
     for (int i = 0; i < NET_MAX_CONNECTIONS && n < max_count; i++) {
-        if (ctx->connections[i].in_use && ctx->connections[i].info.node_id[0] != '\0') {
+        if (ctx->connections[i].in_use &&
+            ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTED &&
+            ctx->connections[i].info.node_id[0] != '\0') {
             strncpy(node_ids[n], ctx->connections[i].info.node_id, 63);
             node_ids[n][63] = '\0';
             n++;
@@ -1535,6 +2039,49 @@ int dislmdb_network_get_connected_nodes(DISLMDB_env *env,
     pthread_mutex_unlock(&ctx->lock);
     *count = n;
     return DISLMDB_SUCCESS;
+}
+
+uint32_t dislmdb_network_connected_peer_count(DISLMDB_env *env)
+{
+    if (!env || !env->network_context) {
+        return 0;
+    }
+    network_context *ctx = env->network_context;
+    uint32_t n = 0;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        if (ctx->connections[i].in_use &&
+            ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTED &&
+            ctx->connections[i].info.node_id[0] != '\0' &&
+            strncmp(ctx->connections[i].info.node_id, env->local_node_id, 63) != 0) {
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return n;
+}
+
+int dislmdb_network_wait_connected(DISLMDB_env *env,
+                                   uint32_t min_peers,
+                                   uint32_t timeout_ms)
+{
+    if (!env || !env->network_context) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (min_peers == 0) {
+        return DISLMDB_SUCCESS;
+    }
+    uint64_t start = dislmdb_get_time_ms();
+    for (;;) {
+        if (dislmdb_network_connected_peer_count(env) >= min_peers) {
+            return DISLMDB_SUCCESS;
+        }
+        if (dislmdb_get_time_ms() - start >= timeout_ms) {
+            return DISLMDB_ERR_NODE_UNREACHABLE;
+        }
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 25 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
 }
 
 int dislmdb_network_connect(DISLMDB_env *env,
@@ -1618,6 +2165,7 @@ int dislmdb_network_connect(DISLMDB_env *env,
             pthread_mutex_unlock(&ctx->lock);
             return DISLMDB_SUCCESS; /* deferred reconnect */
         }
+        (void)set_nonblocking(fd);
     }
 
     dislmdb_mtls_session *tls = NULL;
@@ -1662,6 +2210,7 @@ int dislmdb_network_connect(DISLMDB_env *env,
         }
         return DISLMDB_ERR_MAX_NODES;
     }
+    ensure_io_lock(&ctx->connections[idx]);
     ctx->connections[idx].fd = fd;
     ctx->connections[idx].tls = tls;
     ctx->connections[idx].outbound = true;
@@ -1727,6 +2276,23 @@ int dislmdb_network_bind_peer_id(DISLMDB_env *env,
     if (listen_port != 0) {
         ctx->connections[idx].listen_port = listen_port;
         ctx->connections[idx].info.port = listen_port;
+    }
+    /* Drop silent duplicate dials to the same peer id. Never close a
+     * CONNECTED slot that has already exchanged traffic. */
+    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        if (i == idx || !ctx->connections[i].in_use) {
+            continue;
+        }
+        if (strncmp(ctx->connections[i].info.node_id, real_node_id, 63) != 0) {
+            continue;
+        }
+        bool silent = (ctx->connections[i].fd < 0) ||
+                      (ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTED) ||
+                      (ctx->connections[i].info.messages_received == 0 &&
+                       ctx->connections[i].info.messages_sent == 0);
+        if (silent && ctx->connections[idx].fd >= 0) {
+            close_conn(ctx, i);
+        }
     }
     pthread_mutex_unlock(&ctx->lock);
     return DISLMDB_SUCCESS;

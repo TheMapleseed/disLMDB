@@ -123,6 +123,8 @@ int main(int argc, char *argv[]) {
     config.consensus.max_batch_size = 100;
     config.consensus.checkpoint_interval = 1000;
     config.consensus.fault_tolerance = 0;
+    config.consensus.enable_liveness = true;
+    config.consensus.persist_state = true;
 
     /* Create environment */
     rc = dislmdb_env_create(&env);
@@ -134,13 +136,56 @@ int main(int argc, char *argv[]) {
     
     printf("Environment created successfully\n");
     
-    /* Shared cluster key required for multi-node (fail-closed) */
+    /* Shared cluster key required for multi-node (fail-closed).
+     * HMAC framing + AEAD payloads on BOTH (UDP signal / TCP data).
+     * Override the demo key with DISLMDB_CLUSTER_KEY (64 hex chars).
+     * Optional mTLS: set DISLMDB_MTLS=1 and provide cert paths via
+     * DISLMDB_MTLS_CERT / DISLMDB_MTLS_KEY / DISLMDB_MTLS_CA. */
     if (seed_node_addr || is_seed) {
         uint8_t cluster_key[32];
         memset(cluster_key, 0x5A, sizeof(cluster_key));
+        const char *key_hex = getenv("DISLMDB_CLUSTER_KEY");
+        if (key_hex && strlen(key_hex) == 64) {
+            int ok = 1;
+            for (int i = 0; i < 32 && ok; i++) {
+                unsigned int b = 0;
+                if (sscanf(key_hex + (size_t)i * 2, "%2x", &b) != 1) {
+                    ok = 0;
+                } else {
+                    cluster_key[i] = (uint8_t)b;
+                }
+            }
+            if (!ok) {
+                fprintf(stderr, "DISLMDB_CLUSTER_KEY must be 64 hex characters; using demo key\n");
+                memset(cluster_key, 0x5A, sizeof(cluster_key));
+            }
+        }
         memcpy(config.network.cluster_key, cluster_key, 32);
         config.network.has_cluster_key = true;
         config.network.enable_message_auth = true;
+        config.network.enable_payload_encryption = true;
+        config.network.transport = DISLMDB_TRANSPORT_BOTH; /* UDP signal, TCP data */
+
+        const char *mtls = getenv("DISLMDB_MTLS");
+        if (mtls && mtls[0] == '1') {
+            const char *cert = getenv("DISLMDB_MTLS_CERT");
+            const char *key = getenv("DISLMDB_MTLS_KEY");
+            const char *ca = getenv("DISLMDB_MTLS_CA");
+            if (cert && key && ca) {
+                config.network.enable_mtls = true;
+                config.network.enable_tls = true;
+                strncpy(config.network.tls_cert_path, cert,
+                        sizeof(config.network.tls_cert_path) - 1);
+                strncpy(config.network.tls_key_path, key,
+                        sizeof(config.network.tls_key_path) - 1);
+                strncpy(config.network.tls_ca_path, ca,
+                        sizeof(config.network.tls_ca_path) - 1);
+                printf("mTLS enabled (cert=%s)\n", cert);
+            } else {
+                fprintf(stderr,
+                        "DISLMDB_MTLS=1 requires DISLMDB_MTLS_CERT/KEY/CA; continuing without mTLS\n");
+            }
+        }
     }
 
     /* Register status callback */
@@ -249,6 +294,15 @@ int main(int argc, char *argv[]) {
     }
     
     printf("Transaction committed via consensus\n");
+
+    /* DISLMDB_SMOKE=1: exit after one consensus write (CI / make smoke-example). */
+    const char *smoke = getenv("DISLMDB_SMOKE");
+    if (smoke && smoke[0] == '1') {
+        printf("Smoke mode: shutting down after commit\n");
+        dislmdb_env_close(env);
+        return 0;
+    }
+
     printf("Node is running. Press Ctrl+C to exit.\n");
     
     while (running) {

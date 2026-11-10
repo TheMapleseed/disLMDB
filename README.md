@@ -6,14 +6,16 @@ DisLMDB is a distributed version of the [Lightning Memory-Mapped Database (LMDB)
 
 - **Distributed Database**: Synchronize operations across multiple nodes
 - **ACID Compliance**: Retains all the ACID properties of the original LMDB
-- **Byzantine Fault Tolerance**: Consensus via Enhanced-PBFT, plus local **Raft** (`DISLMDB_CONSENSUS_RAFT`)
-- **Transports**: TCP, UDP datagram, and **BOTH** (UDP signalling + TCP data, with fallback)
+- **Consensus**: Enhanced-PBFT and Raft (`DISLMDB_CONSENSUS_RAFT`) with joint-consensus membership changes
+- **Transports**: TCP, UDP (DQGM v2 session envelope + packet numbers), and **BOTH** (UDP signalling + TCP data, with fallback)
 - **mTLS 1.3**: Portable mutual TLS (`enable_mtls`) via vendored Mbed TLS — same stack on every host
+- **Shard map**: Native key-prefix → owner affinity (`dislmdb_shard_map_*`), replicated via SMAP consensus
+- **Graceful leave**: `dislmdb_remove_node` broadcasts LEAVE and shrinks Raft voter sets
+- **Operation status**: `dislmdb_consensus_get_operation_status` / `get_last_op_id` via the local oplog ring
 - **Modern C Implementation**: Written in modern C (C23 standard)
 - **Zero-Copy Design**: Inherits LMDB's zero-copy memory-mapped architecture for high performance
-- **Node Discovery and Management**: Automatic discovery and management of nodes in the cluster
-- **Leader Election**: Dynamic leader election for coordinating consensus
-- **Efficient Synchronization**: Designed to efficiently replicate bytecode and ML model data between nodes
+- **Node Discovery**: HELLO/JOIN mesh engage before Raft elections
+- **Bytecode distribution**: Consensus-replicated ML/bytecode blobs (plus SOLO local store)
 
 ## Requirements
 

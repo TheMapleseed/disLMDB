@@ -292,6 +292,14 @@ int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t
         return rc;
     }
 
+    if (size >= 12 && dislmdb_read_u32(data) == DISLMDB_SMAP_MAGIC) {
+        int rc = dislmdb_shard_map_apply_payload(env, data, size);
+        if (rc == DISLMDB_SUCCESS) {
+            env->consensus_commits++;
+        }
+        return rc;
+    }
+
     if (size >= 16 && dislmdb_read_u32(data) == BCOD_MAGIC) {
         size_t o = 0;
         (void)dislmdb_read_u32(data + o); o += 4;
@@ -474,6 +482,21 @@ int dislmdb_pbft_propose_transaction(DISLMDB_txn *txn)
     env->pbft_state.view = consensus_core_view(core);
     env->pbft_state.is_primary = consensus_core_is_primary(core);
     consensus_core_primary_id(core, env->pbft_state.primary_id);
+
+    /* Track committed txn for get_operation_status */
+    DISLMDB_op_id oid;
+    if (dislmdb_consensus_generate_op_id(env, &oid) == DISLMDB_SUCCESS) {
+        DISLMDB_consensus_result cres;
+        memset(&cres, 0, sizeof(cres));
+        cres.status = DISLMDB_CONSENSUS_COMMITTED;
+        cres.error_code = DISLMDB_SUCCESS;
+        cres.commit_view = env->pbft_state.view;
+        cres.commit_sequence = env->pbft_state.sequence;
+        cres.commit_time = dislmdb_get_time_ms();
+        cres.node_count = env->node_count ? env->node_count : 1;
+        cres.agree_count = cres.node_count;
+        dislmdb_record_consensus_result(env, &oid, DISLMDB_OP_TYPE_PUT, &cres);
+    }
     return DISLMDB_SUCCESS;
 }
 
@@ -503,9 +526,9 @@ static void replace_seed_node_id(DISLMDB_env *env, const char *real_id,
     pthread_mutex_unlock(&env->nodes_mutex);
 }
 
-static void handle_hello(DISLMDB_env *env, const DISLMDB_network_message *message)
+void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *message)
 {
-    if (!message->payload || message->header.payload_size < 4 + 2 + 1) {
+    if (!env || !message || !message->payload || message->header.payload_size < 4 + 2 + 1) {
         return;
     }
     const uint8_t *p = message->payload;
@@ -559,7 +582,9 @@ static void handle_hello(DISLMDB_env *env, const DISLMDB_network_message *messag
     (void)dislmdb_network_bind_peer_id(env, message->header.sender_id, peer_id, peer_port);
     (void)dislmdb_add_node_internal(env, &addr);
 
-    if (env->consensus_context) {
+    /* consensus_context is ConsensusCore* only under PBFT */
+    if (env->consensus_context &&
+        env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         (void)consensus_core_add_replica(env->consensus_context, peer_id);
         consensus_core_recompute_faults(env->consensus_context,
                                        env->config.consensus.fault_tolerance);
@@ -610,6 +635,79 @@ int dislmdb_pbft_send_hello(DISLMDB_env *env, const char *target_node_id)
     return rc;
 }
 
+int dislmdb_pbft_send_leave(DISLMDB_env *env, const char *node_id)
+{
+    if (!env) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    const char *id = (node_id && node_id[0] != '\0') ? node_id : env->local_node_id;
+    size_t id_len = strnlen(id, 63);
+    if (id_len == 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    uint8_t buf[4 + 1 + 64];
+    size_t o = 0;
+    dislmdb_write_u32(buf + o, DISLMDB_LEAV_MAGIC); o += 4;
+    buf[o++] = (uint8_t)id_len;
+    memcpy(buf + o, id, id_len); o += id_len;
+
+    DISLMDB_network_message nm;
+    int rc = dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_LEAVE, buf, (uint32_t)o, NULL);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    strncpy(nm.header.sender_id, env->local_node_id, sizeof(nm.header.sender_id) - 1);
+    rc = dislmdb_network_broadcast(env, &nm, DISLMDB_DEFAULT_NETWORK_TIMEOUT_MS);
+    dislmdb_network_free_message(&nm);
+    return rc;
+}
+
+void dislmdb_pbft_handle_leave(DISLMDB_env *env, const DISLMDB_network_message *message)
+{
+    if (!env || !message || !message->payload || message->header.payload_size < 5) {
+        return;
+    }
+    const uint8_t *p = message->payload;
+    if (dislmdb_read_u32(p) != DISLMDB_LEAV_MAGIC) {
+        return;
+    }
+    uint8_t id_len = p[4];
+    if ((size_t)5 + id_len > message->header.payload_size || id_len == 0 || id_len >= 64) {
+        return;
+    }
+    char peer_id[64];
+    memset(peer_id, 0, sizeof(peer_id));
+    memcpy(peer_id, p + 5, id_len);
+    if (strncmp(peer_id, env->local_node_id, 63) == 0) {
+        return;
+    }
+
+    dislmdb_log(env, DISLMDB_LOG_INFO, "LEAVE", "Peer leaving id=%s", peer_id);
+    (void)dislmdb_update_node_state(env, peer_id, DISLMDB_NODE_STATE_LEAVING);
+    (void)dislmdb_network_disconnect(env, peer_id);
+
+    if (env->consensus_context &&
+        env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
+        (void)consensus_core_remove_replica(env->consensus_context, peer_id);
+        consensus_core_recompute_faults(env->consensus_context,
+                                       env->config.consensus.fault_tolerance);
+    }
+
+    uint32_t index = 0;
+    if (dislmdb_find_node(env, peer_id, &index) == DISLMDB_SUCCESS) {
+        pthread_mutex_lock(&env->nodes_mutex);
+        for (uint32_t i = index; i + 1 < env->node_count; i++) {
+            env->nodes[i] = env->nodes[i + 1];
+            env->node_states[i] = env->node_states[i + 1];
+        }
+        if (env->node_count > 0) {
+            env->node_count--;
+        }
+        pthread_mutex_unlock(&env->nodes_mutex);
+        (void)dislmdb_persist_save(env);
+    }
+}
+
 void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *user_data)
 {
     DISLMDB_env *env = user_data;
@@ -617,9 +715,13 @@ void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *
         return;
     }
 
-    /* Membership HELLO */
+    /* Membership HELLO / LEAVE */
     if (message->header.type == DISLMDB_MESSAGE_JOIN) {
-        handle_hello(env, message);
+        dislmdb_pbft_handle_hello(env, message);
+        return;
+    }
+    if (message->header.type == DISLMDB_MESSAGE_LEAVE) {
+        dislmdb_pbft_handle_leave(env, message);
         return;
     }
 

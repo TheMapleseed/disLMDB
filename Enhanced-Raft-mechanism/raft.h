@@ -98,8 +98,36 @@ void raft_destroy(RaftNode *node);
 void raft_start(RaftNode *node);
 void raft_stop(RaftNode *node);
 
+/**
+ * @brief Register a peer locally (idempotent). Bootstrap / HELLO only —
+ * durable membership changes must use raft_propose_membership().
+ */
+RaftError raft_add_peer(RaftNode *node, const char *peer_id);
+
+/**
+ * @brief Drop a peer locally (idempotent). Bootstrap / cleanup only.
+ */
+RaftError raft_remove_peer(RaftNode *node, const char *peer_id);
+
+/**
+ * @brief Joint-consensus membership change to the given peer set (excluding self).
+ *
+ * Proposes Cold,new then Cnew per the Raft dissertation. Blocks until Cnew
+ * commits or timeout_ms elapses. Caller must be leader.
+ */
+RaftError raft_propose_membership(RaftNode *node,
+                                  const char peer_ids[][RAFT_NODE_ID_LEN],
+                                  uint32_t peer_count,
+                                  uint32_t timeout_ms);
+
 RaftError raft_propose(RaftNode *node, const uint8_t *data, size_t len, uint32_t timeout_ms);
 RaftError raft_handle_message(RaftNode *node, const RaftMessage *msg);
+
+/**
+ * @brief Step down to follower and arm an immediate election timeout.
+ * Used by dislmdb_consensus_trigger_view_change under Raft.
+ */
+RaftError raft_step_down(RaftNode *node);
 
 RaftRole raft_role(const RaftNode *node);
 uint64_t raft_term(const RaftNode *node);
@@ -107,6 +135,12 @@ uint64_t raft_commit_index(const RaftNode *node);
 uint64_t raft_last_applied(const RaftNode *node);
 bool raft_is_leader(const RaftNode *node);
 void raft_leader_id(const RaftNode *node, char out[RAFT_NODE_ID_LEN]);
+uint32_t raft_peer_count(const RaftNode *node);
+bool raft_in_joint_consensus(const RaftNode *node);
+/** @brief Copy current voter peer ids (excluding self). Returns count written. */
+uint32_t raft_copy_peers(const RaftNode *node,
+                         char out[][RAFT_NODE_ID_LEN],
+                         uint32_t max_out);
 
 int raft_message_serialize(const RaftMessage *msg, uint8_t **out, size_t *out_len);
 int raft_message_deserialize(const uint8_t *buf, size_t len, RaftMessage *out);

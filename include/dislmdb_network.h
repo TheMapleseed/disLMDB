@@ -81,7 +81,8 @@ typedef struct DISLMDB_connection_info {
 
 /** @brief Network statistics structure */
 typedef struct DISLMDB_network_stats {
-    uint32_t active_connections;     /**< Current number of active connections */
+    /** Live CONNECTED slots (recounted on get_stats; not CONNECTING dials). */
+    uint32_t active_connections;
     uint32_t total_connections;      /**< Total connections since startup */
     uint64_t total_bytes_sent;       /**< Total bytes sent since startup */
     uint64_t total_bytes_received;   /**< Total bytes received since startup */
@@ -205,6 +206,19 @@ int dislmdb_network_get_connected_nodes(DISLMDB_env *env,
                                        char node_ids[][64],
                                        size_t max_count,
                                        size_t *count);
+
+/**
+ * @brief Count peers in CONNECTED state (excludes CONNECTING / CLOSED slots).
+ */
+uint32_t dislmdb_network_connected_peer_count(DISLMDB_env *env);
+
+/**
+ * @brief Block until at least min_peers are CONNECTED or timeout_ms elapses.
+ * @return 0 if the threshold was met, DISLMDB_ERR_TIMEOUT otherwise.
+ */
+int dislmdb_network_wait_connected(DISLMDB_env *env,
+                                   uint32_t min_peers,
+                                   uint32_t timeout_ms);
 
 /**
  * @brief Connect to a specific node

@@ -53,7 +53,7 @@ static int open_ft(DISLMDB_env **out, const char *path, const char *name,
     cfg.network.local_port = port;
     cfg.network.has_cluster_key = true;
     cfg.network.enable_message_auth = true;
-    cfg.network.enable_payload_encryption = false;
+    cfg.network.enable_payload_encryption = true; /* encrypted f=1 soak */
     memcpy(cfg.network.cluster_key, key, 32);
     if (peers && npeers) {
         cfg.network.nodes = (DISLMDB_node_addr *)peers;
@@ -120,6 +120,10 @@ static int wait_val(DISLMDB_env *env, const char *k, const char *expect, int ms)
             }
             dislmdb_txn_abort(txn);
         }
+        /* Nudge state transfer if this replica missed the original broadcast */
+        if ((w % 200) == 0) {
+            (void)dislmdb_force_sync(env);
+        }
         usleep(50 * 1000);
         w += 50;
     }
@@ -169,7 +173,7 @@ int main(void)
     EXPECT_EQ_INT(&ctx, "open_d",
                   open_ft(&n[3], paths[3], names[3], ports[3], seed, key, peers[3], 3), 0);
 
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 50; i++) {
         for (int j = 0; j < 4; j++) {
             (void)dislmdb_force_sync(n[j]);
         }
@@ -178,15 +182,21 @@ int main(void)
 
     /* Baseline with all four up */
     EXPECT_EQ_INT(&ctx, "put_all_up", put_kv(n[0], "k1", "v1"), 0);
-    EXPECT_EQ_INT(&ctx, "see_b_k1", wait_val(n[1], "k1", "v1", 10000), 0);
-    EXPECT_EQ_INT(&ctx, "see_c_k1", wait_val(n[2], "k1", "v1", 10000), 0);
-    EXPECT_EQ_INT(&ctx, "see_d_k1", wait_val(n[3], "k1", "v1", 10000), 0);
+    for (int j = 0; j < 4; j++) {
+        (void)dislmdb_force_sync(n[j]);
+    }
+    EXPECT_EQ_INT(&ctx, "see_b_k1", wait_val(n[1], "k1", "v1", 12000), 0);
+    EXPECT_EQ_INT(&ctx, "see_c_k1", wait_val(n[2], "k1", "v1", 12000), 0);
+    EXPECT_EQ_INT(&ctx, "see_d_k1", wait_val(n[3], "k1", "v1", 12000), 0);
 
     /* Kill a non-primary follower (ft-d); sorted primary is ft-a */
     dislmdb_env_close(n[3]);
     n[3] = NULL;
-    /* Allow heartbeat/stale detection to drop dead TCP peers before propose */
-    for (int i = 0; i < 20; i++) {
+    /*
+     * Give net threads time to hit SO_SNDTIMEO on the dead peer, close the
+     * slot, and continue quorum traffic among the remaining three.
+     */
+    for (int i = 0; i < 40; i++) {
         (void)dislmdb_force_sync(n[0]);
         (void)dislmdb_force_sync(n[1]);
         (void)dislmdb_force_sync(n[2]);

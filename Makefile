@@ -43,6 +43,7 @@ DISLMDB_SRCS := \
   src/utils/dislmdb_crypto.c \
   src/utils/dislmdb_ops.c \
   src/utils/dislmdb_persist.c \
+  src/utils/dislmdb_shard.c \
   src/network/dislmdb_network.c \
   src/network/dislmdb_mtls.c \
   src/consensus/dislmdb_consensus.c \
@@ -62,6 +63,7 @@ DISLMDB_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(DISLMDB_SRCS))
 UNIT_SANDBOX_TESTS := \
   $(BINDIR)/test_tvb3 \
   $(BINDIR)/test_raft \
+  $(BINDIR)/test_raft_membership \
   $(BINDIR)/test_mtls \
   $(BINDIR)/test_transport_adapt
 
@@ -79,19 +81,30 @@ RIG_TESTS := \
 
 INTEGRATION_TESTS := \
   $(BINDIR)/test_ops_persist \
+  $(BINDIR)/test_op_status \
   $(BINDIR)/test_membership \
+  $(BINDIR)/test_shard_map \
   $(BINDIR)/test_multinode \
   $(BINDIR)/test_udp \
   $(BINDIR)/test_mixed \
   $(BINDIR)/test_mtls_cluster \
   $(BINDIR)/test_raft_udp \
+  $(BINDIR)/test_raft_tcp \
+  $(BINDIR)/test_raft_both \
+  $(BINDIR)/test_raft_mtls \
+  $(BINDIR)/test_raft_mtls_tcp \
+  $(BINDIR)/test_raft_fault \
+  $(BINDIR)/test_raft_stage \
+  $(BINDIR)/test_raft_membership_it \
+  $(BINDIR)/test_raft_leave \
+  $(BINDIR)/test_pbft_viewchange \
   $(BINDIR)/test_fault_tolerance
 
 BASIC_TEST := $(BINDIR)/dislmdb_test
 E2E_RUNNER := $(BINDIR)/e2e_runner
 
 .PHONY: all dirs lib mbedtls examples test-bins check check-sandbox check-integration \
-        check-orb orb-bins unit unit-sandbox rig integration e2e test clean
+        check-orb orb-bins unit unit-sandbox rig integration e2e test clean smoke-example
 
 # Default: build + sandbox-safe suite (works under Cursor agent sandbox)
 all: lib examples test-bins check-sandbox
@@ -128,6 +141,10 @@ lib: $(LIBDIR)/liblmdb.a $(LIBDIR)/libdislmdb.$(SHARED_EXT)
 
 examples: $(BINDIR)/basic_example $(BINDIR)/distributed_example $(BINDIR)/bytecode_example
 
+smoke-example: $(BINDIR)/distributed_example
+	@chmod +x examples/run_distributed_smoke.sh
+	@./examples/run_distributed_smoke.sh
+
 $(BINDIR)/basic_example: examples/basic_example.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
@@ -154,6 +171,9 @@ $(BINDIR)/test_tvb3: tests/unit/test_tvb3.c Enhanced-PBFT-mechanism/time_variant
 $(BINDIR)/test_raft: tests/unit/test_raft.c Enhanced-Raft-mechanism/raft.c | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LIBS)
 
+$(BINDIR)/test_raft_membership: tests/unit/test_raft_membership.c Enhanced-Raft-mechanism/raft.c | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LIBS)
+
 $(BINDIR)/test_mtls: tests/unit/test_mtls.c src/network/dislmdb_mtls.c $(MBEDTLS_LIBS) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit/test_mtls.c src/network/dislmdb_mtls.c -o $@ \
 	  $(MBEDTLS_LIBS) $(LIBS)
@@ -175,7 +195,13 @@ $(BINDIR)/test_cluster_rig: tests/rig/test_cluster_rig.c tests/rig/cluster_rig.c
 $(BINDIR)/test_ops_persist: tests/integration/test_ops_persist.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
+$(BINDIR)/test_op_status: tests/integration/test_op_status.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
 $(BINDIR)/test_membership: tests/integration/test_membership.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
+$(BINDIR)/test_shard_map: tests/integration/test_shard_map.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
 $(BINDIR)/test_multinode: tests/integration/test_multinode.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
@@ -197,6 +223,42 @@ $(BINDIR)/test_raft_udp: tests/integration/test_raft_udp.c $(LIBDIR)/libdislmdb.
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
 
+$(BINDIR)/test_raft_tcp: tests/integration/test_raft_tcp.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_both: tests/integration/test_raft_both.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_mtls: tests/integration/test_raft_mtls.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_mtls_tcp: tests/integration/test_raft_mtls_tcp.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_fault: tests/integration/test_raft_fault.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_stage: tests/integration/test_raft_stage.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_membership_it: tests/integration/test_raft_membership.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_leave: tests/integration/test_raft_leave.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_pbft_viewchange: tests/integration/test_pbft_viewchange.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
 $(BINDIR)/test_fault_tolerance: tests/integration/test_fault_tolerance.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
@@ -211,6 +273,7 @@ unit-sandbox: $(UNIT_SANDBOX_TESTS)
 	@echo ">>>> Unit (sandbox-safe, no LMDB mmap)"
 	@$(BINDIR)/test_tvb3
 	@$(BINDIR)/test_raft
+	@$(BINDIR)/test_raft_membership
 	@cd $(BUILD) && ./bin/test_mtls
 	@cd $(BUILD) && ./bin/test_transport_adapt
 
@@ -236,12 +299,23 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@echo ">>>> Integration / basic tests (requires unsandboxed mmap)"
 	@cd $(BINDIR) && ./dislmdb_test
 	@cd $(BUILD) && ./bin/test_ops_persist
+	@cd $(BUILD) && ./bin/test_op_status
 	@cd $(BUILD) && ./bin/test_membership
+	@cd $(BUILD) && ./bin/test_shard_map
 	@cd $(BUILD) && ./bin/test_multinode
 	@cd $(BUILD) && ./bin/test_udp
 	@cd $(BUILD) && ./bin/test_mixed
 	@cd $(BUILD) && ./bin/test_mtls_cluster
 	@cd $(BUILD) && ./bin/test_raft_udp
+	@cd $(BUILD) && ./bin/test_raft_tcp
+	@cd $(BUILD) && ./bin/test_raft_both
+	@cd $(BUILD) && ./bin/test_raft_mtls
+	@cd $(BUILD) && ./bin/test_raft_mtls_tcp
+	@cd $(BUILD) && ./bin/test_raft_fault
+	@cd $(BUILD) && ./bin/test_raft_stage
+	@cd $(BUILD) && ./bin/test_raft_membership_it
+	@cd $(BUILD) && ./bin/test_raft_leave
+	@cd $(BUILD) && ./bin/test_pbft_viewchange
 	@cd $(BUILD) && ./bin/test_fault_tolerance
 
 e2e: $(E2E_RUNNER)

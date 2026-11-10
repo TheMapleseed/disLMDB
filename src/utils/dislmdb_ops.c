@@ -247,3 +247,83 @@ int dislmdb_apply_oplog_payload(DISLMDB_env *env, const uint8_t *data, size_t si
     }
     return mdb_txn_commit(txn);
 }
+
+int dislmdb_add_operation_log_entry(DISLMDB_env *env,
+                                    const DISLMDB_operation_log_entry *entry)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !entry || !env->oplog ||
+        env->oplog_size == 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+
+    pthread_mutex_lock(&env->oplog_mutex);
+    uint32_t idx;
+    if (env->oplog_count < env->oplog_size) {
+        idx = (env->oplog_head + env->oplog_count) % env->oplog_size;
+        env->oplog_count++;
+    } else {
+        /* Ring full — drop oldest */
+        idx = env->oplog_head;
+        env->oplog_head = (env->oplog_head + 1) % env->oplog_size;
+    }
+    env->oplog[idx] = *entry;
+    /* Caller retains ownership of operation.data */
+    env->oplog[idx].operation.data = NULL;
+    env->oplog[idx].operation.data_size = 0;
+    env->last_op_id = entry->operation.id;
+    env->has_last_op_id = true;
+    pthread_mutex_unlock(&env->oplog_mutex);
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_find_operation_log_entry(DISLMDB_env *env,
+                                     const DISLMDB_op_id *op_id,
+                                     DISLMDB_operation_log_entry *entry)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !op_id || !entry || !env->oplog) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+
+    pthread_mutex_lock(&env->oplog_mutex);
+    for (uint32_t i = 0; i < env->oplog_count; i++) {
+        uint32_t idx = (env->oplog_head + i) % env->oplog_size;
+        if (dislmdb_crypto_secure_eq(env->oplog[idx].operation.id.bytes,
+                                     op_id->bytes, DISLMDB_OP_ID_SIZE)) {
+            *entry = env->oplog[idx];
+            entry->operation.data = NULL;
+            entry->operation.data_size = 0;
+            pthread_mutex_unlock(&env->oplog_mutex);
+            return DISLMDB_SUCCESS;
+        }
+    }
+    pthread_mutex_unlock(&env->oplog_mutex);
+    return DISLMDB_ERR_NODE_NOT_FOUND;
+}
+
+void dislmdb_record_consensus_result(DISLMDB_env *env,
+                                     const DISLMDB_op_id *op_id,
+                                     DISLMDB_OP_TYPE type,
+                                     const DISLMDB_consensus_result *result)
+{
+    if (!env || !op_id || !result) {
+        return;
+    }
+    DISLMDB_operation_log_entry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.operation.id = *op_id;
+    entry.operation.type = type;
+    entry.operation.sequence = result->commit_sequence;
+    entry.operation.timestamp = result->commit_time ? result->commit_time
+                                                    : dislmdb_get_time_ms();
+    strncpy(entry.operation.node_id, env->local_node_id,
+            sizeof(entry.operation.node_id) - 1);
+    entry.result = *result;
+    entry.start_time = entry.operation.timestamp;
+    entry.end_time = result->commit_time;
+    entry.commit_quorum_reached =
+        (result->status == DISLMDB_CONSENSUS_COMMITTED);
+    entry.prepare_quorum_reached = entry.commit_quorum_reached;
+    entry.commit_count = result->agree_count;
+    entry.prepare_count = result->agree_count;
+    (void)dislmdb_add_operation_log_entry(env, &entry);
+}

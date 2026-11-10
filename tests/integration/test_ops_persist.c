@@ -101,6 +101,16 @@ int main(void)
     EXPECT_EQ_INT(&ctx, "deleted", grc, MDB_NOTFOUND);
     dislmdb_txn_abort(txn);
 
+    const uint8_t bc[] = {0x01, 0x02, 0x03, 0x04};
+    EXPECT_EQ_INT(&ctx, "solo_bc",
+                  dislmdb_store_bytecode(env, bc, sizeof(bc), "solo-bc-1", 0), 0);
+    uint8_t bout[8];
+    size_t bsz = sizeof(bout);
+    unsigned bopts = 0;
+    EXPECT_EQ_INT(&ctx, "solo_bc_get",
+                  dislmdb_get_bytecode(env, "solo-bc-1", bout, &bsz, &bopts), 0);
+    EXPECT_EQ_INT(&ctx, "solo_bc_len", (int)bsz, (int)sizeof(bc));
+
     dislmdb_env_close(env);
     rm_rf(DBPATH);
     return test_end(&ctx);

@@ -33,8 +33,20 @@ void dislmdb_convert_consensus_config(const DISLMDB_consensus_config *dislmdb_co
 void dislmdb_pbft_message_handler(const DISLMDB_network_message *message,
                                   void *user_data);
 
+/**
+ * @brief Process a JOIN/HELLO membership frame (shared by PBFT and Raft).
+ * Updates node table + connection labels; PBFT also registers the replica.
+ */
+void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *message);
+
 /** Send HELLO (JOIN) announcing our real node_id + listen port. */
 int dislmdb_pbft_send_hello(DISLMDB_env *env, const char *target_node_id);
+
+/** Process LEAVE membership frame (shared by PBFT and Raft). */
+void dislmdb_pbft_handle_leave(DISLMDB_env *env, const DISLMDB_network_message *message);
+
+/** Broadcast LEAVE for `node_id` (empty → local node). */
+int dislmdb_pbft_send_leave(DISLMDB_env *env, const char *node_id);
 
 int dislmdb_pbft_serialize_transaction(DISLMDB_txn *txn,
                                        uint8_t **data,

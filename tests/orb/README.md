@@ -51,6 +51,7 @@ Admin ports on the host: `n0=29876`, `n1=29877`, `n2=29878`, `n3=29879`.
 
 ## Sharding note
 
-`shard_affinity` uses a **key-prefix convention** (`shardA/…`, `shardB/…`) until a
-native shard map API exists. Join/spawn already exercise `dislmdb_add_node` and
-live container lifecycle.
+`shard_affinity` still exercises key prefixes (`shardA/…`, `shardB/…`) end-to-end.
+Prefer the native API (`dislmdb_shard_map_set` / `dislmdb_shard_lookup`) for owner
+affinity; the orb scenario remains a prefix soak. Join/spawn exercise
+`dislmdb_add_node` and live container lifecycle.

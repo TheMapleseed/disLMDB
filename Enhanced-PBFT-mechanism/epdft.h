@@ -133,6 +133,9 @@ void consensus_core_stop_liveness(ConsensusCore *core);
 /** Emit a checkpoint for last_committed_seq. */
 ConsensusError consensus_core_checkpoint(ConsensusCore *core);
 
+/** Force a VIEW-CHANGE for view+1 (admin / test trigger). */
+ConsensusError consensus_core_trigger_view_change(ConsensusCore *core);
+
 /** Request state starting after `after_seq` from peers. */
 ConsensusError consensus_core_request_state(ConsensusCore *core, uint64_t after_seq);
 
