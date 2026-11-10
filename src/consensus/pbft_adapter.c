@@ -106,7 +106,8 @@ void dislmdb_convert_consensus_config(const DISLMDB_consensus_config *dislmdb_co
         msg = DISLMDB_MAX_MESSAGE_SIZE;
     }
     pbft_config->max_message_size = (size_t)msg;
-    pbft_config->verify_signatures = false; /* digests are TV-B3 */
+    /* TV-BLAKE3 keyed MACs verified when a cluster key is installed */
+    pbft_config->verify_signatures = true;
     pbft_config->timeouts.enabled = dislmdb_config->enable_liveness;
 }
 
@@ -166,6 +167,9 @@ int dislmdb_pbft_init(DISLMDB_env *env)
 
     consensus_core_set_outbound(core, outbound_pbft, env);
     env->consensus_context = core;
+    if (env->has_cluster_key) {
+        security_manager_set_cluster_key(core->security, env->cluster_key);
+    }
 
     int sub = broadcast_channel_subscribe(core->commit_channel);
     if (sub < 0) {
@@ -326,7 +330,12 @@ int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t
             mdb_txn_abort(txn);
             return rc;
         }
-        return mdb_txn_commit(txn) == 0 ? DISLMDB_SUCCESS : rc;
+        rc = mdb_txn_commit(txn);
+        if (rc != 0) {
+            return rc;
+        }
+        env->consensus_commits++;
+        return DISLMDB_SUCCESS;
     }
 
     if (size >= 8 && dislmdb_read_u32(data) == TXN_MAGIC) {
@@ -367,6 +376,7 @@ int dislmdb_pbft_propose_transaction(DISLMDB_txn *txn)
     env->pbft_state.sequence = (uint32_t)consensus_core_last_committed(core);
     env->pbft_state.view = consensus_core_view(core);
     env->pbft_state.is_primary = consensus_core_is_primary(core);
+    consensus_core_primary_id(core, env->pbft_state.primary_id);
     return DISLMDB_SUCCESS;
 }
 
@@ -380,6 +390,20 @@ void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *
     PbftMessage msg;
     if (pbft_message_deserialize(message->payload, message->header.payload_size, &msg) != 0) {
         return;
+    }
+    /* Bind replica identity to the authenticated transport sender, not the
+     * attacker-controlled PBFT `from` field inside the payload. */
+    if (message->header.sender_id[0] != '\0') {
+        if (msg.from[0] != '\0' &&
+            strncmp(msg.from, message->header.sender_id, EPDFT_NODE_ID_LEN) != 0) {
+            dislmdb_log(env, DISLMDB_LOG_WARNING, "PBFT",
+                        "Dropping PBFT msg: wire from=%s != header sender=%s",
+                        msg.from, message->header.sender_id);
+            pbft_message_clear(&msg);
+            return;
+        }
+        strncpy(msg.from, message->header.sender_id, sizeof(msg.from) - 1);
+        msg.from[sizeof(msg.from) - 1] = '\0';
     }
     ConsensusError err = consensus_core_handle_pbft(core, &msg);
     if (err != CONSENSUS_OK) {
@@ -427,6 +451,9 @@ int dislmdb_pbft_store_bytecode(DISLMDB_env *env,
     dislmdb_write_u64(buffer + o, (uint64_t)time(NULL)); o += 8;
     memcpy(buffer + o, bytecode, bytecode_size);
 
+    /* propose blocks until commit certificate; apply via commit broadcast.
+     * Also apply locally so the caller observes durable storage immediately
+     * (replay on the apply thread is idempotent). */
     ConsensusError err = consensus_core_propose(core, buffer, meta + bytecode_size);
     if (err != CONSENSUS_OK) {
         free(buffer);
@@ -437,8 +464,6 @@ int dislmdb_pbft_store_bytecode(DISLMDB_env *env,
             default: return DISLMDB_ERR_CONSENSUS_FAILED;
         }
     }
-
-    /* Solo path commits synchronously via local dispatch; apply for durability. */
     int arc = dislmdb_pbft_apply_transaction(env, buffer, meta + bytecode_size);
     free(buffer);
     return arc;

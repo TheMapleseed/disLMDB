@@ -100,6 +100,8 @@ static void reset_cfg(e2e_state *st)
     st->cfg.consensus.fault_tolerance = 0;
     st->cfg.consensus.enable_liveness = true;
     st->cfg.consensus.persist_state = true;
+    st->cfg.consensus.persist_cluster_key = false;
+    st->cfg.network.enable_message_auth = true;
     st->cfg.network.enable_payload_encryption = true;
     st->cfg.network.local_port = 29765;
 }
@@ -117,6 +119,8 @@ static int cmd_open(e2e_state *st, char **args, int nargs)
             st->cfg.mapsize = (size_t)strtoull(v, NULL, 10);
         } else if ((v = tok_key(args[i], "port"))) {
             st->cfg.network.local_port = (uint16_t)atoi(v);
+        } else if ((v = tok_key(args[i], "persist_key"))) {
+            st->cfg.consensus.persist_cluster_key = (atoi(v) != 0);
         }
     }
     mkdir(st->path, 0700);
@@ -184,6 +188,11 @@ static int run_line(e2e_state *st, char *line)
         return 0;
     }
     if (strcmp(cmd, "SET_KEY") == 0) {
+        if (!st->env || !st->open) {
+            st->last_rc = DISLMDB_ERR_NOT_INITIALIZED;
+            emit_rc("SET_KEY", st->last_rc);
+            return st->last_rc;
+        }
         uint8_t key[32];
         size_t kl = 0;
         char *hex = NULL;

@@ -167,6 +167,23 @@ void tvb3_hash_payload(ConsensusTemporal temporal,
                        size_t payload_len,
                        uint8_t out[32])
 {
+    /* TeX §4: G'(h,m,t) = G(h ⊕ IV(t), m, t) */
+    uint32_t words[8];
+    tvb3_iv_words(temporal, cfg, words);
+    blake3_hasher h;
+    blake3_hasher_init_cv_xor(&h, words);
+    if (payload && payload_len > 0) {
+        blake3_hasher_update(&h, payload, payload_len);
+    }
+    blake3_hasher_finalize(&h, out, 32);
+}
+
+void tvb3_hash_payload_prefixed(ConsensusTemporal temporal,
+                                const TimeVariantBlake3Config *cfg,
+                                const uint8_t *payload,
+                                size_t payload_len,
+                                uint8_t out[32])
+{
     uint32_t words[8];
     tvb3_iv_words(temporal, cfg, words);
     uint8_t prefix[32];
@@ -183,4 +200,37 @@ void tvb3_hash_payload(ConsensusTemporal temporal,
         blake3_hasher_update(&h, payload, payload_len);
     }
     blake3_hasher_finalize(&h, out, 32);
+}
+
+void tvb3_mac(ConsensusTemporal temporal,
+              const TimeVariantBlake3Config *cfg,
+              const uint8_t key[32],
+              const uint8_t *msg,
+              size_t msg_len,
+              uint8_t out[32])
+{
+    uint32_t words[8];
+    tvb3_iv_words(temporal, cfg, words);
+    blake3_hasher h;
+    blake3_hasher_init_keyed_cv_xor(&h, key, words);
+    if (msg && msg_len > 0) {
+        blake3_hasher_update(&h, msg, msg_len);
+    }
+    blake3_hasher_finalize(&h, out, 32);
+}
+
+bool tvb3_mac_verify(ConsensusTemporal temporal,
+                     const TimeVariantBlake3Config *cfg,
+                     const uint8_t key[32],
+                     const uint8_t *msg,
+                     size_t msg_len,
+                     const uint8_t expect[32])
+{
+    uint8_t got[32];
+    tvb3_mac(temporal, cfg, key, msg, msg_len, got);
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++) {
+        diff |= (uint8_t)(got[i] ^ expect[i]);
+    }
+    return diff == 0;
 }

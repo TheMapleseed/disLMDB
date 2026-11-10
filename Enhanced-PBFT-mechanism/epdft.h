@@ -72,6 +72,8 @@ typedef struct PbftMessage {
     uint64_t view;
     uint64_t sequence;
     uint8_t digest[SECURITY_DIGEST_LEN];
+    uint8_t auth[SECURITY_AUTH_LEN]; /**< TV-BLAKE3 keyed MAC (zero if unsigned) */
+    bool has_auth;
     uint64_t last_stable_seq;
     uint8_t *data;
     size_t data_len;
@@ -96,9 +98,19 @@ void consensus_core_set_outbound(ConsensusCore *core,
                                  void *user_data);
 void consensus_core_destroy(ConsensusCore *core);
 
+/**
+ * Propose `data` and block until a commit certificate is formed for its
+ * sequence (or timeout). Solo (f=0) completes synchronously inside dispatch.
+ */
 ConsensusError consensus_core_propose(ConsensusCore *core,
                                       const uint8_t *data,
                                       size_t size);
+
+/** Copy the current primary replica id for `core->view` into out (NUL-terminated). */
+void consensus_core_primary_id(const ConsensusCore *core, char out[EPDFT_NODE_ID_LEN]);
+
+/** Recompute fault_tolerance to the largest f with 3f+1 <= replica_count (capped by prefer_f if >0). */
+void consensus_core_recompute_faults(ConsensusCore *core, uint32_t prefer_f);
 
 ConsensusError consensus_core_handle_message(ConsensusCore *core,
                                              MessageType type,

@@ -33,6 +33,30 @@ typedef struct blake3_hasher {
 } blake3_hasher;
 
 void blake3_hasher_init(blake3_hasher *self);
+
+/**
+ * Time-Variant BLAKE3 compression binding (TeX §4):
+ * G'(h,m,t) = G(h ⊕ IV(t), m, t).
+ * Sets the initial chaining value / key words to BLAKE3_IV ⊕ tvb3_iv_words.
+ */
+void blake3_hasher_init_cv_xor(blake3_hasher *self, const uint32_t tvb3_iv[8]);
+
+/** BLAKE3 keyed mode (PRF/MAC) with a 32-byte key. */
+void blake3_hasher_init_keyed(blake3_hasher *self, const uint8_t key[BLAKE3_KEY_LEN]);
+
+/**
+ * Keyed mode with TV-B3 IV XOR'd into the key words:
+ * key_words = LE_u32x8(key) ⊕ tvb3_iv, flags = KEYED_HASH.
+ */
+void blake3_hasher_init_keyed_cv_xor(blake3_hasher *self,
+                                     const uint8_t key[BLAKE3_KEY_LEN],
+                                     const uint32_t tvb3_iv[8]);
+
+/** BLAKE3 derive_key(context) → 32-byte key (HKDF-style). */
+void blake3_derive_key(const char *context,
+                       const uint8_t *key_material, size_t key_material_len,
+                       uint8_t out_key[BLAKE3_KEY_LEN]);
+
 void blake3_hasher_update(blake3_hasher *self, const uint8_t *input, size_t input_len);
 void blake3_hasher_finalize(const blake3_hasher *self, uint8_t *out, size_t out_len);
 

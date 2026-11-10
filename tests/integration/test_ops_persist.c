@@ -30,6 +30,8 @@ static int open_env(DISLMDB_env **env, bool persist)
     cfg.consensus.fault_tolerance = 0;
     cfg.consensus.enable_liveness = true;
     cfg.consensus.persist_state = persist;
+    cfg.consensus.persist_cluster_key = persist;
+    cfg.network.enable_message_auth = true;
     cfg.network.enable_payload_encryption = true;
     int rc = dislmdb_env_create(env);
     if (rc) return rc;

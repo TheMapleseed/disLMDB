@@ -104,6 +104,18 @@ int broadcast_channel_publish(BroadcastChannel *channel,
 
     pthread_mutex_lock(&channel->mutex);
 
+    /* Refuse overwrite when any subscriber is more than DEPTH behind */
+    for (int i = 0; i < BROADCAST_MAX_SUBSCRIBERS; i++) {
+        if (!channel->subscribers[i].active) {
+            continue;
+        }
+        if (channel->write_index > channel->subscribers[i].read_index + BROADCAST_QUEUE_DEPTH) {
+            pthread_mutex_unlock(&channel->mutex);
+            free(copy);
+            return CONSENSUS_ERROR_STATE;
+        }
+    }
+
     size_t idx = channel->write_index % BROADCAST_QUEUE_DEPTH;
     free(channel->queue[idx].data);
     channel->queue[idx].data = copy;

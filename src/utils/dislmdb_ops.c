@@ -231,6 +231,10 @@ int dislmdb_apply_oplog_payload(DISLMDB_env *env, const uint8_t *data, size_t si
         }
         if (type == DISLMDB_OP_TYPE_PUT) {
             rc = mdb_put(txn, dbi, &key, &val, flags);
+            /* Idempotent replay after primary already committed locally */
+            if (rc == MDB_KEYEXIST) {
+                rc = 0;
+            }
         } else if (type == DISLMDB_OP_TYPE_DEL) {
             rc = mdb_del(txn, dbi, &key, vlen ? &val : NULL);
         } else {

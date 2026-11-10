@@ -63,7 +63,15 @@ static int send_all(int fd, const void *buf, size_t len)
     while (sent < len) {
         ssize_t n = send(fd, p + sent, len - sent, 0);
         if (n < 0) {
-            if (errno == EINTR) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Wait until writable rather than dropping the peer */
+                fd_set wfds;
+                FD_ZERO(&wfds);
+                FD_SET(fd, &wfds);
+                struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+                if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                    return -1;
+                }
                 continue;
             }
             return -1;
@@ -83,7 +91,14 @@ static int recv_all(int fd, void *buf, size_t len)
     while (got < len) {
         ssize_t n = recv(fd, p + got, len - got, 0);
         if (n < 0) {
-            if (errno == EINTR) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(fd, &rfds);
+                struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+                if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+                    return -1;
+                }
                 continue;
             }
             return -1;
@@ -412,7 +427,8 @@ static void *network_thread(void *arg)
             socklen_t plen = sizeof(peer);
             int cfd = accept(ctx->listen_fd, (struct sockaddr *)&peer, &plen);
             if (cfd >= 0) {
-                set_nonblocking(cfd);
+                /* Keep accepted sockets blocking: select gates readiness,
+                 * but frames may arrive in multiple segments. */
                 pthread_mutex_lock(&ctx->lock);
                 int idx = alloc_conn(ctx);
                 if (idx >= 0) {
@@ -489,13 +505,10 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
     ctx->listen_fd = -1;
     ctx->start_ms = dislmdb_get_time_ms();
     /*
-     * Message auth requires an explicitly shared cluster key on every node.
-     * Random per-process keys would make multi-node HMAC verification impossible.
+     * Auth/encryption activate once a cluster key is installed. Preferring
+     * enable_message_auth without a key is allowed for solo bring-up; multi-node
+     * open is rejected earlier in dislmdb_env_open when no key is configured.
      */
-    if (config->enable_message_auth && !config->has_cluster_key) {
-        free(ctx);
-        return DISLMDB_ERR_AUTH_FAILED;
-    }
     ctx->auth_enabled = config->enable_message_auth && config->has_cluster_key;
     ctx->encrypt_payloads = (config->enable_payload_encryption || config->enable_tls)
                             && config->has_cluster_key;

@@ -93,7 +93,7 @@ typedef struct DISLMDB_network_config {
     uint8_t cluster_key[32];       /**< Shared cluster HMAC/AEAD key */
     bool has_cluster_key;          /**< Whether cluster_key is populated */
     bool enable_payload_encryption;/**< AES-CBC+HMAC payload encryption with cluster_key */
-    bool enable_tls;               /**< Request TLS (OpenSSL builds) or AEAD fallback */
+    bool enable_tls;               /**< Alias: enable payload AEAD (no TLS stack yet) */
 } DISLMDB_network_config;
 
 /** @brief Consensus configuration parameters */
@@ -108,6 +108,7 @@ typedef struct DISLMDB_consensus_config {
     uint32_t fault_tolerance;              /**< PBFT f — tolerate f faulty nodes (needs 3f+1) */
     bool enable_liveness;                  /**< Enable view-change timeouts */
     bool persist_state;                    /**< Persist view/sequence/replicas to meta DB */
+    bool persist_cluster_key;              /**< Persist raw cluster key in meta DB (off by default) */
 } DISLMDB_consensus_config;
 
 /** @brief Runtime metrics for DisLMDB */

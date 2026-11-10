@@ -7,12 +7,16 @@
 #include "blake3_ref.h"
 
 #include <string.h>
+/* strlen used by blake3_derive_key */
 
 enum {
     CHUNK_START = 1u << 0,
     CHUNK_END = 1u << 1,
     PARENT = 1u << 2,
-    ROOT = 1u << 3
+    ROOT = 1u << 3,
+    KEYED_HASH = 1u << 4,
+    DERIVE_KEY_CONTEXT = 1u << 5,
+    DERIVE_KEY_MATERIAL = 1u << 6
 };
 
 static const uint32_t IV[8] = {
@@ -236,6 +240,64 @@ void blake3_hasher_init(blake3_hasher *self)
     memcpy(self->key_words, IV, sizeof(IV));
     memcpy(self->chunk_cv, IV, sizeof(IV));
     self->flags = 0;
+}
+
+void blake3_hasher_init_cv_xor(blake3_hasher *self, const uint32_t tvb3_iv[8])
+{
+    memset(self, 0, sizeof(*self));
+    for (int i = 0; i < 8; i++) {
+        uint32_t w = IV[i] ^ (tvb3_iv ? tvb3_iv[i] : 0u);
+        self->key_words[i] = w;
+        self->chunk_cv[i] = w;
+    }
+    self->flags = 0;
+}
+
+void blake3_hasher_init_keyed(blake3_hasher *self, const uint8_t key[BLAKE3_KEY_LEN])
+{
+    memset(self, 0, sizeof(*self));
+    words_from_le_bytes(key, self->key_words, 8);
+    memcpy(self->chunk_cv, self->key_words, sizeof(self->chunk_cv));
+    self->flags = KEYED_HASH;
+}
+
+void blake3_hasher_init_keyed_cv_xor(blake3_hasher *self,
+                                     const uint8_t key[BLAKE3_KEY_LEN],
+                                     const uint32_t tvb3_iv[8])
+{
+    memset(self, 0, sizeof(*self));
+    words_from_le_bytes(key, self->key_words, 8);
+    for (int i = 0; i < 8; i++) {
+        self->key_words[i] ^= tvb3_iv ? tvb3_iv[i] : 0u;
+        self->chunk_cv[i] = self->key_words[i];
+    }
+    self->flags = KEYED_HASH;
+}
+
+void blake3_derive_key(const char *context,
+                       const uint8_t *key_material, size_t key_material_len,
+                       uint8_t out_key[BLAKE3_KEY_LEN])
+{
+    blake3_hasher ctx_h;
+    memset(&ctx_h, 0, sizeof(ctx_h));
+    memcpy(ctx_h.key_words, IV, sizeof(IV));
+    memcpy(ctx_h.chunk_cv, IV, sizeof(IV));
+    ctx_h.flags = DERIVE_KEY_CONTEXT;
+    if (context) {
+        blake3_hasher_update(&ctx_h, (const uint8_t *)context, strlen(context));
+    }
+    uint8_t context_key[BLAKE3_KEY_LEN];
+    blake3_hasher_finalize(&ctx_h, context_key, BLAKE3_KEY_LEN);
+
+    blake3_hasher mat_h;
+    memset(&mat_h, 0, sizeof(mat_h));
+    words_from_le_bytes(context_key, mat_h.key_words, 8);
+    memcpy(mat_h.chunk_cv, mat_h.key_words, sizeof(mat_h.chunk_cv));
+    mat_h.flags = DERIVE_KEY_MATERIAL;
+    if (key_material && key_material_len > 0) {
+        blake3_hasher_update(&mat_h, key_material, key_material_len);
+    }
+    blake3_hasher_finalize(&mat_h, out_key, BLAKE3_KEY_LEN);
 }
 
 void blake3_hasher_update(blake3_hasher *self, const uint8_t *input, size_t input_len)

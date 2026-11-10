@@ -56,7 +56,7 @@ int dislmdb_persist_save(DISLMDB_env *env)
         return rc;
     }
 
-    if (env->has_cluster_key) {
+    if (env->has_cluster_key && env->config.consensus.persist_cluster_key) {
         k.mv_size = strlen(META_KEY_CK);
         k.mv_data = (void *)META_KEY_CK;
         v.mv_size = 32;

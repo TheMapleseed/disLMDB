@@ -42,10 +42,10 @@ static const DISLMDB_env_config default_env_config = {
         .is_seed_node = false,
         .seed_nodes = {{0}},
         .seed_node_count = 0,
-        .enable_message_auth = false,
+        .enable_message_auth = true,
         .cluster_key = {0},
         .has_cluster_key = false,
-        .enable_payload_encryption = false,
+        .enable_payload_encryption = true,
         .enable_tls = false
     },
     .consensus = {
@@ -58,7 +58,8 @@ static const DISLMDB_env_config default_env_config = {
         .checkpoint_interval = 1000,
         .fault_tolerance = 0,
         .enable_liveness = true,
-        .persist_state = true
+        .persist_state = true,
+        .persist_cluster_key = false
     },
     .read_only_node = false,
     .sync_interval_ms = 60000,
@@ -302,6 +303,17 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
     int rc = deep_copy_config(env, config);
     if (rc != DISLMDB_SUCCESS) {
         return rc;
+    }
+
+    /* Multi-node / BFT deployments must have a shared cluster key (fail closed). */
+    bool multi = (env->config.network.node_count > 0) ||
+                 (env->config.network.seed_node_count > 0) ||
+                 (env->config.consensus.fault_tolerance > 0);
+    if (multi && !env->config.network.has_cluster_key) {
+        dislmdb_set_error(env, DISLMDB_ERR_NOT_AUTHORIZED,
+                          "Cluster key required for multi-node or f>0 (call dislmdb_set_cluster_key / set network.has_cluster_key)");
+        free_config_nodes(env);
+        return DISLMDB_ERR_NOT_AUTHORIZED;
     }
 
     rc = mdb_env_set_mapsize(env->mdb_env, config->mapsize);
@@ -707,6 +719,13 @@ int dislmdb_remove_node(DISLMDB_env *env, const char *node_id)
         return rc;
     }
     (void)dislmdb_network_disconnect(env, node_id);
+    if (env->consensus_context) {
+        ConsensusError err = consensus_core_remove_replica(env->consensus_context, node_id);
+        if (err != CONSENSUS_OK && err != CONSENSUS_ERROR_UNKNOWN_REPLICA) {
+            dislmdb_log(env, DISLMDB_LOG_WARNING, "NODE",
+                        "consensus_core_remove_replica(%s) -> %d", node_id, (int)err);
+        }
+    }
 
     pthread_mutex_lock(&env->nodes_mutex);
     for (uint32_t i = index; i + 1 < env->node_count; i++) {
@@ -715,6 +734,7 @@ int dislmdb_remove_node(DISLMDB_env *env, const char *node_id)
     }
     env->node_count--;
     pthread_mutex_unlock(&env->nodes_mutex);
+    (void)dislmdb_persist_save(env);
     return DISLMDB_SUCCESS;
 }
 
@@ -737,10 +757,20 @@ int dislmdb_get_leader(DISLMDB_env *env, char *leader_id, size_t id_size)
     if (!env || env->magic != DISLMDB_MAGIC || !leader_id || id_size < 2) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    if (env->pbft_state.primary_id[0] == '\0') {
+    char primary[EPDFT_NODE_ID_LEN];
+    primary[0] = '\0';
+    if (env->consensus_context) {
+        consensus_core_primary_id(env->consensus_context, primary);
+        strncpy(env->pbft_state.primary_id, primary, sizeof(env->pbft_state.primary_id) - 1);
+    } else if (env->pbft_state.primary_id[0] != '\0') {
+        strncpy(primary, env->pbft_state.primary_id, sizeof(primary) - 1);
+    } else {
+        strncpy(primary, env->local_node_id, sizeof(primary) - 1);
+    }
+    if (primary[0] == '\0') {
         return DISLMDB_ERR_NO_LEADER;
     }
-    strncpy(leader_id, env->pbft_state.primary_id, id_size - 1);
+    strncpy(leader_id, primary, id_size - 1);
     leader_id[id_size - 1] = '\0';
     return DISLMDB_SUCCESS;
 }
@@ -805,6 +835,11 @@ int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32])
     env->config.network.has_cluster_key = true;
     env->config.network.enable_message_auth = true;
     memcpy(env->config.network.cluster_key, env->cluster_key, 32);
+    if (env->consensus_context) {
+        ConsensusCore *core = env->consensus_context;
+        security_manager_set_cluster_key(core->security, env->cluster_key);
+        core->config.verify_signatures = true;
+    }
     if (env->network_context) {
         (void)dislmdb_network_set_auth_key(env, env->cluster_key);
         if (env->config.network.enable_payload_encryption || env->config.network.enable_tls) {

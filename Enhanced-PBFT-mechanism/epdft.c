@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 #include "dislmdb_crypto.h"
 
@@ -53,7 +54,12 @@ typedef struct CoreImpl {
     uint64_t live_deadline_ms;
     pthread_t live_thread;
     bool live_running;
+    /* Serialize proposes; wait for commit certificate */
+    bool propose_inflight;
+    uint64_t propose_seq;
+    pthread_cond_t commit_cv;
 } CoreImpl;
+
 
 static uint64_t now_ms(void)
 {
@@ -102,7 +108,7 @@ ConsensusConfig consensus_config_default(void)
     cfg.min_nodes = 1;
     cfg.replica_count = 0;
     cfg.max_message_size = 16u * 1024u * 1024u;
-    cfg.verify_signatures = false;
+    cfg.verify_signatures = true;
     cfg.timeouts.enabled = false;
     cfg.timeouts.wait_pre_prepare_ms = 5000;
     cfg.timeouts.prepare_certificate_ms = 3000;
@@ -208,12 +214,67 @@ static void slot_clear(Slot *s)
     memset(s, 0, sizeof(*s));
 }
 
+static void sign_message(ConsensusCore *core, PbftMessage *msg)
+{
+    if (!core || !msg || !core->security) {
+        return;
+    }
+    if (!security_manager_has_key(core->security)) {
+        msg->has_auth = false;
+        memset(msg->auth, 0, sizeof(msg->auth));
+        return;
+    }
+    if (security_manager_sign_pbft(core->security,
+                                   (uint8_t)msg->type,
+                                   msg->from,
+                                   msg->view,
+                                   msg->sequence,
+                                   msg->digest,
+                                   msg->last_stable_seq,
+                                   msg->data,
+                                   msg->data_len,
+                                   msg->auth)) {
+        msg->has_auth = true;
+    } else {
+        msg->has_auth = false;
+        memset(msg->auth, 0, sizeof(msg->auth));
+    }
+}
+
+static ConsensusError verify_inbound(ConsensusCore *core, const PbftMessage *msg)
+{
+    if (!core->config.verify_signatures) {
+        return CONSENSUS_OK;
+    }
+    if (!security_manager_has_key(core->security)) {
+        return CONSENSUS_OK; /* solo / no key yet */
+    }
+    if (!msg->has_auth) {
+        return CONSENSUS_ERROR_SIGNATURE;
+    }
+    if (!security_manager_verify_pbft(core->security,
+                                      (uint8_t)msg->type,
+                                      msg->from,
+                                      msg->view,
+                                      msg->sequence,
+                                      msg->digest,
+                                      msg->last_stable_seq,
+                                      msg->data,
+                                      msg->data_len,
+                                      msg->auth)) {
+        return CONSENSUS_ERROR_SIGNATURE;
+    }
+    return CONSENSUS_OK;
+}
+
 static ConsensusError dispatch(ConsensusCore *core, const PbftMessage *msg)
 {
-    /* Always apply locally (Rust mesh delivers to self). */
-    ConsensusError local = consensus_core_handle_pbft(core, msg);
+    PbftMessage signed_msg = *msg;
+    /* Deep-copy is not needed for data pointer — same lifetime as caller */
+    sign_message(core, &signed_msg);
+    ConsensusError local = consensus_core_handle_pbft(core, &signed_msg);
     if (core->outbound) {
-        core->outbound(msg, core->outbound_user);
+        core->outbound(&signed_msg, core->outbound_user);
     }
     return local;
 }
@@ -267,8 +328,15 @@ ConsensusCore *consensus_core_create(NodeId *node_id,
         free(core);
         return NULL;
     }
+    if (pthread_cond_init(&impl->commit_cv, NULL) != 0) {
+        pthread_mutex_destroy(&core->lock);
+        free(impl);
+        free(core);
+        return NULL;
+    }
     core->commit_channel = broadcast_channel_create();
     if (!core->commit_channel) {
+        pthread_cond_destroy(&impl->commit_cv);
         pthread_mutex_destroy(&core->lock);
         free(impl);
         free(core);
@@ -303,6 +371,7 @@ void consensus_core_destroy(ConsensusCore *core)
         for (size_t i = 0; i < 256; i++) {
             free(impl->history[i].data);
         }
+        pthread_cond_destroy(&impl->commit_cv);
         free(impl);
     }
     broadcast_channel_destroy(core->commit_channel);
@@ -310,6 +379,43 @@ void consensus_core_destroy(ConsensusCore *core)
     node_id_destroy(core->node_id);
     pthread_mutex_destroy(&core->lock);
     free(core);
+}
+
+void consensus_core_primary_id(const ConsensusCore *core, char out[EPDFT_NODE_ID_LEN])
+{
+    if (!out) {
+        return;
+    }
+    out[0] = '\0';
+    if (!core) {
+        return;
+    }
+    primary_id_for_view(&core->config, core->view, out);
+}
+
+void consensus_core_recompute_faults(ConsensusCore *core, uint32_t prefer_f)
+{
+    if (!core) {
+        return;
+    }
+    pthread_mutex_lock(&core->lock);
+    uint32_t n = core->config.replica_count;
+    uint32_t max_f = n > 0 ? (n - 1) / 3u : 0;
+    uint32_t f = prefer_f;
+    if (f > max_f) {
+        f = max_f;
+    }
+    /* Solo / single-node: keep f=0 */
+    if (n < 4) {
+        f = 0;
+    }
+    core->config.fault_tolerance = f;
+    core->config.min_nodes = 3u * f + 1u;
+    if (core->config.min_nodes == 0) {
+        core->config.min_nodes = 1;
+    }
+    refresh_primary(core);
+    pthread_mutex_unlock(&core->lock);
 }
 
 BroadcastChannel *consensus_core_commit_channel(ConsensusCore *core)
@@ -351,8 +457,15 @@ static ConsensusError on_pre_prepare(ConsensusCore *core, const PbftMessage *msg
         return CONSENSUS_OK;
     }
     uint64_t expected = core->last_committed_seq + 1;
-    if (msg->sequence != expected) {
+    if (msg->sequence < expected) {
         pthread_mutex_unlock(&core->lock);
+        return CONSENSUS_OK; /* already committed */
+    }
+    if (msg->sequence > expected) {
+        /* Gap — ask peers for missing history; do not advance on forgeable holes */
+        uint64_t after = core->last_committed_seq;
+        pthread_mutex_unlock(&core->lock);
+        (void)consensus_core_request_state(core, after);
         return CONSENSUS_OK;
     }
 
@@ -491,19 +604,24 @@ static ConsensusError on_commit(ConsensusCore *core, const PbftMessage *msg)
         }
         history_push(impl, msg->sequence, commit_data, commit_len);
         core->metrics.commits++;
+        if (impl->propose_inflight && impl->propose_seq == msg->sequence) {
+            impl->propose_inflight = false;
+        }
         slot_clear(slot);
         executed = true;
         arm_liveness(core, LIVE_WAIT_PRE_PREPARE, core->config.timeouts.wait_pre_prepare_ms);
+        pthread_cond_broadcast(&impl->commit_cv);
     }
     pthread_mutex_unlock(&core->lock);
 
     if (executed) {
-        if (commit_data) {
+        if (commit_data && commit_len > 0) {
             (void)broadcast_channel_publish(core->commit_channel, commit_data, commit_len);
             free(commit_data);
-        } else {
-            (void)broadcast_channel_publish(core->commit_channel, (const uint8_t *)"", 0);
+        } else if (commit_data) {
+            free(commit_data);
         }
+        /* Empty payloads are no-ops — do not publish a poison empty frame */
     }
     return CONSENSUS_OK;
 }
@@ -585,6 +703,15 @@ static ConsensusError on_view_change(ConsensusCore *core, const PbftMessage *msg
 
 static ConsensusError on_new_view(ConsensusCore *core, const PbftMessage *msg)
 {
+    char expected_primary[EPDFT_NODE_ID_LEN];
+    primary_id_for_view(&core->config, msg->view, expected_primary);
+    if (strncmp(msg->from, expected_primary, EPDFT_NODE_ID_LEN) != 0) {
+        return CONSENSUS_OK; /* ignore NEW_VIEW not from the new primary */
+    }
+    if (replica_index(&core->config, msg->from) < 0) {
+        return CONSENSUS_OK;
+    }
+
     pthread_mutex_lock(&core->lock);
     if (msg->view > core->view) {
         core->view = msg->view;
@@ -593,7 +720,10 @@ static ConsensusError on_new_view(ConsensusCore *core, const PbftMessage *msg)
         }
         refresh_primary(core);
         core->metrics.view_changes++;
+        CoreImpl *impl = core->impl;
+        impl->propose_inflight = false;
         arm_liveness(core, LIVE_WAIT_PRE_PREPARE, core->config.timeouts.wait_pre_prepare_ms);
+        pthread_cond_broadcast(&impl->commit_cv);
     }
     pthread_mutex_unlock(&core->lock);
     return CONSENSUS_OK;
@@ -601,11 +731,14 @@ static ConsensusError on_new_view(ConsensusCore *core, const PbftMessage *msg)
 
 static ConsensusError on_checkpoint(ConsensusCore *core, const PbftMessage *msg)
 {
+    if (replica_index(&core->config, msg->from) < 0) {
+        return CONSENSUS_OK;
+    }
     pthread_mutex_lock(&core->lock);
-    if (msg->sequence >= core->stable_checkpoint) {
+    if (msg->sequence >= core->stable_checkpoint &&
+        msg->sequence <= core->last_committed_seq + EPDFT_MAX_SLOTS) {
         core->stable_checkpoint = msg->sequence;
         core->metrics.checkpoints++;
-        /* GC slots below stable checkpoint */
         CoreImpl *impl = core->impl;
         for (int i = 0; i < EPDFT_MAX_SLOTS; i++) {
             if (impl->slots[i].in_use && impl->slots[i].sequence <= core->stable_checkpoint) {
@@ -619,46 +752,71 @@ static ConsensusError on_checkpoint(ConsensusCore *core, const PbftMessage *msg)
 
 static ConsensusError on_state_req(ConsensusCore *core, const PbftMessage *msg)
 {
+    if (replica_index(&core->config, msg->from) < 0) {
+        return CONSENSUS_OK;
+    }
     CoreImpl *impl = core->impl;
-    /* Build response: concatenate history entries with sequence > after_seq (in msg->sequence) */
+
+    pthread_mutex_lock(&core->lock);
+    /* Collect matching history indices, sort by sequence, then serialize */
+    uint64_t seqs[256];
+    size_t idxs[256];
+    size_t nmatch = 0;
     size_t total = 0;
     for (size_t i = 0; i < 256; i++) {
         if (impl->history[i].used && impl->history[i].sequence > msg->sequence) {
+            seqs[nmatch] = impl->history[i].sequence;
+            idxs[nmatch] = i;
             total += 8 + 4 + impl->history[i].len;
+            nmatch++;
         }
     }
+    /* Simple insertion sort by sequence (nmatch <= 256) */
+    for (size_t i = 1; i < nmatch; i++) {
+        uint64_t s = seqs[i];
+        size_t ix = idxs[i];
+        size_t j = i;
+        while (j > 0 && seqs[j - 1] > s) {
+            seqs[j] = seqs[j - 1];
+            idxs[j] = idxs[j - 1];
+            j--;
+        }
+        seqs[j] = s;
+        idxs[j] = ix;
+    }
+
     uint8_t *buf = malloc(total ? total : 1);
     if (!buf) {
+        pthread_mutex_unlock(&core->lock);
         return CONSENSUS_ERROR_MEMORY_ERROR;
     }
     size_t o = 0;
-    pthread_mutex_lock(&core->lock);
-    for (size_t i = 0; i < 256; i++) {
-        if (impl->history[i].used && impl->history[i].sequence > msg->sequence) {
-            dislmdb_write_u64(buf + o, impl->history[i].sequence); o += 8;
-            dislmdb_write_u32(buf + o, (uint32_t)impl->history[i].len); o += 4;
-            if (impl->history[i].len > 0 && impl->history[i].data) {
-                memcpy(buf + o, impl->history[i].data, impl->history[i].len);
-                o += impl->history[i].len;
-            }
+    for (size_t k = 0; k < nmatch; k++) {
+        size_t i = idxs[k];
+        dislmdb_write_u64(buf + o, impl->history[i].sequence); o += 8;
+        dislmdb_write_u32(buf + o, (uint32_t)impl->history[i].len); o += 4;
+        if (impl->history[i].len > 0 && impl->history[i].data) {
+            memcpy(buf + o, impl->history[i].data, impl->history[i].len);
+            o += impl->history[i].len;
         }
     }
     core->metrics.state_transfers++;
+    uint64_t view = core->view;
+    uint64_t last = core->last_committed_seq;
+    uint64_t stable = core->stable_checkpoint;
     pthread_mutex_unlock(&core->lock);
 
     PbftMessage resp;
     memset(&resp, 0, sizeof(resp));
     resp.type = MSG_STATE_RESP;
-    resp.view = core->view;
-    resp.sequence = core->last_committed_seq;
-    resp.last_stable_seq = core->stable_checkpoint;
+    resp.view = view;
+    resp.sequence = last;
+    resp.last_stable_seq = stable;
     strncpy(resp.from, core->node_id->id, sizeof(resp.from) - 1);
     resp.data = buf;
     resp.data_len = o;
     ConsensusError err = dispatch(core, &resp);
-    /* dispatch copies via handle; free our buffer after */
     free(buf);
-    resp.data = NULL;
     return err;
 }
 
@@ -668,27 +826,62 @@ static ConsensusError on_state_resp(ConsensusCore *core, const PbftMessage *msg)
         return CONSENSUS_OK;
     }
     if (strncmp(msg->from, core->node_id->id, EPDFT_NODE_ID_LEN) == 0) {
-        return CONSENSUS_OK; /* ignore our own state responses */
+        return CONSENSUS_OK;
     }
-    /* Replay each retained payload into commit channel */
+    if (replica_index(&core->config, msg->from) < 0) {
+        return CONSENSUS_OK; /* untrusted peer */
+    }
+
+    /* Parse into temporary list, sort, apply only contiguous seq = last+1, last+2, ... */
+    typedef struct {
+        uint64_t seq;
+        const uint8_t *ptr;
+        uint32_t len;
+    } StEntry;
+    StEntry entries[256];
+    size_t n = 0;
     size_t o = 0;
-    while (o + 12 <= msg->data_len) {
+    while (o + 12 <= msg->data_len && n < 256) {
         uint64_t seq = dislmdb_read_u64(msg->data + o); o += 8;
         uint32_t len = dislmdb_read_u32(msg->data + o); o += 4;
         if (o + len > msg->data_len) {
             break;
         }
-        pthread_mutex_lock(&core->lock);
-        if (seq > core->last_committed_seq) {
-            history_push(core->impl, seq, msg->data + o, len);
-            core->last_committed_seq = seq;
-            core->metrics.state_transfers++;
-            pthread_mutex_unlock(&core->lock);
-            (void)broadcast_channel_publish(core->commit_channel, msg->data + o, len);
-        } else {
-            pthread_mutex_unlock(&core->lock);
-        }
+        entries[n].seq = seq;
+        entries[n].ptr = msg->data + o;
+        entries[n].len = len;
+        n++;
         o += len;
+    }
+    for (size_t i = 1; i < n; i++) {
+        StEntry tmp = entries[i];
+        size_t j = i;
+        while (j > 0 && entries[j - 1].seq > tmp.seq) {
+            entries[j] = entries[j - 1];
+            j--;
+        }
+        entries[j] = tmp;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        pthread_mutex_lock(&core->lock);
+        uint64_t expect = core->last_committed_seq + 1;
+        if (entries[i].seq < expect) {
+            pthread_mutex_unlock(&core->lock);
+            continue;
+        }
+        if (entries[i].seq > expect) {
+            pthread_mutex_unlock(&core->lock);
+            break; /* gap — stop; wait for another transfer */
+        }
+        history_push(core->impl, entries[i].seq, entries[i].ptr, entries[i].len);
+        core->last_committed_seq = entries[i].seq;
+        core->metrics.state_transfers++;
+        pthread_cond_broadcast(&((CoreImpl *)core->impl)->commit_cv);
+        pthread_mutex_unlock(&core->lock);
+        if (entries[i].len > 0) {
+            (void)broadcast_channel_publish(core->commit_channel, entries[i].ptr, entries[i].len);
+        }
     }
     return CONSENSUS_OK;
 }
@@ -697,6 +890,10 @@ ConsensusError consensus_core_handle_pbft(ConsensusCore *core, const PbftMessage
 {
     if (!core || !msg) {
         return CONSENSUS_ERROR_INVALID_PARAMETER;
+    }
+    ConsensusError verr = verify_inbound(core, msg);
+    if (verr != CONSENSUS_OK) {
+        return verr;
     }
     switch (msg->type) {
         case MSG_PRE_PREPARE:
@@ -731,14 +928,47 @@ ConsensusError consensus_core_propose(ConsensusCore *core,
         return CONSENSUS_ERROR_MESSAGE_TOO_LARGE;
     }
 
+    CoreImpl *impl = core->impl;
+    uint32_t wait_ms = core->config.timeouts.commit_certificate_ms;
+    if (wait_ms == 0) {
+        wait_ms = 5000;
+    }
+
     pthread_mutex_lock(&core->lock);
     refresh_primary(core);
     if (!core->is_primary) {
         pthread_mutex_unlock(&core->lock);
         return CONSENSUS_ERROR_NOT_LEADER;
     }
+
+    /* One in-flight proposal at a time (sequence must stay last_committed+1). */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(wait_ms / 1000u);
+    deadline.tv_nsec += (long)(wait_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (impl->propose_inflight) {
+        int wr = pthread_cond_timedwait(&impl->commit_cv, &core->lock, &deadline);
+        if (wr == ETIMEDOUT) {
+            pthread_mutex_unlock(&core->lock);
+            return CONSENSUS_ERROR_TIMEOUT;
+        }
+        refresh_primary(core);
+        if (!core->is_primary) {
+            pthread_mutex_unlock(&core->lock);
+            return CONSENSUS_ERROR_NOT_LEADER;
+        }
+    }
+
     uint64_t view = core->view;
     uint64_t sequence = core->last_committed_seq + 1;
+    impl->propose_inflight = true;
+    impl->propose_seq = sequence;
+    core->metrics.proposes++;
+    arm_liveness(core, LIVE_WAIT_PREPARE, core->config.timeouts.prepare_certificate_ms);
     pthread_mutex_unlock(&core->lock);
 
     PbftMessage msg;
@@ -751,20 +981,50 @@ ConsensusError consensus_core_propose(ConsensusCore *core,
     if (size > 0) {
         msg.data = malloc(size);
         if (!msg.data) {
+            pthread_mutex_lock(&core->lock);
+            impl->propose_inflight = false;
+            pthread_cond_broadcast(&impl->commit_cv);
+            pthread_mutex_unlock(&core->lock);
             return CONSENSUS_ERROR_MEMORY_ERROR;
         }
         memcpy(msg.data, data, size);
     }
     security_manager_hash_consensus(core->security, view, sequence, data, size, msg.digest);
 
-    pthread_mutex_lock(&core->lock);
-    core->metrics.proposes++;
-    arm_liveness(core, LIVE_WAIT_PREPARE, core->config.timeouts.prepare_certificate_ms);
-    pthread_mutex_unlock(&core->lock);
-
     ConsensusError err = dispatch(core, &msg);
     free(msg.data);
-    return err;
+    if (err != CONSENSUS_OK) {
+        pthread_mutex_lock(&core->lock);
+        if (impl->propose_inflight && impl->propose_seq == sequence) {
+            impl->propose_inflight = false;
+            pthread_cond_broadcast(&impl->commit_cv);
+        }
+        pthread_mutex_unlock(&core->lock);
+        return err;
+    }
+
+    /* Wait until this sequence is committed (solo completes inside dispatch). */
+    pthread_mutex_lock(&core->lock);
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(wait_ms / 1000u);
+    deadline.tv_nsec += (long)(wait_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (core->last_committed_seq < sequence) {
+        int wr = pthread_cond_timedwait(&impl->commit_cv, &core->lock, &deadline);
+        if (wr == ETIMEDOUT) {
+            if (impl->propose_inflight && impl->propose_seq == sequence) {
+                impl->propose_inflight = false;
+            }
+            pthread_cond_broadcast(&impl->commit_cv);
+            pthread_mutex_unlock(&core->lock);
+            return CONSENSUS_ERROR_TIMEOUT;
+        }
+    }
+    pthread_mutex_unlock(&core->lock);
+    return CONSENSUS_OK;
 }
 
 ConsensusError consensus_core_handle_message(ConsensusCore *core,
@@ -804,7 +1064,8 @@ int pbft_message_serialize(const PbftMessage *msg, uint8_t **out, size_t *out_le
     if (!msg || !out || !out_len) {
         return -1;
     }
-    size_t total = 1 + 8 + 8 + 32 + 64 + 8 + 4 + msg->data_len;
+    /* v2 wire: type|view|seq|digest|auth|has_auth|from|last_stable|data_len|data */
+    size_t total = 1 + 8 + 8 + 32 + 32 + 1 + 64 + 8 + 4 + msg->data_len;
     uint8_t *buf = malloc(total);
     if (!buf) {
         return -1;
@@ -814,6 +1075,8 @@ int pbft_message_serialize(const PbftMessage *msg, uint8_t **out, size_t *out_le
     dislmdb_write_u64(buf + o, msg->view); o += 8;
     dislmdb_write_u64(buf + o, msg->sequence); o += 8;
     memcpy(buf + o, msg->digest, 32); o += 32;
+    memcpy(buf + o, msg->auth, 32); o += 32;
+    buf[o++] = msg->has_auth ? 1 : 0;
     memset(buf + o, 0, 64);
     strncpy((char *)(buf + o), msg->from, 63); o += 64;
     dislmdb_write_u64(buf + o, msg->last_stable_seq); o += 8;
@@ -829,7 +1092,9 @@ int pbft_message_serialize(const PbftMessage *msg, uint8_t **out, size_t *out_le
 
 int pbft_message_deserialize(const uint8_t *buf, size_t len, PbftMessage *out)
 {
-    if (!buf || !out || len < 1 + 8 + 8 + 32 + 64 + 8 + 4) {
+    /* Minimum with auth fields */
+    const size_t min_v2 = 1 + 8 + 8 + 32 + 32 + 1 + 64 + 8 + 4;
+    if (!buf || !out || len < min_v2) {
         return -1;
     }
     memset(out, 0, sizeof(*out));
@@ -838,6 +1103,8 @@ int pbft_message_deserialize(const uint8_t *buf, size_t len, PbftMessage *out)
     out->view = dislmdb_read_u64(buf + o); o += 8;
     out->sequence = dislmdb_read_u64(buf + o); o += 8;
     memcpy(out->digest, buf + o, 32); o += 32;
+    memcpy(out->auth, buf + o, 32); o += 32;
+    out->has_auth = (buf[o++] != 0);
     memcpy(out->from, buf + o, 64);
     out->from[63] = '\0';
     o += 64;
@@ -967,6 +1234,12 @@ ConsensusError consensus_core_add_replica(ConsensusCore *core, const char *repli
     strncpy(core->config.replica_ids[core->config.replica_count], replica_id,
             EPDFT_NODE_ID_LEN - 1);
     core->config.replica_count++;
+    /* Keep configured f if still valid; otherwise clamp */
+    uint32_t max_f = (core->config.replica_count - 1) / 3u;
+    if (core->config.fault_tolerance > max_f) {
+        core->config.fault_tolerance = max_f;
+    }
+    core->config.min_nodes = 3u * core->config.fault_tolerance + 1u;
     refresh_primary(core);
     pthread_mutex_unlock(&core->lock);
     return CONSENSUS_OK;
@@ -983,15 +1256,25 @@ ConsensusError consensus_core_remove_replica(ConsensusCore *core, const char *re
         pthread_mutex_unlock(&core->lock);
         return CONSENSUS_ERROR_UNKNOWN_REPLICA;
     }
+    /* Never remove ourselves */
+    if (strncmp(replica_id, core->node_id->id, EPDFT_NODE_ID_LEN) == 0) {
+        pthread_mutex_unlock(&core->lock);
+        return CONSENSUS_ERROR_INVALID_PARAMETER;
+    }
     for (uint32_t i = (uint32_t)idx; i + 1 < core->config.replica_count; i++) {
         memcpy(core->config.replica_ids[i], core->config.replica_ids[i + 1],
                EPDFT_NODE_ID_LEN);
     }
     core->config.replica_count--;
-    if (consensus_config_validate(&core->config) != CONSENSUS_OK) {
-        /* roll forward anyway but flag */
-        pthread_mutex_unlock(&core->lock);
-        return CONSENSUS_ERROR_INSUFFICIENT_REPLICAS;
+    uint32_t max_f = core->config.replica_count > 0
+                         ? (core->config.replica_count - 1) / 3u
+                         : 0;
+    if (core->config.fault_tolerance > max_f) {
+        core->config.fault_tolerance = max_f;
+    }
+    core->config.min_nodes = 3u * core->config.fault_tolerance + 1u;
+    if (core->config.min_nodes == 0) {
+        core->config.min_nodes = 1;
     }
     refresh_primary(core);
     pthread_mutex_unlock(&core->lock);
