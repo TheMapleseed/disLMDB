@@ -91,6 +91,13 @@ typedef struct DISLMDB_network_stats {
     uint32_t total_errors;           /**< Total errors since startup */
     uint32_t connection_failures;    /**< Total connection failures */
     uint64_t uptime_ms;              /**< Network uptime in milliseconds */
+    /** DQGM (UDP) substrate counters */
+    uint64_t dqgm_packets_rx;        /**< DQGM envelopes accepted */
+    uint64_t dqgm_cid_mismatch;      /**< Dropped: peer CID mismatch (no session reset) */
+    uint64_t dqgm_replay_drop;       /**< Dropped: stale/replay pkt_num */
+    uint64_t dqgm_session_rebind;    /**< Peer CID rebound (pkt_num==1 session restart) */
+    uint64_t dqgm_ack_rx;            /**< Cumulative ACK fields observed (v3+) */
+    uint64_t dqgm_ack_advance;       /**< Times peer ACK advanced our in-flight watermark */
 } DISLMDB_network_stats;
 
 /** @brief Callback for handling received messages */
@@ -259,6 +266,15 @@ int dislmdb_network_bind_peer_id(DISLMDB_env *env,
                                  uint16_t listen_port);
 
 /**
+ * @brief Consume a one-shot HELLO re-engage hint for a peer
+ *
+ * Set when a UDP/TCP slot is revived from CLOSED (peer restart). Callers
+ * should reply HELLO once, then the flag clears. Returns true if a reply
+ * is warranted.
+ */
+bool dislmdb_network_take_hello_reengage(DISLMDB_env *env, const char *node_id);
+
+/**
  * @brief True for signalling traffic (HELLO/JOIN, HEARTBEAT, ELECTION, LEAVE)
  *
  * Under DISLMDB_TRANSPORT_BOTH these prefer UDP; data/consensus prefer TCP.
@@ -322,4 +338,4 @@ int dislmdb_network_broadcast_consensus_message(DISLMDB_env *env,
 }
 #endif
 
-#endif /* DISLMDB_NETWORK_H */ 
+#endif /* DISLMDB_NETWORK_H */

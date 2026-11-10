@@ -142,6 +142,13 @@ typedef struct DISLMDB_metrics {
     uint64_t last_committed_seq;
     uint32_t replica_count;
     uint32_t active_connections; /**< Live CONNECTED peers (from network stats) */
+    /** DQGM (UDP) substrate — copied from network stats when available */
+    uint64_t dqgm_packets_rx;
+    uint64_t dqgm_cid_mismatch;
+    uint64_t dqgm_replay_drop;
+    uint64_t dqgm_session_rebind;
+    uint64_t dqgm_ack_rx;
+    uint64_t dqgm_ack_advance;
 } DISLMDB_metrics;
 
 /** @brief Maximum entries in a shard map */

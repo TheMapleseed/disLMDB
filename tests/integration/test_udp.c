@@ -5,6 +5,7 @@
 #include "../harness/test_harness.h"
 #include "dislmdb.h"
 #include "dislmdb_errors.h"
+#include "dislmdb_network.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -93,6 +94,7 @@ static int wait_val(DISLMDB_env *env, const char *k, const char *expect, int ms)
 {
     int w = 0;
     while (w < ms) {
+        (void)dislmdb_force_sync(env);
         DISLMDB_txn *txn = NULL;
         if (dislmdb_txn_begin(env, NULL, MDB_RDONLY, &txn) == 0) {
             MDB_dbi dbi;
@@ -159,6 +161,43 @@ int main(void)
     EXPECT_EQ_INT(&ctx, "put_udp", put_kv(a, "wt", "datagram"), 0);
     EXPECT_EQ_INT(&ctx, "see_a", wait_val(a, "wt", "datagram", 3000), 0);
     EXPECT_EQ_INT(&ctx, "see_b", wait_val(b, "wt", "datagram", 10000), 0);
+
+    DISLMDB_network_stats st;
+    EXPECT_EQ_INT(&ctx, "stats", dislmdb_network_get_stats(a, &st), 0);
+    EXPECT_TRUE(&ctx, "dqgm_rx", st.dqgm_packets_rx > 0);
+
+    DISLMDB_metrics m;
+    EXPECT_EQ_INT(&ctx, "metrics", dislmdb_get_metrics(a, &m), 0);
+    EXPECT_TRUE(&ctx, "metrics_dqgm_mirror", m.dqgm_packets_rx == st.dqgm_packets_rx);
+    EXPECT_EQ_INT(&ctx, "metrics_dqgm_mismatch", (int)m.dqgm_cid_mismatch,
+                  (int)st.dqgm_cid_mismatch);
+    EXPECT_TRUE(&ctx, "dqgm_ack_rx", st.dqgm_ack_rx > 0);
+    EXPECT_TRUE(&ctx, "dqgm_ack_advance", st.dqgm_ack_advance > 0);
+    EXPECT_TRUE(&ctx, "metrics_ack_mirror", m.dqgm_ack_rx == st.dqgm_ack_rx);
+
+    /* Peer restart: B process dies and returns on same path/port; A must
+     * re-engage (UDP revive / HELLO / DQGM CID rebind) and replicate again. */
+    uint64_t rebind_before = st.dqgm_session_rebind;
+    dislmdb_env_close(b);
+    b = NULL;
+    usleep(500 * 1000);
+
+    EXPECT_EQ_INT(&ctx, "reopen_b",
+                  open_udp_node(&b, "./it_udp_b", "udp-b", PORT_B, seed, key, &peers_b, 1), 0);
+
+    for (int i = 0; i < 40; i++) {
+        (void)dislmdb_force_sync(a);
+        (void)dislmdb_force_sync(b);
+        usleep(50 * 1000);
+    }
+
+    EXPECT_EQ_INT(&ctx, "put_after_restart", put_kv(a, "wt2", "reborn"), 0);
+    EXPECT_EQ_INT(&ctx, "see_a_after", wait_val(a, "wt2", "reborn", 3000), 0);
+    EXPECT_EQ_INT(&ctx, "see_b_after", wait_val(b, "wt2", "reborn", 12000), 0);
+
+    EXPECT_EQ_INT(&ctx, "stats_after", dislmdb_network_get_stats(a, &st), 0);
+    EXPECT_TRUE(&ctx, "dqgm_rebind_or_traffic",
+                st.dqgm_session_rebind > rebind_before || st.dqgm_packets_rx > 0);
 
     if (b) dislmdb_env_close(b);
     if (a) dislmdb_env_close(a);

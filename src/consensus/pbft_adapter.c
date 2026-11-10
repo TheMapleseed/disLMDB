@@ -578,6 +578,13 @@ void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *
     }
     pthread_mutex_unlock(&env->nodes_mutex);
 
+    /* RX may have already revived CLOSED→CONNECTED; consume one-shot hint */
+    bool peer_reengage = dislmdb_network_take_hello_reengage(env, peer_id);
+    if (!peer_reengage && message->header.sender_id[0] != '\0' &&
+        strncmp(message->header.sender_id, peer_id, 63) != 0) {
+        peer_reengage = dislmdb_network_take_hello_reengage(env, message->header.sender_id);
+    }
+
     replace_seed_node_id(env, peer_id, addr.hostname, peer_port);
     (void)dislmdb_network_bind_peer_id(env, message->header.sender_id, peer_id, peer_port);
     (void)dislmdb_add_node_internal(env, &addr);
@@ -590,10 +597,15 @@ void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *
                                        env->config.consensus.fault_tolerance);
     }
     dislmdb_log(env, DISLMDB_LOG_INFO, "HELLO",
-                "Learned peer id=%s port=%u", peer_id, (unsigned)peer_port);
+                "Learned peer id=%s port=%u%s", peer_id, (unsigned)peer_port,
+                peer_reengage ? " (re-engage)" : "");
 
-    /* One-shot reply so the peer can drop its seed-* label (avoid HELLO loops) */
-    if (!already_known) {
+    /*
+     * Reply on first learn, or when a known peer comes back after the wire
+     * slot went down — so the restarted replica can drop seed-* and share
+     * CIDs. Skip steady-state CONNECTED peers to avoid HELLO ping-pong.
+     */
+    if (!already_known || peer_reengage) {
         (void)dislmdb_pbft_send_hello(env, peer_id);
     }
 }

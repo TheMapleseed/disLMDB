@@ -39,8 +39,10 @@ typedef struct net_connection {
     bool io_lock_ready;
     uint64_t peer_dgram_cid; /* bound DQGM session id from peer */
     bool peer_cid_bound;     /* true once first DQGM cid observed */
-    uint64_t peer_last_pkt;  /* highest accepted DQGM pkt_num (v2) */
-    bool peer_pkt_seen;      /* true once a v2 pkt_num was accepted */
+    uint64_t peer_last_pkt;  /* highest accepted DQGM pkt_num (v2+) */
+    bool peer_pkt_seen;      /* true once a v2+ pkt_num was accepted */
+    uint64_t local_acked_pkt; /* highest cumulative ACK from peer (our pkts) */
+    bool hello_reengage;     /* revived from CLOSED — HELLO should reply once */
     DISLMDB_connection_info info;
 } net_connection;
 
@@ -781,15 +783,50 @@ static void send_heartbeats(network_context *ctx)
         if (!ctx->connections[i].in_use) {
             continue;
         }
-        if (ctx->connections[i].fd < 0 && !conn_can_udp(ctx, i)) {
-            if (ctx->connections[i].outbound) {
+        /*
+         * Reconnect / UDP revive when the slot has no live stream fd:
+         *   UDP-only  → connectionless revive (fd = shared udp_fd) + HELLO
+         *   TCP/BOTH  → dial TCP (BOTH must not stick on udp_fd or data
+         *               never gets a stream and try_reconnect is skipped)
+         */
+        if (ctx->connections[i].outbound &&
+            (ctx->connections[i].fd < 0 ||
+             (ctx->transport == DISLMDB_TRANSPORT_UDP &&
+              ctx->connections[i].info.state == DISLMDB_CONNECTION_CLOSED &&
+              conn_can_udp(ctx, i)))) {
+            if (ctx->transport == DISLMDB_TRANSPORT_UDP && conn_can_udp(ctx, i)) {
+                if (ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTED ||
+                    ctx->connections[i].fd < 0) {
+                    ctx->connections[i].info.state = DISLMDB_CONNECTION_CONNECTED;
+                    ctx->connections[i].hello_reengage = true;
+                    ctx->connections[i].fd = ctx->udp_fd;
+                    ctx->stats.active_connections =
+                        recount_active_connections_locked(ctx);
+                    if (n_hello < NET_MAX_CONNECTIONS &&
+                        ctx->connections[i].info.node_id[0] != '\0') {
+                        strncpy(reconnect_labels[n_hello],
+                                ctx->connections[i].info.node_id,
+                                sizeof(reconnect_labels[n_hello]) - 1);
+                        reconnect_labels[n_hello]
+                            [sizeof(reconnect_labels[n_hello]) - 1] = '\0';
+                        n_hello++;
+                        ctx->connections[i].hello_reengage = false;
+                    }
+                }
+                if (n_send < NET_MAX_CONNECTIONS) {
+                    send_idx[n_send++] = i;
+                }
+                continue;
+            }
+            if (ctx->connections[i].fd < 0) {
                 int tr = try_reconnect(ctx, i);
                 if (tr == 1 && n_pending < NET_MAX_CONNECTIONS) {
                     pending_mtls[n_pending++] = i;
                 } else if (tr == 0) {
                     strncpy(reconnect_labels[n_hello], ctx->connections[i].info.node_id,
                             sizeof(reconnect_labels[n_hello]) - 1);
-                    reconnect_labels[n_hello][sizeof(reconnect_labels[n_hello]) - 1] = '\0';
+                    reconnect_labels[n_hello][sizeof(reconnect_labels[n_hello]) - 1] =
+                        '\0';
                     n_hello++;
                 }
             }
@@ -798,7 +835,9 @@ static void send_heartbeats(network_context *ctx)
         if (ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTING) {
             continue; /* finish_reconnect_mtls handles these */
         }
+        /* Stale-close TCP/BOTH streams only — pure UDP stays connectionless. */
         if (ctx->connections[i].outbound &&
+            ctx->transport != DISLMDB_TRANSPORT_UDP &&
             ctx->connections[i].info.last_activity_time > 0 &&
             now - ctx->connections[i].info.last_activity_time > stale_limit) {
             close_conn(ctx, i);
@@ -907,10 +946,10 @@ static int write_framed(network_context *ctx, int fd,
         }
     }
 
-    /* UDP path: DQGM v2 session envelope + framed message (QUIC/WT substrate). */
+    /* UDP path: DQGM v3 session envelope + framed message (QUIC/WT substrate). */
     if (ctx->udp_fd >= 0 && fd == ctx->udp_fd) {
         size_t body = NET_HEADER_WIRE_SIZE + wire_size + NET_HMAC_SIZE;
-        size_t total = DISLMDB_DGRAM_ENVELOPE_V2_SIZE + body;
+        size_t total = DISLMDB_DGRAM_ENVELOPE_V3_SIZE + body;
         if (total > 65507) {
             free(sealed);
             return DISLMDB_ERR_BUFFER_OVERFLOW;
@@ -921,33 +960,16 @@ static int write_framed(network_context *ctx, int fd,
             return DISLMDB_ERR_MEMORY_ERROR;
         }
         uint64_t pkt;
-        pthread_mutex_lock(&ctx->lock);
-        if (ctx->dgram_pkt_num == 0) {
-            ctx->dgram_pkt_num = 1;
-        }
-        pkt = ctx->dgram_pkt_num++;
-        pthread_mutex_unlock(&ctx->lock);
-        dislmdb_write_u32(dgram, DISLMDB_DQGM_MAGIC);
-        dgram[4] = DISLMDB_DQGM_VERSION; /* v2: includes pkt_num */
-        dgram[5] = 0; /* flags */
-        /* stream_id: 0 = signalling, 1 = bulk/data (WebTransport-oriented) */
-        uint16_t stream = dislmdb_network_is_signalling(message->header.type) ? 0u : 1u;
-        dislmdb_write_u16(dgram + 6, stream);
-        dislmdb_write_u64(dgram + 8, ctx->dgram_cid);
-        dislmdb_write_u64(dgram + 16, pkt);
-        memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE, header_buf, NET_HEADER_WIRE_SIZE);
-        if (wire_size > 0 && wire_payload) {
-            memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE + NET_HEADER_WIRE_SIZE,
-                   wire_payload, wire_size);
-        }
-        memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE + NET_HEADER_WIRE_SIZE + wire_size,
-               hmac, NET_HMAC_SIZE);
-        free(sealed);
+        uint64_t ack = 0;
         struct sockaddr_in to;
         memset(&to, 0, sizeof(to));
         to.sin_family = AF_INET;
         bool found = false;
         pthread_mutex_lock(&ctx->lock);
+        if (ctx->dgram_pkt_num == 0) {
+            ctx->dgram_pkt_num = 1;
+        }
+        pkt = ctx->dgram_pkt_num++;
         for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
             if (!ctx->connections[i].in_use ||
                 ctx->connections[i].info.hostname[0] == '\0') {
@@ -956,6 +978,10 @@ static int write_framed(network_context *ctx, int fd,
             if (message->header.target_id[0] != '\0' &&
                 strncmp(ctx->connections[i].info.node_id, message->header.target_id, 63) != 0) {
                 continue;
+            }
+            /* Cumulative ACK: highest contiguous pkt accepted from this peer */
+            if (ctx->connections[i].peer_pkt_seen) {
+                ack = ctx->connections[i].peer_last_pkt;
             }
             to.sin_port = htons(ctx->connections[i].listen_port
                                     ? ctx->connections[i].listen_port
@@ -966,6 +992,24 @@ static int write_framed(network_context *ctx, int fd,
             }
         }
         pthread_mutex_unlock(&ctx->lock);
+        dislmdb_write_u32(dgram, DISLMDB_DQGM_MAGIC);
+        dgram[4] = DISLMDB_DQGM_VERSION; /* v3: pkt_num + cumulative ack */
+        /* First packet of a session advertises CID reset so peers can rebind. */
+        dgram[5] = (pkt == 1ull) ? (uint8_t)DISLMDB_DQGM_FLAG_CID_RESET : 0u;
+        /* stream_id: 0 = signalling, 1 = bulk/data (WebTransport-oriented) */
+        uint16_t stream = dislmdb_network_is_signalling(message->header.type) ? 0u : 1u;
+        dislmdb_write_u16(dgram + 6, stream);
+        dislmdb_write_u64(dgram + 8, ctx->dgram_cid);
+        dislmdb_write_u64(dgram + 16, pkt);
+        dislmdb_write_u64(dgram + 24, ack);
+        memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V3_SIZE, header_buf, NET_HEADER_WIRE_SIZE);
+        if (wire_size > 0 && wire_payload) {
+            memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V3_SIZE + NET_HEADER_WIRE_SIZE,
+                   wire_payload, wire_size);
+        }
+        memcpy(dgram + DISLMDB_DGRAM_ENVELOPE_V3_SIZE + NET_HEADER_WIRE_SIZE + wire_size,
+               hmac, NET_HMAC_SIZE);
+        free(sealed);
         if (!found) {
             free(dgram);
             return DISLMDB_ERR_NODE_NOT_FOUND;
@@ -1187,17 +1231,30 @@ static void *network_thread(void *arg)
             ssize_t n = recvfrom(ctx->udp_fd, dgram, sizeof(dgram), 0,
                                  (struct sockaddr *)&peer, &plen);
             if (n > (ssize_t)(NET_HEADER_WIRE_SIZE + NET_HMAC_SIZE)) {
-                /* Strip DQGM session envelope when present (v1 legacy + v2 pkt_num). */
+                /* Strip DQGM session envelope (v1/v2/v3 — ack on v3). */
                 const uint8_t *frame = dgram;
                 size_t frame_len = (size_t)n;
                 bool has_dqgm = false;
                 bool has_pkt = false;
+                bool has_ack = false;
+                uint8_t dqgm_flags = 0;
                 uint64_t dqgm_cid = 0;
                 uint64_t dqgm_pkt = 0;
+                uint64_t dqgm_ack = 0;
                 if (frame_len >= DISLMDB_DGRAM_ENVELOPE_V1_SIZE &&
                     dislmdb_read_u32(dgram) == DISLMDB_DQGM_MAGIC) {
                     uint8_t ver = dgram[4];
-                    if (ver == 2 && frame_len >= DISLMDB_DGRAM_ENVELOPE_V2_SIZE) {
+                    dqgm_flags = dgram[5];
+                    if (ver == 3 && frame_len >= DISLMDB_DGRAM_ENVELOPE_V3_SIZE) {
+                        has_dqgm = true;
+                        has_pkt = true;
+                        has_ack = true;
+                        dqgm_cid = dislmdb_read_u64(dgram + 8);
+                        dqgm_pkt = dislmdb_read_u64(dgram + 16);
+                        dqgm_ack = dislmdb_read_u64(dgram + 24);
+                        frame = dgram + DISLMDB_DGRAM_ENVELOPE_V3_SIZE;
+                        frame_len -= DISLMDB_DGRAM_ENVELOPE_V3_SIZE;
+                    } else if (ver == 2 && frame_len >= DISLMDB_DGRAM_ENVELOPE_V2_SIZE) {
                         has_dqgm = true;
                         has_pkt = true;
                         dqgm_cid = dislmdb_read_u64(dgram + 8);
@@ -1304,31 +1361,82 @@ static void *network_thread(void *arg)
                             if (sport != 0 && ctx->connections[idx].listen_port == 0) {
                                 ctx->connections[idx].listen_port = sport;
                             }
+                            if (sport != 0) {
+                                ctx->connections[idx].info.port = sport;
+                            }
                             if (ctx->connections[idx].info.hostname[0] == '\0') {
                                 strncpy(ctx->connections[idx].info.hostname, host,
                                         sizeof(ctx->connections[idx].info.hostname) - 1);
                             }
+                            /*
+                             * Peer restart / stale-close: datagram proves the
+                             * peer is reachable. Revive CLOSED slots so
+                             * broadcast includes them. Pure UDP may bind the
+                             * shared datagram fd; BOTH/TCP keep fd unset so
+                             * heartbeat can dial a stream.
+                             */
+                            if (ctx->connections[idx].info.state !=
+                                    DISLMDB_CONNECTION_CONNECTED &&
+                                ctx->connections[idx].info.state !=
+                                    DISLMDB_CONNECTION_CONNECTING) {
+                                ctx->connections[idx].info.state =
+                                    DISLMDB_CONNECTION_CONNECTED;
+                                ctx->connections[idx].hello_reengage = true;
+                                if (ctx->transport == DISLMDB_TRANSPORT_UDP &&
+                                    ctx->udp_fd >= 0 &&
+                                    (ctx->connections[idx].fd < 0 ||
+                                     ctx->connections[idx].fd == ctx->udp_fd)) {
+                                    ctx->connections[idx].fd = ctx->udp_fd;
+                                }
+                                ctx->stats.active_connections =
+                                    recount_active_connections_locked(ctx);
+                            }
                         }
                         bool cid_ok = true;
                         if (idx >= 0 && has_dqgm) {
+                            bool session_reset =
+                                (dqgm_flags & DISLMDB_DQGM_FLAG_CID_RESET) != 0 ||
+                                (has_pkt && dqgm_pkt == 1ull);
                             if (!ctx->connections[idx].peer_cid_bound) {
                                 ctx->connections[idx].peer_dgram_cid = dqgm_cid;
                                 ctx->connections[idx].peer_cid_bound = true;
                             } else if (ctx->connections[idx].peer_dgram_cid != dqgm_cid) {
-                                /* Session CID mismatch — drop (QUIC/WT bind) */
-                                cid_ok = false;
-                                ctx->stats.total_errors++;
+                                if (session_reset) {
+                                    ctx->connections[idx].peer_dgram_cid = dqgm_cid;
+                                    ctx->connections[idx].peer_last_pkt = 0;
+                                    ctx->connections[idx].peer_pkt_seen = false;
+                                    ctx->stats.dqgm_session_rebind++;
+                                } else {
+                                    cid_ok = false;
+                                    ctx->stats.dqgm_cid_mismatch++;
+                                    ctx->stats.total_errors++;
+                                }
+                            } else if (session_reset) {
+                                /* Same CID but sender restarted pkt space */
+                                ctx->connections[idx].peer_last_pkt = 0;
+                                ctx->connections[idx].peer_pkt_seen = false;
+                                ctx->stats.dqgm_session_rebind++;
                             }
                             if (cid_ok && has_pkt) {
                                 if (ctx->connections[idx].peer_pkt_seen &&
                                     dqgm_pkt <= ctx->connections[idx].peer_last_pkt) {
-                                    /* Replay / stale packet — drop */
                                     cid_ok = false;
+                                    ctx->stats.dqgm_replay_drop++;
                                     ctx->stats.total_errors++;
                                 } else {
                                     ctx->connections[idx].peer_last_pkt = dqgm_pkt;
                                     ctx->connections[idx].peer_pkt_seen = true;
                                 }
+                            }
+                            if (cid_ok && has_ack) {
+                                ctx->stats.dqgm_ack_rx++;
+                                if (dqgm_ack > ctx->connections[idx].local_acked_pkt) {
+                                    ctx->connections[idx].local_acked_pkt = dqgm_ack;
+                                    ctx->stats.dqgm_ack_advance++;
+                                }
+                            }
+                            if (cid_ok) {
+                                ctx->stats.dqgm_packets_rx++;
                             }
                         }
                         if (idx >= 0 && msg.header.sender_id[0] != '\0') {
@@ -2233,6 +2341,23 @@ int dislmdb_network_connect(DISLMDB_env *env,
     extern int dislmdb_pbft_send_hello(DISLMDB_env *env, const char *target_node_id);
     (void)dislmdb_pbft_send_hello(env, peer_label);
     return DISLMDB_SUCCESS;
+}
+
+bool dislmdb_network_take_hello_reengage(DISLMDB_env *env, const char *node_id)
+{
+    if (!env || !env->network_context || !node_id || node_id[0] == '\0') {
+        return false;
+    }
+    network_context *ctx = env->network_context;
+    pthread_mutex_lock(&ctx->lock);
+    int idx = find_conn_by_id(ctx, node_id);
+    bool need = false;
+    if (idx >= 0 && ctx->connections[idx].hello_reengage) {
+        need = true;
+        ctx->connections[idx].hello_reengage = false;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return need;
 }
 
 int dislmdb_network_bind_peer_id(DISLMDB_env *env,

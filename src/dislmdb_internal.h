@@ -191,8 +191,10 @@ struct DISLMDB_txn {
 #define DISLMDB_DQGM_MAGIC 0x4451474Du  /* DQGM — UDP datagram session envelope */
 #define DISLMDB_DGRAM_ENVELOPE_V1_SIZE 16 /* magic+ver+flags+stream+cid */
 #define DISLMDB_DGRAM_ENVELOPE_V2_SIZE 24 /* v1 + pkt_num (QUIC-oriented) */
-#define DISLMDB_DGRAM_ENVELOPE_SIZE DISLMDB_DGRAM_ENVELOPE_V2_SIZE
-#define DISLMDB_DQGM_VERSION 2
+#define DISLMDB_DGRAM_ENVELOPE_V3_SIZE 32 /* v2 + cumulative ack_num */
+#define DISLMDB_DGRAM_ENVELOPE_SIZE DISLMDB_DGRAM_ENVELOPE_V3_SIZE
+#define DISLMDB_DQGM_VERSION 3
+#define DISLMDB_DQGM_FLAG_CID_RESET 0x01u /* sender restarted session (optional) */
 
 int dislmdb_persist_save(DISLMDB_env *env);
 int dislmdb_persist_load(DISLMDB_env *env);
@@ -370,4 +372,4 @@ int dislmdb_serialize_operation(const DISLMDB_operation *operation,
                                size_t size,
                                size_t *bytes_written);
 
-#endif /* DISLMDB_INTERNAL_H */ 
+#endif /* DISLMDB_INTERNAL_H */

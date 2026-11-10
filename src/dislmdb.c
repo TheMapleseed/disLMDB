@@ -1109,6 +1109,12 @@ int dislmdb_get_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics)
         if (dislmdb_network_get_stats(env, &ns) == DISLMDB_SUCCESS) {
             metrics->active_connections = ns.active_connections;
             metrics->total_sync_bytes += ns.total_bytes_received + ns.total_bytes_sent;
+            metrics->dqgm_packets_rx = ns.dqgm_packets_rx;
+            metrics->dqgm_cid_mismatch = ns.dqgm_cid_mismatch;
+            metrics->dqgm_replay_drop = ns.dqgm_replay_drop;
+            metrics->dqgm_session_rebind = ns.dqgm_session_rebind;
+            metrics->dqgm_ack_rx = ns.dqgm_ack_rx;
+            metrics->dqgm_ack_advance = ns.dqgm_ack_advance;
         }
     }
     return DISLMDB_SUCCESS;
