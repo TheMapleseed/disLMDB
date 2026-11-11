@@ -95,6 +95,13 @@ INTEGRATION_TESTS := \
   $(BINDIR)/test_acl \
   $(BINDIR)/test_system_surface \
   $(BINDIR)/test_raft_learner \
+  $(BINDIR)/test_multikey_txn \
+  $(BINDIR)/test_index_versioned \
+  $(BINDIR)/test_index_query \
+  $(BINDIR)/test_connect_churn_quic \
+  $(BINDIR)/test_quic_pki_reject \
+  $(BINDIR)/test_geo_regions \
+  $(BINDIR)/test_slo_baseline \
   $(BINDIR)/test_op_status \
   $(BINDIR)/test_membership \
   $(BINDIR)/test_shard_map \
@@ -171,6 +178,8 @@ lib: $(LIBDIR)/libdislmdb.$(SHARED_EXT)
 
 examples: $(BINDIR)/basic_example $(BINDIR)/distributed_example $(BINDIR)/bytecode_example
 
+tools: $(BINDIR)/dislmdb_admin
+
 smoke-example: $(BINDIR)/distributed_example
 	@chmod +x examples/run_distributed_smoke.sh
 	@./examples/run_distributed_smoke.sh
@@ -182,6 +191,9 @@ $(BINDIR)/distributed_example: examples/distributed_example.c $(LIBDIR)/libdislm
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
 $(BINDIR)/bytecode_example: examples/bytecode_example.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
+$(BINDIR)/dislmdb_admin: tools/dislmdb_admin.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
 # --- Test binaries ----------------------------------------------------------
@@ -241,6 +253,34 @@ $(BINDIR)/test_system_surface: tests/integration/test_system_surface.c $(LIBDIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
 $(BINDIR)/test_raft_learner: tests/integration/test_raft_learner.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_multikey_txn: tests/integration/test_multikey_txn.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_index_versioned: tests/integration/test_index_versioned.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_index_query: tests/integration/test_index_query.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_connect_churn_quic: tests/integration/test_connect_churn_quic.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_quic_pki_reject: tests/integration/test_quic_pki_reject.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_geo_regions: tests/integration/test_geo_regions.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_slo_baseline: tests/integration/test_slo_baseline.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
 
@@ -404,16 +444,23 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@cd $(BUILD) && ./bin/test_raft_quic
 	@cd $(BUILD) && ./bin/test_raft_tcp
 	@cd $(BUILD) && ./bin/test_raft_learner
+	@cd $(BUILD) && ./bin/test_multikey_txn
+	@cd $(BUILD) && ./bin/test_index_versioned
+	@cd $(BUILD) && ./bin/test_index_query
 	@cd $(BUILD) && ./bin/test_raft_both
 	@cd $(BUILD) && ./bin/test_raft_mtls
 	@cd $(BUILD) && ./bin/test_raft_mtls_tcp
 	@cd $(BUILD) && ./bin/test_raft_matrix
 	@cd $(BUILD) && ./bin/test_connect_churn
+	@cd $(BUILD) && ./bin/test_connect_churn_quic
 	@cd $(BUILD) && ./bin/test_auth_reject
+	@cd $(BUILD) && ./bin/test_quic_pki_reject
 	@cd $(BUILD) && ./bin/test_topo_env
 	@cd $(BUILD) && ./bin/test_topo_modes
 	@cd $(BUILD) && ./bin/test_topo_forward
 	@cd $(BUILD) && ./bin/test_topo_plane
+	@cd $(BUILD) && ./bin/test_geo_regions
+	@cd $(BUILD) && ./bin/test_slo_baseline
 	@cd $(BUILD) && ./bin/test_raft_wal
 	@cd $(BUILD) && ./bin/test_raft_wal_chaos
 	@cd $(BUILD) && ./bin/test_raft_fault
@@ -425,18 +472,44 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 
 # Repeat flake-prone / matrix cells for soak confidence
 check-stress: $(BINDIR)/test_raft_mtls $(BINDIR)/test_raft_matrix \
-		$(BINDIR)/test_connect_churn $(BINDIR)/test_cluster_rig
+		$(BINDIR)/test_connect_churn $(BINDIR)/test_cluster_rig \
+		$(BINDIR)/test_raft_quic
 	@echo ""
-	@echo ">>>> Stress (repeat flake-prone + matrix + churn)"
+	@echo ">>>> Stress (repeat flake-prone + matrix + churn + QUIC)"
 	@fails=0; \
 	for i in $$(seq 1 20); do \
 	  $(BINDIR)/test_raft_mtls >/dev/null || { fails=$$((fails+1)); echo "raft_mtls fail $$i"; }; \
+	done; \
+	for i in $$(seq 1 20); do \
+	  $(BINDIR)/test_raft_quic >/dev/null || { fails=$$((fails+1)); echo "raft_quic fail $$i"; }; \
 	done; \
 	$(BINDIR)/test_raft_matrix || fails=$$((fails+1)); \
 	$(BINDIR)/test_connect_churn || fails=$$((fails+1)); \
 	cd $(BUILD) && ./bin/test_cluster_rig || fails=$$((fails+1)); \
 	if [ $$fails -ne 0 ]; then echo "STRESS FAILED ($$fails)"; exit 1; fi; \
-	echo "Stress PASSED (20× raft_mtls + matrix + connect_churn + cluster_rig)."
+	echo "Stress PASSED (20× raft_mtls + 20× raft_quic + matrix + connect_churn + cluster_rig)."
+
+# Measure hub election + leaf catchup; prints p50/p99 for docs/soak_slos.kdl.
+DISLMDB_SLO_ROUNDS ?= 10
+measure-slos: $(BINDIR)/test_slo_baseline
+	@echo ""
+	@echo ">>>> SLO baseline (DISLMDB_SLO_ROUNDS=$(DISLMDB_SLO_ROUNDS))"
+	@cd $(BUILD) && DISLMDB_SLO_ROUNDS=$(DISLMDB_SLO_ROUNDS) ./bin/test_slo_baseline
+
+# Optional nightly QUIC long soak (minutes). Override rounds via DISLMDB_QUIC_SOAK_ROUNDS.
+DISLMDB_QUIC_SOAK_ROUNDS ?= 30
+check-quic-soak: $(BINDIR)/test_raft_quic $(BINDIR)/test_connect_churn_quic \
+		$(BINDIR)/test_quic_pki_reject
+	@echo ""
+	@echo ">>>> QUIC long soak ($(DISLMDB_QUIC_SOAK_ROUNDS) rounds raft_quic + churn + pki)"
+	@fails=0; \
+	for i in $$(seq 1 $(DISLMDB_QUIC_SOAK_ROUNDS)); do \
+	  $(BINDIR)/test_raft_quic >/dev/null || { fails=$$((fails+1)); echo "raft_quic fail $$i"; }; \
+	  $(BINDIR)/test_connect_churn_quic >/dev/null || { fails=$$((fails+1)); echo "churn_quic fail $$i"; }; \
+	done; \
+	$(BINDIR)/test_quic_pki_reject >/dev/null || fails=$$((fails+1)); \
+	if [ $$fails -ne 0 ]; then echo "QUIC SOAK FAILED ($$fails)"; exit 1; fi; \
+	echo "QUIC soak PASSED ($(DISLMDB_QUIC_SOAK_ROUNDS)× raft_quic+churn + pki)."
 
 e2e: $(E2E_RUNNER)
 	@echo ""
@@ -480,6 +553,14 @@ pc: | dirs
 # High-level Rust binding (edition 2024); requires `make lib` first
 rust-bindings: lib
 	@cd bindings/rust && cargo test
+
+# Thin Go cgo binding; requires `make lib` first (soft-skip if go missing)
+go-bindings: lib
+	@if command -v go >/dev/null 2>&1; then \
+	  cd bindings/go && go test; \
+	else \
+	  echo "go-bindings: go toolchain not found — skipped (bindings/go sources still present)"; \
+	fi
 
 clean:
 	rm -rf $(BUILD)

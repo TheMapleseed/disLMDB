@@ -103,6 +103,16 @@ enum {
 #define DISLMDB_ACL_PRINCIPAL_MAX 64
 /** @brief Max principals in the in-memory ACL table */
 #define DISLMDB_ACL_MAX_PRINCIPALS 64
+/** @brief Max key-prefix length for prefix ACL grants (excluding NUL) */
+#define DISLMDB_ACL_PREFIX_MAX 64
+/** @brief Max prefix grants in the in-memory ACL table */
+#define DISLMDB_ACL_MAX_PREFIX_GRANTS 128
+/** @brief Max RBAC role name length (excluding NUL) */
+#define DISLMDB_ACL_ROLE_MAX 64
+/** @brief Max roles in the in-memory RBAC table */
+#define DISLMDB_ACL_MAX_ROLES 64
+/** @brief Max principal→role memberships */
+#define DISLMDB_ACL_MAX_ROLE_MEMBERS 256
 
 #ifdef __cplusplus
 }

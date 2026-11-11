@@ -152,6 +152,119 @@ int main(void)
                   0);
     EXPECT_EQ_INT(&ctx, "put_re", try_put(env, "k3", "v3"), 0);
 
+    /* Prefix ACL: carol may write only under user/carol/ */
+    EXPECT_EQ_INT(&ctx, "grant_carol_pfx",
+                  dislmdb_acl_grant_prefix(env, "carol", "user/carol/",
+                                           DISLMDB_ACL_WRITE | DISLMDB_ACL_READ),
+                  0);
+    unsigned int pfx = 0;
+    EXPECT_EQ_INT(&ctx, "get_pfx",
+                  dislmdb_acl_get_prefix(env, "carol", "user/carol/", &pfx), 0);
+    EXPECT_TRUE(&ctx, "pfx_rw",
+                (pfx & (DISLMDB_ACL_READ | DISLMDB_ACL_WRITE)) ==
+                    (DISLMDB_ACL_READ | DISLMDB_ACL_WRITE));
+    EXPECT_EQ_INT(&ctx, "pfx_admin_rej",
+                  dislmdb_acl_grant_prefix(env, "carol", "user/carol/",
+                                           DISLMDB_ACL_ADMIN),
+                  DISLMDB_ERR_INVALID_PARAMETER);
+
+    EXPECT_EQ_INT(&ctx, "as_carol", dislmdb_acl_set_principal(env, "carol"), 0);
+    EXPECT_EQ_INT(&ctx, "carol_other_deny", try_put(env, "user/alice/x", "no"),
+                  DISLMDB_ERR_NOT_AUTHORIZED);
+    EXPECT_EQ_INT(&ctx, "carol_own_ok", try_put(env, "user/carol/inbox", "yes"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "carol_ckpt_deny", dislmdb_checkpoint(env),
+                  DISLMDB_ERR_NOT_AUTHORIZED);
+
+    /* Persist prefix grants across reopen. */
+    dislmdb_env_close(env);
+    env = NULL;
+    EXPECT_EQ_INT(&ctx, "create_pfx", dislmdb_env_create(&env), 0);
+    dislmdb_env_config_init(&cfg);
+    cfg.path = DBPATH;
+    cfg.mapsize = 8 * 1024 * 1024;
+    cfg.maxdbs = 8;
+    cfg.consensus.mechanism = DISLMDB_CONSENSUS_PBFT;
+    cfg.consensus.fault_tolerance = 0;
+    cfg.consensus.persist_state = true;
+    cfg.enable_acl = true;
+    EXPECT_EQ_INT(&ctx, "open_pfx", dislmdb_env_open(env, &cfg), 0);
+    pfx = 0;
+    EXPECT_EQ_INT(&ctx, "pfx_re",
+                  dislmdb_acl_get_prefix(env, "carol", "user/carol/", &pfx), 0);
+    EXPECT_TRUE(&ctx, "pfx_re_rw", (pfx & DISLMDB_ACL_WRITE) != 0);
+    EXPECT_EQ_INT(&ctx, "as_carol_re", dislmdb_acl_set_principal(env, "carol"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "carol_re_ok", try_put(env, "user/carol/out", "y"), 0);
+    EXPECT_EQ_INT(&ctx, "as_alice_rev", dislmdb_acl_set_principal(env, "alice"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "revoke_pfx",
+                  dislmdb_acl_revoke_prefix(env, "carol", "user/carol/",
+                                            DISLMDB_ACL_WRITE | DISLMDB_ACL_READ),
+                  0);
+    EXPECT_EQ_INT(&ctx, "as_carol_gone", dislmdb_acl_set_principal(env, "carol"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "carol_gone_deny",
+                  try_put(env, "user/carol/z", "n"), DISLMDB_ERR_NOT_AUTHORIZED);
+
+    /* RBAC: global writer role + prefix-scoped reader role */
+    EXPECT_EQ_INT(&ctx, "as_alice_rbac", dislmdb_acl_set_principal(env, "alice"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "role_writer",
+                  dislmdb_acl_role_define(env, "writer", NULL,
+                                          DISLMDB_ACL_READ | DISLMDB_ACL_WRITE),
+                  0);
+    EXPECT_EQ_INT(&ctx, "role_tenant",
+                  dislmdb_acl_role_define(env, "tenant_dave", "dave/",
+                                          DISLMDB_ACL_READ | DISLMDB_ACL_WRITE),
+                  0);
+    EXPECT_EQ_INT(&ctx, "assign_eve",
+                  dislmdb_acl_role_assign(env, "eve", "writer"), 0);
+    EXPECT_EQ_INT(&ctx, "assign_dave",
+                  dislmdb_acl_role_assign(env, "dave", "tenant_dave"), 0);
+    unsigned int eff = 0;
+    EXPECT_EQ_INT(&ctx, "eff_eve", dislmdb_acl_effective(env, "eve", &eff), 0);
+    EXPECT_TRUE(&ctx, "eve_rw",
+                (eff & (DISLMDB_ACL_READ | DISLMDB_ACL_WRITE)) ==
+                    (DISLMDB_ACL_READ | DISLMDB_ACL_WRITE));
+    EXPECT_EQ_INT(&ctx, "as_eve", dislmdb_acl_set_principal(env, "eve"), 0);
+    EXPECT_EQ_INT(&ctx, "eve_put", try_put(env, "anywhere", "1"), 0);
+    EXPECT_EQ_INT(&ctx, "as_dave", dislmdb_acl_set_principal(env, "dave"), 0);
+    EXPECT_EQ_INT(&ctx, "dave_other", try_put(env, "eve/x", "n"),
+                  DISLMDB_ERR_NOT_AUTHORIZED);
+    EXPECT_EQ_INT(&ctx, "dave_own", try_put(env, "dave/inbox", "y"), 0);
+
+    dislmdb_env_close(env);
+    env = NULL;
+    EXPECT_EQ_INT(&ctx, "create_rbac", dislmdb_env_create(&env), 0);
+    dislmdb_env_config_init(&cfg);
+    cfg.path = DBPATH;
+    cfg.mapsize = 8 * 1024 * 1024;
+    cfg.maxdbs = 8;
+    cfg.consensus.mechanism = DISLMDB_CONSENSUS_PBFT;
+    cfg.consensus.fault_tolerance = 0;
+    cfg.consensus.persist_state = true;
+    cfg.enable_acl = true;
+    EXPECT_EQ_INT(&ctx, "open_rbac", dislmdb_env_open(env, &cfg), 0);
+    unsigned int rperms = 0;
+    char rpfx[64] = {0};
+    EXPECT_EQ_INT(&ctx, "role_get",
+                  dislmdb_acl_role_get(env, "tenant_dave", &rperms, rpfx,
+                                       sizeof(rpfx)),
+                  0);
+    EXPECT_STREQ(&ctx, "role_pfx", rpfx, "dave/");
+    EXPECT_EQ_INT(&ctx, "as_dave_re", dislmdb_acl_set_principal(env, "dave"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "dave_re_ok", try_put(env, "dave/out", "z"), 0);
+    EXPECT_EQ_INT(&ctx, "as_alice_un", dislmdb_acl_set_principal(env, "alice"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "unassign",
+                  dislmdb_acl_role_unassign(env, "dave", "tenant_dave"), 0);
+    EXPECT_EQ_INT(&ctx, "as_dave_gone", dislmdb_acl_set_principal(env, "dave"),
+                  0);
+    EXPECT_EQ_INT(&ctx, "dave_gone", try_put(env, "dave/z", "n"),
+                  DISLMDB_ERR_NOT_AUTHORIZED);
+
     dislmdb_env_close(env);
     rm_rf(DBPATH);
 

@@ -26,8 +26,23 @@
  *   BYTECODE_GET id=<id>
  *   ACL_GRANT principal=<id> perms=read|write|admin|all
  *   ACL_REVOKE principal=<id> perms=...
+ *   ACL_GRANT_PREFIX principal=<id> prefix=<p> perms=read|write
+ *   ACL_REVOKE_PREFIX principal=<id> prefix=<p> perms=...
+ *   ACL_GET_PREFIX principal=<id> prefix=<p>
+ *   ACL_ROLE_DEFINE role=<name> [prefix=<p>] perms=read|write|admin|all
+ *   ACL_ROLE_UNDEFINE role=<name>
+ *   ACL_ROLE_GET role=<name>
+ *   ACL_ROLE_ASSIGN principal=<id> role=<name>
+ *   ACL_ROLE_UNASSIGN principal=<id> role=<name>
+ *   ACL_EFFECTIVE principal=<id>
  *   ACL_PRINCIPAL name=<id>
  *   ACL_GET principal=<id>
+ *   INDEX_PUT primary=<db> index=<db> pkey=<k> pval=<v> skey=<k>
+ *   INDEX_DEL primary=<db> index=<db> pkey=<k> skey=<k>
+ *   INDEX_GET primary=<db> index=<db> skey=<k>
+ *   INDEX_SCAN primary=<db> index=<db> [prefix=<p>] [limit=<n>]
+ *   PUT_VERSIONED db=<name> key=<k> value=<v> version=<u64>
+ *   GET_VERSIONED db=<name> key=<k>
  *   REGION | LOCALITY | TOPO | VOTING
  *   EXPECT_OK | EXPECT_ERR <code>
  *   ECHO <text...>
@@ -93,6 +108,44 @@ static void emit_rc(const char *tag, int rc)
 {
     printf("%s rc=%d err=%s\n", tag, rc, dislmdb_strerror(rc));
     fflush(stdout);
+}
+
+typedef struct {
+    size_t count;
+} e2e_scan_acc;
+
+static int e2e_scan_cb(const MDB_val *secondary_key, const MDB_val *primary_key,
+                       const MDB_val *primary_val, void *user)
+{
+    (void)secondary_key;
+    (void)primary_key;
+    (void)primary_val;
+    e2e_scan_acc *acc = (e2e_scan_acc *)user;
+    if (acc) {
+        acc->count++;
+    }
+    return 0;
+}
+
+static unsigned parse_perms(const char *v)
+{
+    unsigned perms = 0;
+    if (!v) {
+        return 0;
+    }
+    if (strstr(v, "all")) {
+        return DISLMDB_ACL_ALL;
+    }
+    if (strstr(v, "read")) {
+        perms |= DISLMDB_ACL_READ;
+    }
+    if (strstr(v, "write")) {
+        perms |= DISLMDB_ACL_WRITE;
+    }
+    if (strstr(v, "admin")) {
+        perms |= DISLMDB_ACL_ADMIN;
+    }
+    return perms;
 }
 
 static void reset_cfg(e2e_state *st)
@@ -408,19 +461,7 @@ static int run_line(e2e_state *st, char *line)
             if ((v = tok_key(args[i], "principal"))) {
                 principal = v;
             } else if ((v = tok_key(args[i], "perms"))) {
-                if (strstr(v, "all")) {
-                    perms = DISLMDB_ACL_ALL;
-                } else {
-                    if (strstr(v, "read")) {
-                        perms |= DISLMDB_ACL_READ;
-                    }
-                    if (strstr(v, "write")) {
-                        perms |= DISLMDB_ACL_WRITE;
-                    }
-                    if (strstr(v, "admin")) {
-                        perms |= DISLMDB_ACL_ADMIN;
-                    }
-                }
+                perms = parse_perms(v);
             }
         }
         if (!principal) {
@@ -465,6 +506,377 @@ static int run_line(e2e_state *st, char *line)
                principal ? principal : "", mask);
         fflush(stdout);
         return 0;
+    }
+    if (strcmp(cmd, "ACL_GRANT_PREFIX") == 0 ||
+        strcmp(cmd, "ACL_REVOKE_PREFIX") == 0) {
+        const char *principal = NULL;
+        const char *prefix = NULL;
+        unsigned perms = 0;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "principal"))) {
+                principal = v;
+            } else if ((v = tok_key(args[i], "prefix"))) {
+                prefix = v;
+            } else if ((v = tok_key(args[i], "perms"))) {
+                perms = parse_perms(v) & (DISLMDB_ACL_READ | DISLMDB_ACL_WRITE);
+            }
+        }
+        if (!principal || !prefix) {
+            emit(cmd, "rc=-1 err=missing_principal_or_prefix");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        if (strcmp(cmd, "ACL_GRANT_PREFIX") == 0) {
+            st->last_rc =
+                dislmdb_acl_grant_prefix(st->env, principal, prefix, perms);
+        } else {
+            st->last_rc =
+                dislmdb_acl_revoke_prefix(st->env, principal, prefix, perms);
+        }
+        emit_rc(cmd, st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "ACL_GET_PREFIX") == 0) {
+        const char *principal = NULL;
+        const char *prefix = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "principal"))) {
+                principal = v;
+            } else if ((v = tok_key(args[i], "prefix"))) {
+                prefix = v;
+            }
+        }
+        unsigned mask = 0;
+        st->last_rc =
+            dislmdb_acl_get_prefix(st->env, principal, prefix, &mask);
+        if (st->last_rc) {
+            emit_rc("ACL_GET_PREFIX", st->last_rc);
+            return st->last_rc;
+        }
+        printf("ACL_GET_PREFIX rc=0 principal=%s prefix=%s perms=0x%x\n",
+               principal ? principal : "", prefix ? prefix : "", mask);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "ACL_ROLE_DEFINE") == 0) {
+        const char *role = NULL, *prefix = NULL;
+        unsigned perms = 0;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "role"))) {
+                role = v;
+            } else if ((v = tok_key(args[i], "prefix"))) {
+                prefix = v;
+            } else if ((v = tok_key(args[i], "perms"))) {
+                perms = parse_perms(v);
+            }
+        }
+        if (!role || perms == 0) {
+            emit(cmd, "rc=-1 err=bad_args");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        st->last_rc =
+            dislmdb_acl_role_define(st->env, role, prefix, perms);
+        emit_rc(cmd, st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "ACL_ROLE_UNDEFINE") == 0) {
+        const char *role = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v = tok_key(args[i], "role");
+            if (v) {
+                role = v;
+            }
+        }
+        if (!role) {
+            emit(cmd, "rc=-1 err=missing_role");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        st->last_rc = dislmdb_acl_role_undefine(st->env, role);
+        emit_rc(cmd, st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "ACL_ROLE_GET") == 0) {
+        const char *role = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v = tok_key(args[i], "role");
+            if (v) {
+                role = v;
+            }
+        }
+        if (!role) {
+            emit(cmd, "rc=-1 err=missing_role");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        unsigned mask = 0;
+        char pfx[128] = {0};
+        st->last_rc =
+            dislmdb_acl_role_get(st->env, role, &mask, pfx, sizeof(pfx));
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        printf("ACL_ROLE_GET rc=0 role=%s prefix=%s perms=0x%x\n", role, pfx,
+               mask);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "ACL_ROLE_ASSIGN") == 0 ||
+        strcmp(cmd, "ACL_ROLE_UNASSIGN") == 0) {
+        const char *principal = NULL, *role = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "principal"))) {
+                principal = v;
+            } else if ((v = tok_key(args[i], "role"))) {
+                role = v;
+            }
+        }
+        if (!principal || !role) {
+            emit(cmd, "rc=-1 err=missing_principal_or_role");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        if (strcmp(cmd, "ACL_ROLE_ASSIGN") == 0) {
+            st->last_rc =
+                dislmdb_acl_role_assign(st->env, principal, role);
+        } else {
+            st->last_rc =
+                dislmdb_acl_role_unassign(st->env, principal, role);
+        }
+        emit_rc(cmd, st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "ACL_EFFECTIVE") == 0) {
+        const char *principal = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v = tok_key(args[i], "principal");
+            if (v) {
+                principal = v;
+            }
+        }
+        if (!principal) {
+            emit(cmd, "rc=-1 err=missing_principal");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        unsigned mask = 0;
+        st->last_rc = dislmdb_acl_effective(st->env, principal, &mask);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        printf("ACL_EFFECTIVE rc=0 principal=%s perms=0x%x\n", principal,
+               mask);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "INDEX_PUT") == 0 || strcmp(cmd, "INDEX_DEL") == 0) {
+        const char *primary = NULL, *index = NULL, *pkey = NULL, *pval = NULL,
+                   *skey = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "primary"))) {
+                primary = v;
+            } else if ((v = tok_key(args[i], "index"))) {
+                index = v;
+            } else if ((v = tok_key(args[i], "pkey"))) {
+                pkey = v;
+            } else if ((v = tok_key(args[i], "pval"))) {
+                pval = v;
+            } else if ((v = tok_key(args[i], "skey"))) {
+                skey = v;
+            }
+        }
+        if (!primary || !index || !pkey || !skey ||
+            (strcmp(cmd, "INDEX_PUT") == 0 && !pval)) {
+            emit(cmd, "rc=-1 err=bad_args");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        MDB_dbi pdbi, idbi;
+        st->last_rc =
+            dislmdb_dbi_open(st->txn, primary, MDB_CREATE, &pdbi);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        st->last_rc = dislmdb_dbi_open(st->txn, index, MDB_CREATE, &idbi);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        MDB_val pk = {.mv_size = strlen(pkey), .mv_data = (void *)pkey};
+        MDB_val sk = {.mv_size = strlen(skey), .mv_data = (void *)skey};
+        if (strcmp(cmd, "INDEX_PUT") == 0) {
+            MDB_val pv = {.mv_size = strlen(pval), .mv_data = (void *)pval};
+            st->last_rc =
+                dislmdb_index_put(st->txn, pdbi, idbi, &pk, &pv, &sk, 0);
+        } else {
+            st->last_rc = dislmdb_index_del(st->txn, pdbi, idbi, &pk, &sk);
+        }
+        emit_rc(cmd, st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "INDEX_GET") == 0) {
+        const char *primary = NULL, *index = NULL, *skey = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "primary"))) {
+                primary = v;
+            } else if ((v = tok_key(args[i], "index"))) {
+                index = v;
+            } else if ((v = tok_key(args[i], "skey"))) {
+                skey = v;
+            }
+        }
+        if (!primary || !index || !skey || !st->txn) {
+            emit(cmd, "rc=-1 err=bad_args");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        MDB_dbi pdbi, idbi;
+        st->last_rc = dislmdb_dbi_open(st->txn, primary, 0, &pdbi);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        st->last_rc = dislmdb_dbi_open(st->txn, index, 0, &idbi);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        MDB_val sk = {.mv_size = strlen(skey), .mv_data = (void *)skey};
+        MDB_val pk = {0}, pv = {0};
+        st->last_rc =
+            dislmdb_index_get(st->txn, pdbi, idbi, &sk, &pk, &pv);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        printf("INDEX_GET rc=0 pkey=%.*s pval=%.*s\n", (int)pk.mv_size,
+               (const char *)pk.mv_data, (int)pv.mv_size,
+               (const char *)pv.mv_data);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "INDEX_SCAN") == 0) {
+        const char *primary = NULL, *index = NULL, *prefix = NULL;
+        size_t limit = 0;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "primary"))) {
+                primary = v;
+            } else if ((v = tok_key(args[i], "index"))) {
+                index = v;
+            } else if ((v = tok_key(args[i], "prefix"))) {
+                prefix = v;
+            } else if ((v = tok_key(args[i], "limit"))) {
+                limit = (size_t)strtoull(v, NULL, 10);
+            }
+        }
+        if (!primary || !index || !st->txn) {
+            emit(cmd, "rc=-1 err=bad_args");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        MDB_dbi pdbi, idbi;
+        st->last_rc = dislmdb_dbi_open(st->txn, primary, 0, &pdbi);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        st->last_rc = dislmdb_dbi_open(st->txn, index, 0, &idbi);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        MDB_val pfx_val;
+        const MDB_val *pfx_ptr = NULL;
+        if (prefix) {
+            pfx_val.mv_size = strlen(prefix);
+            pfx_val.mv_data = (void *)prefix;
+            pfx_ptr = &pfx_val;
+        }
+        e2e_scan_acc acc = {.count = 0};
+        st->last_rc = dislmdb_index_scan(st->txn, pdbi, idbi, NULL, pfx_ptr,
+                                         limit, e2e_scan_cb, &acc);
+        if (st->last_rc) {
+            emit_rc(cmd, st->last_rc);
+            return st->last_rc;
+        }
+        printf("INDEX_SCAN rc=0 count=%zu\n", acc.count);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "PUT_VERSIONED") == 0) {
+        const char *db = "kv", *key = NULL, *val = NULL;
+        uint64_t version = 0;
+        bool have_ver = false;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "db"))) {
+                db = v;
+            } else if ((v = tok_key(args[i], "key"))) {
+                key = v;
+            } else if ((v = tok_key(args[i], "value"))) {
+                val = v;
+            } else if ((v = tok_key(args[i], "version"))) {
+                version = strtoull(v, NULL, 10);
+                have_ver = true;
+            }
+        }
+        if (!key || !val || !have_ver) {
+            emit("PUT_VERSIONED", "rc=-1 err=bad_args");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        MDB_dbi dbi;
+        st->last_rc = dislmdb_dbi_open(st->txn, db, MDB_CREATE, &dbi);
+        if (st->last_rc) {
+            emit_rc("PUT_VERSIONED", st->last_rc);
+            return st->last_rc;
+        }
+        MDB_val k = {.mv_size = strlen(key), .mv_data = (void *)key};
+        MDB_val v = {.mv_size = strlen(val), .mv_data = (void *)val};
+        st->last_rc =
+            dislmdb_put_versioned(st->txn, dbi, &k, &v, 0, version);
+        emit_rc("PUT_VERSIONED", st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "GET_VERSIONED") == 0) {
+        const char *db = "kv", *key = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "db"))) {
+                db = v;
+            } else if ((v = tok_key(args[i], "key"))) {
+                key = v;
+            }
+        }
+        if (!key) {
+            emit("GET_VERSIONED", "rc=-1 err=missing_key");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        MDB_dbi dbi;
+        st->last_rc = dislmdb_dbi_open(st->txn, db, 0, &dbi);
+        if (st->last_rc) {
+            emit_rc("GET_VERSIONED", st->last_rc);
+            return st->last_rc;
+        }
+        MDB_val k = {.mv_size = strlen(key), .mv_data = (void *)key};
+        uint64_t ver = 0;
+        char buf[1024];
+        size_t cap = sizeof(buf);
+        st->last_rc =
+            dislmdb_get_versioned(st->txn, dbi, &k, &ver, buf, &cap);
+        if (st->last_rc == 0) {
+            if (cap >= sizeof(buf)) {
+                cap = sizeof(buf) - 1;
+            }
+            buf[cap] = '\0';
+            printf("GET_VERSIONED rc=0 version=%llu value=%s\n",
+                   (unsigned long long)ver, buf);
+        } else {
+            emit_rc("GET_VERSIONED", st->last_rc);
+        }
+        fflush(stdout);
+        return st->last_rc;
     }
     if (strcmp(cmd, "REGION") == 0) {
         char buf[64] = {0};

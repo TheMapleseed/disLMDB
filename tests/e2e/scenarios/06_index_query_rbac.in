@@ -1,0 +1,46 @@
+# Phase M: INDEX_GET/SCAN + RBAC roles
+OPEN path=./e2e_work/06_index_query_rbac port=29706 acl=1
+ACL_PRINCIPAL name=alice
+ACL_GRANT principal=alice perms=all
+SET_KEY hex=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+BEGIN
+INDEX_PUT primary=entities index=idx_name pkey=u1 pval=alice skey=alice
+INDEX_PUT primary=entities index=idx_name pkey=u2 pval=amy skey=amy
+INDEX_PUT primary=entities index=idx_name pkey=u3 pval=bob skey=bob
+COMMIT
+EXPECT_OK
+BEGIN readonly
+INDEX_GET primary=entities index=idx_name skey=alice
+INDEX_SCAN primary=entities index=idx_name prefix=a
+INDEX_SCAN primary=entities index=idx_name
+INDEX_SCAN primary=entities index=idx_name limit=1
+ABORT
+ACL_ROLE_DEFINE role=writer perms=read|write
+ACL_ROLE_DEFINE role=tenant_dave prefix=dave/ perms=read|write
+ACL_ROLE_GET role=tenant_dave
+ACL_ROLE_ASSIGN principal=eve role=writer
+ACL_ROLE_ASSIGN principal=dave role=tenant_dave
+ACL_EFFECTIVE principal=eve
+ACL_PRINCIPAL name=eve
+BEGIN
+PUT db=kv key=anywhere value=1
+COMMIT
+EXPECT_OK
+ACL_PRINCIPAL name=dave
+BEGIN
+PUT db=kv key=eve/x value=n
+EXPECT_ERR 1013
+ABORT
+BEGIN
+PUT db=kv key=dave/inbox value=y
+COMMIT
+EXPECT_OK
+ACL_PRINCIPAL name=alice
+ACL_ROLE_UNASSIGN principal=dave role=tenant_dave
+ACL_PRINCIPAL name=dave
+BEGIN
+PUT db=kv key=dave/z value=n
+EXPECT_ERR 1013
+ABORT
+CLOSE
+ECHO scenario_06_complete

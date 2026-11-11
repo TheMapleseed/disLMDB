@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,14 @@ static inline void it_rm_rf(const char *p)
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", p);
     (void)system(cmd);
+}
+
+/** Monotonic milliseconds (for SLO timing). */
+static inline uint64_t it_mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
 static inline int it_mkdir(const char *p)
@@ -173,6 +182,7 @@ static inline int it_open_raft(DISLMDB_env **out, const it_raft_opts *opts)
     if (opts->enable_mtls && (!opts->cert_dir || opts->cert_dir[0] == '\0')) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    /* cert_dir without enable_mtls ⇒ QUIC CertificateVerify trust paths only */
     DISLMDB_env *env = NULL;
     int rc = dislmdb_env_create(&env);
     if (rc != 0) {
@@ -191,7 +201,7 @@ static inline int it_open_raft(DISLMDB_env **out, const it_raft_opts *opts)
     cfg.network.enable_payload_encryption = true;
     cfg.network.enable_mtls = opts->enable_mtls;
     memcpy(cfg.network.cluster_key, opts->cluster_key, 32);
-    if (opts->enable_mtls) {
+    if (opts->cert_dir && opts->cert_dir[0] != '\0') {
         snprintf(cfg.network.tls_cert_path, sizeof(cfg.network.tls_cert_path),
                  "%s/cert.pem", opts->cert_dir);
         snprintf(cfg.network.tls_key_path, sizeof(cfg.network.tls_key_path),

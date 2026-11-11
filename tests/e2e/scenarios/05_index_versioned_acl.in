@@ -1,0 +1,31 @@
+# Phase K surface: secondary index, versioned LWW, prefix ACL
+OPEN path=./e2e_work/05_index_versioned_acl port=29705 acl=1
+ACL_PRINCIPAL name=alice
+ACL_GRANT principal=alice perms=all
+SET_KEY hex=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BEGIN
+INDEX_PUT primary=entities index=idx_name pkey=u1 pval=alice skey=alice
+PUT_VERSIONED db=kv key=doc value=v100 version=100
+COMMIT
+EXPECT_OK
+BEGIN
+PUT_VERSIONED db=kv key=doc value=stale version=50
+EXPECT_ERR 1009
+ABORT
+BEGIN readonly
+GET db=idx_name key=alice
+GET_VERSIONED db=kv key=doc
+ABORT
+ACL_GRANT_PREFIX principal=carol prefix=user/carol/ perms=read|write
+ACL_GET_PREFIX principal=carol prefix=user/carol/
+ACL_PRINCIPAL name=carol
+BEGIN
+PUT db=kv key=user/alice/x value=no
+EXPECT_ERR 1013
+ABORT
+BEGIN
+PUT db=kv key=user/carol/inbox value=yes
+COMMIT
+EXPECT_OK
+CLOSE
+ECHO scenario_05_complete

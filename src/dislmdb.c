@@ -557,6 +557,10 @@ static void apply_environ_overrides(DISLMDB_env *env)
         } else if (strcasecmp(mcp, "region_priority") == 0 ||
                    strcasecmp(mcp, "region-priority") == 0) {
             env->config.mirror_conflict_policy = DISLMDB_MIRROR_REGION_PRIORITY;
+        } else if (strcasecmp(mcp, "client_timestamp") == 0 ||
+                   strcasecmp(mcp, "client-timestamp") == 0 ||
+                   strcasecmp(mcp, "lww") == 0) {
+            env->config.mirror_conflict_policy = DISLMDB_MIRROR_CLIENT_TIMESTAMP;
         }
     }
     const char *mpr = getenv("DISLMDB_MIRROR_PRIMARY_REGION");
@@ -672,7 +676,8 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
         return rc;
     }
     /* Ensure room for internal bytecode DBI */
-    unsigned int maxdbs = config->maxdbs < 2 ? 2 : config->maxdbs;
+    /* Reserve room for __dislmdb_meta__ (+ optional raft/bytecode) + app DBIs. */
+    unsigned int maxdbs = config->maxdbs < 8 ? 8 : config->maxdbs;
     rc = mdb_env_set_maxdbs(env->mdb_env, maxdbs);
     if (rc != 0) {
         dislmdb_set_error(env, rc, "Failed to set max DBs: %s", mdb_strerror(rc));
@@ -1306,6 +1311,7 @@ int dislmdb_force_sync(DISLMDB_env *env)
         /* Re-announce identity so membership stays current */
         (void)dislmdb_pbft_send_hello(env, "");
     }
+    (void)dislmdb_export_metrics_file(env, NULL);
     return DISLMDB_SUCCESS;
 }
 
@@ -1443,20 +1449,26 @@ int dislmdb_checkpoint(DISLMDB_env *env)
     if (arc != DISLMDB_SUCCESS) {
         return arc;
     }
+    int crc;
     if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
-        return dislmdb_raft_checkpoint(env);
-    }
-    if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT && env->consensus_context) {
+        crc = dislmdb_raft_checkpoint(env);
+    } else if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT &&
+               env->consensus_context) {
         ConsensusError err = consensus_core_checkpoint(env->consensus_context);
         if (err != CONSENSUS_OK) {
             return DISLMDB_ERR_CHECKPOINT_FAILED;
         }
         env->checkpoints++;
-        return dislmdb_persist_save(env);
+        crc = dislmdb_persist_save(env);
+    } else {
+        /* SOLO / unarmed: flush meta + bump checkpoint counter */
+        env->checkpoints++;
+        crc = dislmdb_persist_save(env);
     }
-    /* SOLO / unarmed: flush meta + bump checkpoint counter */
-    env->checkpoints++;
-    return dislmdb_persist_save(env);
+    if (crc == DISLMDB_SUCCESS) {
+        (void)dislmdb_export_metrics_file(env, NULL);
+    }
+    return crc;
 }
 
 int dislmdb_request_state_transfer(DISLMDB_env *env)
@@ -1673,6 +1685,60 @@ int dislmdb_format_metrics(const DISLMDB_metrics *m,
     if (buf && buf_sz > 0 && (size_t)n >= buf_sz) {
         buf[buf_sz - 1] = '\0';
         return DISLMDB_ERR_BUFFER_OVERFLOW;
+    }
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_export_metrics_file(DISLMDB_env *env, const char *path)
+{
+    if (!env || env->magic != DISLMDB_MAGIC) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    const char *dest = path;
+    if (!dest || dest[0] == '\0') {
+        dest = getenv("DISLMDB_METRICS_FILE");
+    }
+    if (!dest || dest[0] == '\0') {
+        return DISLMDB_SUCCESS;
+    }
+    if (strnlen(dest, 1024) >= 1024) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+
+    DISLMDB_metrics m;
+    int rc = dislmdb_get_metrics(env, &m);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    char text[8192];
+    size_t n = 0;
+    rc = dislmdb_format_metrics(&m, text, sizeof(text), &n);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+
+    char tmp[1100];
+    int tn = snprintf(tmp, sizeof(tmp), "%s.tmp.%d", dest, (int)getpid());
+    if (tn < 0 || (size_t)tn >= sizeof(tmp)) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    FILE *f = fopen(tmp, "w");
+    if (!f) {
+        return DISLMDB_ERR_INVALID_OPERATION;
+    }
+    size_t wr = fwrite(text, 1, n, f);
+    if (wr != n || fflush(f) != 0) {
+        fclose(f);
+        (void)unlink(tmp);
+        return DISLMDB_ERR_INVALID_OPERATION;
+    }
+    if (fclose(f) != 0) {
+        (void)unlink(tmp);
+        return DISLMDB_ERR_INVALID_OPERATION;
+    }
+    if (rename(tmp, dest) != 0) {
+        (void)unlink(tmp);
+        return DISLMDB_ERR_INVALID_OPERATION;
     }
     return DISLMDB_SUCCESS;
 }

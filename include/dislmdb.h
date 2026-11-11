@@ -95,8 +95,17 @@ typedef enum DISLMDB_MIRROR_CONFLICT_POLICY {
      * Set @ref DISLMDB_env_config.mirror_primary_region (or env
      * `DISLMDB_MIRROR_PRIMARY_REGION`). Empty primary ⇒ last-write behavior.
      */
-    DISLMDB_MIRROR_REGION_PRIORITY = 1
+    DISLMDB_MIRROR_REGION_PRIORITY = 1,
+    /**
+     * Apps should use @ref dislmdb_put_versioned / @ref dislmdb_get_versioned
+     * (8-byte BE version prefix). Stale versions are rejected locally before
+     * consensus. Plain @ref dislmdb_put remains consensus-order (LAST_WRITE).
+     */
+    DISLMDB_MIRROR_CLIENT_TIMESTAMP = 2
 } DISLMDB_MIRROR_CONFLICT_POLICY;
+
+/** On-wire size of the version prefix used by @ref dislmdb_put_versioned. */
+#define DISLMDB_VERSIONED_HEADER 8u
 
 /** @brief Wire transport for cluster traffic */
 typedef enum DISLMDB_TRANSPORT {
@@ -553,6 +562,59 @@ int dislmdb_acl_revoke(DISLMDB_env *env, const char *principal, unsigned int per
 int dislmdb_acl_get(DISLMDB_env *env, const char *principal, unsigned int *perms_out);
 
 /**
+ * @brief Grant READ/WRITE on keys matching @p key_prefix (byte prefix).
+ *
+ * Requires ADMIN (or empty global table bootstrap via @ref dislmdb_acl_grant first).
+ * @p perms may only include @ref DISLMDB_ACL_READ / @ref DISLMDB_ACL_WRITE
+ * (ADMIN on a prefix is rejected). Longest matching prefix wins at check time.
+ */
+int dislmdb_acl_grant_prefix(DISLMDB_env *env, const char *principal,
+                             const char *key_prefix, unsigned int perms);
+
+/** @brief Revoke bits from a prefix grant (requires ADMIN). Zero bits removes it. */
+int dislmdb_acl_revoke_prefix(DISLMDB_env *env, const char *principal,
+                              const char *key_prefix, unsigned int perms);
+
+/** @brief Query prefix-grant mask (0 if none / ACL off). */
+int dislmdb_acl_get_prefix(DISLMDB_env *env, const char *principal,
+                           const char *key_prefix, unsigned int *perms_out);
+
+/**
+ * @brief Define or update an RBAC role.
+ *
+ * @p key_prefix NULL/"" = global role (bits apply env-wide, including ADMIN).
+ * Non-empty prefix: READ/WRITE only, scoped like prefix grants.
+ * Requires ADMIN (after bootstrap).
+ */
+int dislmdb_acl_role_define(DISLMDB_env *env, const char *role,
+                            const char *key_prefix, unsigned int perms);
+
+/** @brief Remove a role and all its memberships (requires ADMIN). */
+int dislmdb_acl_role_undefine(DISLMDB_env *env, const char *role);
+
+/** @brief Query role definition (perms + optional prefix). */
+int dislmdb_acl_role_get(DISLMDB_env *env, const char *role,
+                         unsigned int *perms_out, char *prefix_out,
+                         size_t prefix_cap);
+
+/** @brief Assign @p principal to @p role (requires ADMIN). */
+int dislmdb_acl_role_assign(DISLMDB_env *env, const char *principal,
+                            const char *role);
+
+/** @brief Remove membership (requires ADMIN). */
+int dislmdb_acl_role_unassign(DISLMDB_env *env, const char *principal,
+                              const char *role);
+
+/**
+ * @brief Effective permission mask for @p principal.
+ *
+ * Unions direct grants with global (empty-prefix) role memberships.
+ * Prefix-scoped role bits are key-dependent (see require_key).
+ */
+int dislmdb_acl_effective(DISLMDB_env *env, const char *principal,
+                          unsigned int *perms_out);
+
+/**
  * @brief Distributed put — records the op for consensus replication.
  *
  * Under shard/hybrid, if this node is not the owner and
@@ -568,6 +630,67 @@ int dislmdb_put(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data,
  * See @ref dislmdb_put for shard auto-forward behavior.
  */
 int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data);
+
+/**
+ * @brief Put primary value and secondary→primary index entry in one txn.
+ *
+ * Both ops are recorded for a single consensus apply (atomic with other
+ * pending ops in @p txn). Index value is a copy of @p primary_key bytes.
+ */
+int dislmdb_index_put(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                      MDB_val *primary_key, MDB_val *primary_val,
+                      MDB_val *secondary_key, unsigned int flags);
+
+/**
+ * @brief Delete primary row and its secondary index entry in one txn.
+ */
+int dislmdb_index_del(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                      MDB_val *primary_key, MDB_val *secondary_key);
+
+/**
+ * @brief Lookup via secondary index: secondary → primary key → primary value.
+ *
+ * @p primary_key_out / @p primary_val_out may be NULL. On success, pointed
+ * MDB_val data is valid until the next write on @p txn (LMDB rules).
+ */
+int dislmdb_index_get(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                      MDB_val *secondary_key, MDB_val *primary_key_out,
+                      MDB_val *primary_val_out);
+
+/**
+ * @brief Callback for @ref dislmdb_index_scan — return 0 to continue, else stop.
+ */
+typedef int (*dislmdb_index_scan_cb)(const MDB_val *secondary_key,
+                                     const MDB_val *primary_key,
+                                     const MDB_val *primary_val, void *user);
+
+/**
+ * @brief Scan a secondary index (optional start + byte-prefix filter).
+ *
+ * @p start_key NULL = first. @p prefix NULL = no filter. @p limit 0 = unlimited.
+ */
+int dislmdb_index_scan(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                       const MDB_val *start_key, const MDB_val *prefix,
+                       size_t limit, dislmdb_index_scan_cb cb, void *user);
+
+/**
+ * @brief Versioned put: stores BE-u64 @p version then @p data.
+ *
+ * If an existing versioned value is present and its version >= @p version,
+ * returns @ref DISLMDB_ERR_OPERATION_REJECTED (no mutation). Prefer this under
+ * @ref DISLMDB_MIRROR_CLIENT_TIMESTAMP.
+ */
+int dislmdb_put_versioned(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key,
+                          MDB_val *data, unsigned int flags, uint64_t version);
+
+/**
+ * @brief Read a versioned value written by @ref dislmdb_put_versioned.
+ *
+ * @p data_out / @p data_cap receive the payload (after the 8-byte header).
+ * @p version_out may be NULL. Size probe: data_out NULL, data_cap non-NULL.
+ */
+int dislmdb_get_versioned(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key,
+                          uint64_t *version_out, void *data_out, size_t *data_cap);
 
 /**
  * @brief Open a named DBI within a distributed transaction (tracks name for replication)
@@ -594,6 +717,14 @@ int dislmdb_format_metrics(const DISLMDB_metrics *metrics,
                            char *buf,
                            size_t buf_sz,
                            size_t *written);
+
+/**
+ * @brief Snapshot metrics and write Prometheus text to @p path (atomic replace).
+ *
+ * Safe on a live node (no exclusive offline lock). When @p path is NULL, uses
+ * getenv("DISLMDB_METRICS_FILE") if set; otherwise returns success with no write.
+ */
+int dislmdb_export_metrics_file(DISLMDB_env *env, const char *path);
 
 /**
  * @brief Reconfigure replica membership

@@ -193,6 +193,34 @@ add_executable(test_raft_learner tests/integration/test_raft_learner.c)
 target_link_libraries(test_raft_learner dislmdb)
 add_test(NAME integration_raft_learner COMMAND test_raft_learner WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_multikey_txn tests/integration/test_multikey_txn.c)
+target_link_libraries(test_multikey_txn dislmdb)
+add_test(NAME integration_multikey_txn COMMAND test_multikey_txn WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_index_versioned tests/integration/test_index_versioned.c)
+target_link_libraries(test_index_versioned dislmdb)
+add_test(NAME integration_index_versioned COMMAND test_index_versioned WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_index_query tests/integration/test_index_query.c)
+target_link_libraries(test_index_query dislmdb)
+add_test(NAME integration_index_query COMMAND test_index_query WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_connect_churn_quic tests/integration/test_connect_churn_quic.c)
+target_link_libraries(test_connect_churn_quic dislmdb)
+add_test(NAME integration_connect_churn_quic COMMAND test_connect_churn_quic WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_quic_pki_reject tests/integration/test_quic_pki_reject.c)
+target_link_libraries(test_quic_pki_reject dislmdb)
+add_test(NAME integration_quic_pki_reject COMMAND test_quic_pki_reject WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_geo_regions tests/integration/test_geo_regions.c)
+target_link_libraries(test_geo_regions dislmdb)
+add_test(NAME integration_geo_regions COMMAND test_geo_regions WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_slo_baseline tests/integration/test_slo_baseline.c)
+target_link_libraries(test_slo_baseline dislmdb)
+add_test(NAME integration_slo_baseline COMMAND test_slo_baseline WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_op_status tests/integration/test_op_status.c)
 target_link_libraries(test_op_status dislmdb)
 add_test(NAME integration_op_status COMMAND test_op_status WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -331,7 +359,9 @@ add_custom_target(check
             test_topo_forward test_topo_plane test_raft_wal test_raft_wal_chaos
             test_multinode test_udp test_mixed
             test_mtls_cluster test_raft_udp test_raft_quic test_raft_tcp
-            test_raft_learner test_raft_both
+            test_raft_learner test_multikey_txn test_index_versioned
+            test_index_query test_connect_churn_quic test_quic_pki_reject
+            test_geo_regions test_slo_baseline test_raft_both
             test_raft_mtls test_raft_mtls_tcp test_raft_fault test_raft_stage
             test_raft_membership_it test_raft_leave test_pbft_viewchange
             test_fault_tolerance e2e_runner

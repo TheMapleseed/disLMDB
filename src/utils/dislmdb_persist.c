@@ -21,6 +21,9 @@
 #define META_KEY_TOPO_MODE "topo_mode"
 #define META_KEY_PEER_TOPO "peer_topo"
 #define META_KEY_ACL "acl_grants"
+#define META_KEY_ACL_PREFIX "acl_prefix_grants"
+#define META_KEY_ACL_ROLES "acl_roles"
+#define META_KEY_ACL_ROLE_MEMBERS "acl_role_members"
 
 /* Packed shard: count u32 + N * (id + prefix + owner [+ flags v2]) */
 #define SHARD_PACK_SIZE_V1 (DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN + 64)
@@ -306,6 +309,60 @@ int dislmdb_persist_save(DISLMDB_env *env)
             mdb_txn_abort(txn);
             return rc;
         }
+
+        uint8_t *pbuf = NULL;
+        size_t psize = 0;
+        rc = dislmdb_acl_prefix_persist_pack(env, &pbuf, &psize);
+        if (rc != DISLMDB_SUCCESS) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+        k.mv_size = strlen(META_KEY_ACL_PREFIX);
+        k.mv_data = (void *)META_KEY_ACL_PREFIX;
+        v.mv_size = psize;
+        v.mv_data = pbuf;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        free(pbuf);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+
+        uint8_t *rbuf2 = NULL;
+        size_t rsize2 = 0;
+        rc = dislmdb_acl_roles_persist_pack(env, &rbuf2, &rsize2);
+        if (rc != DISLMDB_SUCCESS) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+        k.mv_size = strlen(META_KEY_ACL_ROLES);
+        k.mv_data = (void *)META_KEY_ACL_ROLES;
+        v.mv_size = rsize2;
+        v.mv_data = rbuf2;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        free(rbuf2);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+
+        uint8_t *mbuf = NULL;
+        size_t msize = 0;
+        rc = dislmdb_acl_role_members_persist_pack(env, &mbuf, &msize);
+        if (rc != DISLMDB_SUCCESS) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+        k.mv_size = strlen(META_KEY_ACL_ROLE_MEMBERS);
+        k.mv_data = (void *)META_KEY_ACL_ROLE_MEMBERS;
+        v.mv_size = msize;
+        v.mv_data = mbuf;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        free(mbuf);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
     }
     return mdb_txn_commit(txn);
 }
@@ -539,6 +596,22 @@ int dislmdb_persist_load(DISLMDB_env *env)
     k.mv_data = (void *)META_KEY_ACL;
     if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 8) {
         (void)dislmdb_acl_persist_unpack(env, v.mv_data, v.mv_size);
+    }
+    k.mv_size = strlen(META_KEY_ACL_PREFIX);
+    k.mv_data = (void *)META_KEY_ACL_PREFIX;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 8) {
+        (void)dislmdb_acl_prefix_persist_unpack(env, v.mv_data, v.mv_size);
+    }
+    k.mv_size = strlen(META_KEY_ACL_ROLES);
+    k.mv_data = (void *)META_KEY_ACL_ROLES;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 8) {
+        (void)dislmdb_acl_roles_persist_unpack(env, v.mv_data, v.mv_size);
+    }
+    k.mv_size = strlen(META_KEY_ACL_ROLE_MEMBERS);
+    k.mv_data = (void *)META_KEY_ACL_ROLE_MEMBERS;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 8) {
+        (void)dislmdb_acl_role_members_persist_unpack(env, v.mv_data,
+                                                      v.mv_size);
     }
     mdb_txn_abort(txn);
 

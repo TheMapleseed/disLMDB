@@ -32,6 +32,12 @@ abi version="1.0" {
     fn dislmdb_dbi_open
     fn dislmdb_put
     fn dislmdb_del
+    fn dislmdb_index_put
+    fn dislmdb_index_del
+    fn dislmdb_index_get
+    fn dislmdb_index_scan
+    fn dislmdb_put_versioned
+    fn dislmdb_get_versioned
     fn dislmdb_get_lmdb_txn
     fn dislmdb_get_lmdb_env
   }
@@ -43,11 +49,21 @@ abi version="1.0" {
     fn dislmdb_acl_grant
     fn dislmdb_acl_revoke
     fn dislmdb_acl_get
+    fn dislmdb_acl_grant_prefix
+    fn dislmdb_acl_revoke_prefix
+    fn dislmdb_acl_get_prefix
+    fn dislmdb_acl_role_define
+    fn dislmdb_acl_role_undefine
+    fn dislmdb_acl_role_get
+    fn dislmdb_acl_role_assign
+    fn dislmdb_acl_role_unassign
+    fn dislmdb_acl_effective
   }
 
   metrics {
     fn dislmdb_get_metrics
     fn dislmdb_format_metrics
+    fn dislmdb_export_metrics_file
   }
 
   notes {

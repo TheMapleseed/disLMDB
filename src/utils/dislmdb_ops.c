@@ -187,7 +187,8 @@ int dislmdb_put(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data, unsi
     if (!txn || txn->magic != DISLMDB_MAGIC || !key) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    int arc = dislmdb_acl_require(txn->env, DISLMDB_ACL_WRITE);
+    int arc = dislmdb_acl_require_key(txn->env, DISLMDB_ACL_WRITE, key->mv_data,
+                                      key->mv_size);
     if (arc != DISLMDB_SUCCESS) {
         return arc;
     }
@@ -216,7 +217,8 @@ int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data)
     if (!txn || txn->magic != DISLMDB_MAGIC || !key) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    int arc = dislmdb_acl_require(txn->env, DISLMDB_ACL_WRITE);
+    int arc = dislmdb_acl_require_key(txn->env, DISLMDB_ACL_WRITE, key->mv_data,
+                                      key->mv_size);
     if (arc != DISLMDB_SUCCESS) {
         return arc;
     }
@@ -238,6 +240,241 @@ int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data)
         rc = record_op(txn, DISLMDB_OP_TYPE_DEL, dbname_for_dbi(txn, dbi), key, data, 0);
     }
     return rc;
+}
+
+int dislmdb_index_put(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                      MDB_val *primary_key, MDB_val *primary_val,
+                      MDB_val *secondary_key, unsigned int flags)
+{
+    if (!txn || !primary_key || !primary_val || !secondary_key) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    int rc = dislmdb_put(txn, primary_dbi, primary_key, primary_val, flags);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    /* Index maps secondary → primary key bytes (opaque). */
+    MDB_val idx_val = {.mv_size = primary_key->mv_size,
+                       .mv_data = primary_key->mv_data};
+    return dislmdb_put(txn, index_dbi, secondary_key, &idx_val, flags);
+}
+
+int dislmdb_index_del(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                      MDB_val *primary_key, MDB_val *secondary_key)
+{
+    if (!txn || !primary_key || !secondary_key) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    int rc = dislmdb_del(txn, primary_dbi, primary_key, NULL);
+    if (rc != 0 && rc != MDB_NOTFOUND) {
+        return rc;
+    }
+    int irc = dislmdb_del(txn, index_dbi, secondary_key, NULL);
+    if (irc != 0 && irc != MDB_NOTFOUND) {
+        return irc;
+    }
+    /* Prefer SUCCESS if either side deleted; NOTFOUND only if both missing. */
+    if (rc == MDB_NOTFOUND && irc == MDB_NOTFOUND) {
+        return MDB_NOTFOUND;
+    }
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_index_get(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                      MDB_val *secondary_key, MDB_val *primary_key_out,
+                      MDB_val *primary_val_out)
+{
+    if (!txn || txn->magic != DISLMDB_MAGIC || !secondary_key ||
+        !txn->mdb_txn) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    int arc = dislmdb_acl_require_key(txn->env, DISLMDB_ACL_READ,
+                                      secondary_key->mv_data,
+                                      secondary_key->mv_size);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
+
+    MDB_val pkey;
+    int rc = mdb_get(txn->mdb_txn, index_dbi, secondary_key, &pkey);
+    if (rc != 0) {
+        return rc;
+    }
+    if (primary_key_out) {
+        *primary_key_out = pkey;
+    }
+    if (!primary_val_out) {
+        return DISLMDB_SUCCESS;
+    }
+    arc = dislmdb_acl_require_key(txn->env, DISLMDB_ACL_READ, pkey.mv_data,
+                                  pkey.mv_size);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
+    return mdb_get(txn->mdb_txn, primary_dbi, &pkey, primary_val_out);
+}
+
+int dislmdb_index_scan(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
+                       const MDB_val *start_key, const MDB_val *prefix,
+                       size_t limit, dislmdb_index_scan_cb cb, void *user)
+{
+    if (!txn || txn->magic != DISLMDB_MAGIC || !cb || !txn->mdb_txn) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    /* Env-wide READ for scan entry; per-key checks below. */
+    int arc = dislmdb_acl_require(txn->env, DISLMDB_ACL_READ);
+    if (arc != DISLMDB_SUCCESS) {
+        /* Prefix-only principals: allow scan; filter per key inside. */
+        if (arc != DISLMDB_ERR_NOT_AUTHORIZED) {
+            return arc;
+        }
+    }
+
+    MDB_cursor *cur = NULL;
+    int rc = mdb_cursor_open(txn->mdb_txn, index_dbi, &cur);
+    if (rc != 0) {
+        return rc;
+    }
+
+    MDB_val k, v;
+    MDB_cursor_op op = MDB_FIRST;
+    if (start_key && start_key->mv_data && start_key->mv_size > 0) {
+        k = *start_key;
+        op = MDB_SET_RANGE;
+    } else {
+        k.mv_size = 0;
+        k.mv_data = NULL;
+    }
+    v.mv_size = 0;
+    v.mv_data = NULL;
+
+    size_t seen = 0;
+    rc = mdb_cursor_get(cur, &k, &v, op);
+    while (rc == 0) {
+        if (prefix && prefix->mv_data && prefix->mv_size > 0) {
+            if (k.mv_size < prefix->mv_size ||
+                memcmp(k.mv_data, prefix->mv_data, prefix->mv_size) != 0) {
+                /* Past prefix range when scanning sorted keys with start>=prefix */
+                if (k.mv_size >= prefix->mv_size &&
+                    memcmp(k.mv_data, prefix->mv_data, prefix->mv_size) > 0) {
+                    break;
+                }
+                rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+                continue;
+            }
+        }
+
+        arc = dislmdb_acl_require_key(txn->env, DISLMDB_ACL_READ, k.mv_data,
+                                      k.mv_size);
+        if (arc == DISLMDB_SUCCESS) {
+            MDB_val pval = {.mv_size = 0, .mv_data = NULL};
+            MDB_val pkey = v;
+            int prc = dislmdb_acl_require_key(txn->env, DISLMDB_ACL_READ,
+                                              pkey.mv_data, pkey.mv_size);
+            if (prc == DISLMDB_SUCCESS) {
+                (void)mdb_get(txn->mdb_txn, primary_dbi, &pkey, &pval);
+            }
+            int stop = cb(&k, &pkey, &pval, user);
+            seen++;
+            if (stop != 0) {
+                mdb_cursor_close(cur);
+                return DISLMDB_SUCCESS;
+            }
+            if (limit > 0 && seen >= limit) {
+                mdb_cursor_close(cur);
+                return DISLMDB_SUCCESS;
+            }
+        }
+
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+    mdb_cursor_close(cur);
+    if (rc == MDB_NOTFOUND) {
+        return DISLMDB_SUCCESS;
+    }
+    return rc;
+}
+
+int dislmdb_put_versioned(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key,
+                          MDB_val *data, unsigned int flags, uint64_t version)
+{
+    if (!txn || txn->magic != DISLMDB_MAGIC || !key || !data) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (!txn->mdb_txn) {
+        return DISLMDB_ERR_NOT_INITIALIZED;
+    }
+
+    /* Reject stale writes against an existing versioned value. */
+    MDB_val existing;
+    int grc = mdb_get(txn->mdb_txn, dbi, key, &existing);
+    if (grc == 0 && existing.mv_size >= DISLMDB_VERSIONED_HEADER &&
+        existing.mv_data) {
+        uint64_t have = dislmdb_read_u64((const uint8_t *)existing.mv_data);
+        if (have >= version) {
+            return DISLMDB_ERR_OPERATION_REJECTED;
+        }
+    } else if (grc != 0 && grc != MDB_NOTFOUND) {
+        return grc;
+    }
+
+    size_t total = DISLMDB_VERSIONED_HEADER + data->mv_size;
+    uint8_t *buf = malloc(total ? total : 1);
+    if (!buf) {
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    dislmdb_write_u64(buf, version);
+    if (data->mv_size > 0 && data->mv_data) {
+        memcpy(buf + DISLMDB_VERSIONED_HEADER, data->mv_data, data->mv_size);
+    }
+    MDB_val packed = {.mv_size = total, .mv_data = buf};
+    int rc = dislmdb_put(txn, dbi, key, &packed, flags);
+    free(buf);
+    return rc;
+}
+
+int dislmdb_get_versioned(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key,
+                          uint64_t *version_out, void *data_out, size_t *data_cap)
+{
+    if (!txn || txn->magic != DISLMDB_MAGIC || !key || !data_cap) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (!txn->mdb_txn) {
+        return DISLMDB_ERR_NOT_INITIALIZED;
+    }
+    int arc = dislmdb_acl_require_key(txn->env, DISLMDB_ACL_READ, key->mv_data,
+                                      key->mv_size);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
+
+    MDB_val got;
+    int rc = mdb_get(txn->mdb_txn, dbi, key, &got);
+    if (rc != 0) {
+        return rc;
+    }
+    if (got.mv_size < DISLMDB_VERSIONED_HEADER || !got.mv_data) {
+        return DISLMDB_ERR_DATA_CORRUPTION;
+    }
+    uint64_t ver = dislmdb_read_u64((const uint8_t *)got.mv_data);
+    size_t plen = got.mv_size - DISLMDB_VERSIONED_HEADER;
+    if (version_out) {
+        *version_out = ver;
+    }
+    if (!data_out) {
+        *data_cap = plen;
+        return DISLMDB_SUCCESS;
+    }
+    if (*data_cap < plen) {
+        *data_cap = plen;
+        return DISLMDB_ERR_BUFFER_OVERFLOW;
+    }
+    if (plen > 0) {
+        memcpy(data_out, (const uint8_t *)got.mv_data + DISLMDB_VERSIONED_HEADER,
+               plen);
+    }
+    *data_cap = plen;
+    return DISLMDB_SUCCESS;
 }
 
 int dislmdb_serialize_pending_ops(const DISLMDB_txn *txn, uint8_t **out, size_t *out_len)

@@ -113,6 +113,38 @@ int main(void) {
 
 Multi-node deployments **must** set a shared cluster key (`dislmdb_set_cluster_key` / `network.has_cluster_key`) or open fails closed. Prefer Raft for crashy LANs; PBFT when Byzantine tolerance matters. See `examples/`.
 
+## Application guide (keys, UUIDs, transactions)
+
+Normative conventions live in [`docs/kv_and_txn.kdl`](docs/kv_and_txn.kdl). Short form:
+
+| Topic | Rule |
+| --- | --- |
+| **Keys/values** | Opaque bytes (`MDB_val`). Binary UUIDv7 (16 bytes) is fine and sorts by time. |
+| **Shard prefixes** | NUL-terminated C strings (longest-prefix match). Do **not** use raw 16-byte UUIDs as `key_prefix`; use `user/` / `evt/` and put the UUID in the key body. |
+| **Multi-key / multi-DBI** | One `dislmdb_txn` → one consensus oplog → one LMDB apply txn. Puts/dels across named DBIs in that txn are applied atomically. |
+| **Secondary indexes** | `index_put` / `index_del` / `index_get` / `index_scan` (app-owned DBI). |
+| **Versioned LWW** | `dislmdb_put_versioned` / `dislmdb_get_versioned` + `DISLMDB_MIRROR_CLIENT_TIMESTAMP`. |
+| **ACL / RBAC** | Principal grants, prefix grants, roles (global or prefix-scoped). See `docs/acl.kdl`. |
+| **Auto-forward** | Only when the txn has no prior local pending ops — no mixed local+forward batch. |
+| **Success** | Raft/PBFT: client sees success after consensus commit (staging aborted; durable via apply). SOLO: local LMDB commit. |
+
+IT lock-in: `tests/integration/test_multikey_txn.c`, `tests/integration/test_index_versioned.c`.
+
+## Ops & geo (playbooks)
+
+| Doc | Contents |
+| --- | --- |
+| [`docs/ops_backup.kdl`](docs/ops_backup.kdl) | Checkpoint/sync, cold-copy of `data.mdb`, restore, metrics sidecar, soak lanes |
+| [`docs/acl.kdl`](docs/acl.kdl) | Global + prefix ACL grants |
+| [`docs/geo_playbook.kdl`](docs/geo_playbook.kdl) | Hub vs leaf voting, mirror/shard/hybrid, env knobs, failure domains |
+| [`docs/soak_slos.kdl`](docs/soak_slos.kdl) | CI soak gates; `make measure-slos` / `check-quic-soak`; measured p50/p99 |
+
+**Admin CLI:** `make tools` → `build/bin/dislmdb_admin --path <dir> metrics|checkpoint|sync|leader` (exclusive lock; stop the node first).
+
+**Backup (short):** quiesce → `dislmdb_checkpoint` + `dislmdb_force_sync` → close → copy the env directory. Restore into an empty/stopped path with the same cluster key; prefer catch-up from a live leader if the copy may be stale. Outbox/DQGM counters are RAM-only.
+
+**Geo (short):** small same-region voter hubs (`DISLMDB_VOTING=on`); edges as learners (`off`); choose `mirror`/`shard`/`hybrid` before load; separate region vs cross-region secrets.
+
 ## Topology env (large / regional fleets)
 
 | Variable | Role |
@@ -205,7 +237,7 @@ See [TRIBUTE_HOWARD_CHU.md](TRIBUTE_HOWARD_CHU.md).
 
 ## Roadmap
 
-Tracked in [TODO.md](TODO.md): Phase I — ACL persist / hygiene (A–H complete).
+Tracked in [TODO.md](TODO.md): Phases A–N complete.
 
 ## License
 

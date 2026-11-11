@@ -177,16 +177,61 @@ struct DISLMDB_env {
         bool used;
     } acl_grants[DISLMDB_ACL_MAX_PRINCIPALS];
     uint32_t acl_grant_count;
+    struct {
+        char name[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+        char prefix[DISLMDB_ACL_PREFIX_MAX + 1];
+        unsigned int perms;
+        bool used;
+    } acl_prefix_grants[DISLMDB_ACL_MAX_PREFIX_GRANTS];
+    uint32_t acl_prefix_grant_count;
+    struct {
+        char name[DISLMDB_ACL_ROLE_MAX + 1];
+        char prefix[DISLMDB_ACL_PREFIX_MAX + 1]; /**< empty = global role */
+        unsigned int perms;
+        bool used;
+    } acl_roles[DISLMDB_ACL_MAX_ROLES];
+    uint32_t acl_role_count;
+    struct {
+        char principal[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+        char role[DISLMDB_ACL_ROLE_MAX + 1];
+        bool used;
+    } acl_role_members[DISLMDB_ACL_MAX_ROLE_MEMBERS];
+    uint32_t acl_role_member_count;
 };
 
 /** Require @p need bits when enable_acl; no-op success when ACL off. */
 int dislmdb_acl_require(DISLMDB_env *env, unsigned int need);
+
+/**
+ * Require @p need for a key: global grant OR longest matching prefix grant.
+ * ADMIN is never satisfied by a prefix grant.
+ */
+int dislmdb_acl_require_key(DISLMDB_env *env, unsigned int need,
+                            const void *key, size_t key_len);
 
 /** Pack grant table for meta DBI (owns *out). Empty table → len 8 header only. */
 int dislmdb_acl_persist_pack(DISLMDB_env *env, uint8_t **out, size_t *out_len);
 
 /** Replace grant table from packed blob (ignores principal). */
 int dislmdb_acl_persist_unpack(DISLMDB_env *env, const uint8_t *data, size_t len);
+
+/** Pack prefix-grant table for meta DBI (owns *out). */
+int dislmdb_acl_prefix_persist_pack(DISLMDB_env *env, uint8_t **out, size_t *out_len);
+
+/** Replace prefix-grant table from packed blob. */
+int dislmdb_acl_prefix_persist_unpack(DISLMDB_env *env, const uint8_t *data,
+                                      size_t len);
+
+/** Pack RBAC role definitions (owns *out). */
+int dislmdb_acl_roles_persist_pack(DISLMDB_env *env, uint8_t **out,
+                                   size_t *out_len);
+int dislmdb_acl_roles_persist_unpack(DISLMDB_env *env, const uint8_t *data,
+                                     size_t len);
+/** Pack principal→role memberships (owns *out). */
+int dislmdb_acl_role_members_persist_pack(DISLMDB_env *env, uint8_t **out,
+                                          size_t *out_len);
+int dislmdb_acl_role_members_persist_unpack(DISLMDB_env *env,
+                                            const uint8_t *data, size_t len);
 
 /** @brief Pending op recorded for replication */
 typedef struct DISLMDB_pending_op {
