@@ -111,10 +111,20 @@ int main(void)
                   dislmdb_get_bytecode(env, "solo-bc-1", bout, &bsz, &bopts), 0);
     EXPECT_EQ_INT(&ctx, "solo_bc_len", (int)bsz, (int)sizeof(bc));
 
-    EXPECT_EQ_INT(&ctx, "bc_compress_nyi",
+    EXPECT_EQ_INT(&ctx, "solo_bc_compress",
                   dislmdb_store_bytecode(env, bc, sizeof(bc), "solo-bc-c",
                                          DISLMDB_BYTECODE_COMPRESS),
-                  DISLMDB_ERR_NOT_IMPLEMENTED);
+                  0);
+    bsz = sizeof(bout);
+    bopts = 0;
+    memset(bout, 0, sizeof(bout));
+    EXPECT_EQ_INT(&ctx, "solo_bc_compress_get",
+                  dislmdb_get_bytecode(env, "solo-bc-c", bout, &bsz, &bopts), 0);
+    EXPECT_EQ_INT(&ctx, "solo_bc_compress_len", (int)bsz, (int)sizeof(bc));
+    EXPECT_MEMEQ(&ctx, "solo_bc_compress_bytes", bout, bc, sizeof(bc));
+    EXPECT_TRUE(&ctx, "solo_bc_compress_flag",
+                (bopts & DISLMDB_BYTECODE_COMPRESS) != 0);
+
     EXPECT_EQ_INT(&ctx, "solo_bc_verify",
                   dislmdb_store_bytecode(env, bc, sizeof(bc), "solo-bc-v",
                                          DISLMDB_BYTECODE_VERIFY),
@@ -126,6 +136,50 @@ int main(void)
     EXPECT_EQ_INT(&ctx, "solo_bc_verify_len", (int)bsz, (int)sizeof(bc));
     EXPECT_TRUE(&ctx, "solo_bc_verify_flag",
                 (bopts & DISLMDB_BYTECODE_VERIFY) != 0);
+
+    EXPECT_EQ_INT(&ctx, "solo_bc_cv",
+                  dislmdb_store_bytecode(env, bc, sizeof(bc), "solo-bc-cv",
+                                         DISLMDB_BYTECODE_COMPRESS | DISLMDB_BYTECODE_VERIFY),
+                  0);
+    bsz = sizeof(bout);
+    bopts = 0;
+    memset(bout, 0, sizeof(bout));
+    EXPECT_EQ_INT(&ctx, "solo_bc_cv_get",
+                  dislmdb_get_bytecode(env, "solo-bc-cv", bout, &bsz, &bopts), 0);
+    EXPECT_EQ_INT(&ctx, "solo_bc_cv_len", (int)bsz, (int)sizeof(bc));
+    EXPECT_MEMEQ(&ctx, "solo_bc_cv_bytes", bout, bc, sizeof(bc));
+    EXPECT_TRUE(&ctx, "solo_bc_cv_flags",
+                (bopts & DISLMDB_BYTECODE_COMPRESS) != 0 &&
+                (bopts & DISLMDB_BYTECODE_VERIFY) != 0);
+
+    /* Size probe + overflow on compressed payload (owned decompress path). */
+    bsz = 0;
+    EXPECT_EQ_INT(&ctx, "solo_bc_c_probe",
+                  dislmdb_get_bytecode(env, "solo-bc-c", NULL, &bsz, NULL), 0);
+    EXPECT_EQ_INT(&ctx, "solo_bc_c_probe_len", (int)bsz, (int)sizeof(bc));
+    uint8_t tiny[2];
+    bsz = sizeof(tiny);
+    EXPECT_EQ_INT(&ctx, "solo_bc_c_overflow",
+                  dislmdb_get_bytecode(env, "solo-bc-c", tiny, &bsz, NULL),
+                  DISLMDB_ERR_BUFFER_OVERFLOW);
+    EXPECT_EQ_INT(&ctx, "solo_bc_c_overflow_len", (int)bsz, (int)sizeof(bc));
+
+    /* Highly compressible blob — round-trip through zlib. */
+    uint8_t big[4096];
+    memset(big, 0xA5, sizeof(big));
+    EXPECT_EQ_INT(&ctx, "solo_bc_big",
+                  dislmdb_store_bytecode(env, big, sizeof(big), "solo-bc-big",
+                                         DISLMDB_BYTECODE_COMPRESS |
+                                             DISLMDB_BYTECODE_VERIFY),
+                  0);
+    uint8_t big_out[4096];
+    bsz = sizeof(big_out);
+    bopts = 0;
+    EXPECT_EQ_INT(&ctx, "solo_bc_big_get",
+                  dislmdb_get_bytecode(env, "solo-bc-big", big_out, &bsz, &bopts),
+                  0);
+    EXPECT_EQ_INT(&ctx, "solo_bc_big_len", (int)bsz, (int)sizeof(big));
+    EXPECT_MEMEQ(&ctx, "solo_bc_big_bytes", big_out, big, sizeof(big));
 
     DISLMDB_metrics m2;
     EXPECT_EQ_INT(&ctx, "metrics2", dislmdb_get_metrics(env, &m2), 0);

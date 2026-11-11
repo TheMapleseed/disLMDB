@@ -1,0 +1,58 @@
+// DisLMDB stable C ABI contract (Phase H).
+// High-level bindings must link libdislmdb and consume only these symbols
+// (plus LMDB MDB_* types already re-exported via dislmdb.h).
+
+abi version="1.0" {
+  headers {
+    public "include/dislmdb.h"
+    public "include/dislmdb_errors.h"
+    public "include/dislmdb_network.h"
+    public "include/dislmdb_consensus.h"
+    public "include/dislmdb_crypto.h"
+    public "include/dislmdb_quic.h"
+  }
+
+  library name="dislmdb" soname="libdislmdb" {
+    requires "pthread"
+    requires "z" // DISLMDB_BYTECODE_COMPRESS
+    // Host crypto: Security.framework (Darwin) or libcrypto (elsewhere)
+    // mTLS: vendored mbedtls (static into libdislmdb)
+  }
+
+  env {
+    fn dislmdb_version
+    fn dislmdb_strerror
+    fn dislmdb_env_config_init
+    fn dislmdb_env_create
+    fn dislmdb_env_open
+    fn dislmdb_env_close
+    fn dislmdb_txn_begin
+    fn dislmdb_txn_commit
+    fn dislmdb_txn_abort
+    fn dislmdb_dbi_open
+    fn dislmdb_put
+    fn dislmdb_del
+    fn dislmdb_get_lmdb_txn
+    fn dislmdb_get_lmdb_env
+  }
+
+  security {
+    fn dislmdb_set_cluster_key
+    fn dislmdb_get_cluster_key
+    fn dislmdb_acl_set_principal
+    fn dislmdb_acl_grant
+    fn dislmdb_acl_revoke
+    fn dislmdb_acl_get
+  }
+
+  metrics {
+    fn dislmdb_get_metrics
+    fn dislmdb_format_metrics
+  }
+
+  notes {
+    // Opaque DISLMDB_env / DISLMDB_txn — never layout-dependent across majors.
+    // enable_acl default false; COMPRESS requires zlib at link time.
+    // Metrics: format_metrics only — no in-process scrape HTTP (sidecar forever).
+  }
+}

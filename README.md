@@ -17,8 +17,9 @@ Proprietary software — The Mapleseed Inc. Commercial license required.
 | **Topo modes** | `mirror` / `shard` / `hybrid`; auto-forward puts/dels (`enable_auto_forward`); read proxy `dislmdb_topo_get` / `forward_get` |
 | **Scale** | Heap-growable peer + connection tables; soft `max_peers` (0 = unlimited). Regional voters; voter HB vs learner AE lanes |
 | **Shard map** | `dislmdb_shard_map_*` + SMAP v2 (flags); longest-prefix owner lookup; `dislmdb_topo_key_writable` |
-| **Bytecode** | Consensus-replicated (or SOLO) store/get; `DISLMDB_BYTECODE_VERIFY` (SHA-256 on disk). Compress flag reserved (`NOT_IMPLEMENTED`) |
-| **Metrics** | `dislmdb_get_metrics` + `dislmdb_format_metrics` (Prometheus text). Covers commits, consensus, Raft term/commit, DQGM, outbox |
+| **Bytecode** | Consensus-replicated (or SOLO) store/get; `VERIFY` (SHA-256 plaintext) + `COMPRESS` (zlib) |
+| **ACL** | Opt-in `enable_acl` + principal grants (`READ`/`WRITE`/`ADMIN`); independent of transport crypto |
+| **Metrics** | `dislmdb_get_metrics` + `dislmdb_format_metrics` (Prometheus text). Sidecar/supervisor exposes scrape — no embedded HTTP |
 | **Ops status** | `dislmdb_consensus_get_operation_status` / `get_last_op_id` via local oplog ring |
 | **Discovery** | HELLO/JOIN mesh engage before Raft elections |
 
@@ -34,12 +35,10 @@ Proprietary software — The Mapleseed Inc. Commercial license required.
 
 Local ACID properties of LMDB still apply per node. Cross-node linearizability depends on the consensus path completing before the client sees success.
 
-## Not done / not claimed
+## Language bindings
 
-- `DISLMDB_BYTECODE_COMPRESS`
-- Access-control layer / language bindings
-- Built-in Prometheus HTTP scrape port (format text yourself and expose)
-- QUIC multi-node integration smoke (unit substrate + `stack_ready` shipped)
+- C ABI contract: [bindings/ABI.kdl](bindings/ABI.kdl); `make pc` → `build/dislmdb.pc`
+- Rust (edition 2024): [bindings/rust](bindings/rust) — `make rust-bindings` after `make lib`
 
 ## Requirements
 
@@ -206,7 +205,7 @@ See [TRIBUTE_HOWARD_CHU.md](TRIBUTE_HOWARD_CHU.md).
 
 ## Roadmap
 
-Tracked in [TODO.md](TODO.md): Phase H — bytecode compress, ACL, bindings, scrape, QUIC IT.
+Tracked in [TODO.md](TODO.md): Phase I — ACL persist / hygiene (A–H complete).
 
 ## License
 

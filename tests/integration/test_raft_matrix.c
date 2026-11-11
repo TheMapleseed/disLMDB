@@ -47,6 +47,11 @@ static int run_cell(test_ctx_t *ctx, const matrix_cell *cell, const uint8_t key[
     oa.transport = cell->transport;
     oa.enable_mtls = cell->mtls;
     oa.cert_dir = cert_dir;
+    if (cell->transport == DISLMDB_TRANSPORT_QUIC) {
+        oa.timeout_ms = 12000;
+        oa.election_min_ms = 400;
+        oa.election_max_ms = 800;
+    }
 
     it_raft_opts ob = oa;
     ob.path = dir_b;
@@ -73,7 +78,11 @@ static int run_cell(test_ctx_t *ctx, const matrix_cell *cell, const uint8_t key[
     }
 
     DISLMDB_env *envs[2] = {a, b};
-    it_mesh_warmup(envs, 2, cell->mtls ? 60 : 30);
+    int warm = cell->mtls ? 60 : 30;
+    if (cell->transport == DISLMDB_TRANSPORT_QUIC) {
+        warm = 50;
+    }
+    it_mesh_warmup(envs, 2, warm);
 
     char leader[64] = {0};
     snprintf(tag, sizeof(tag), "%s_elect", cell->label);
@@ -124,6 +133,7 @@ int main(void)
         {"both", DISLMDB_TRANSPORT_BOTH, false, 30714, 30715},
         {"both_mtls", DISLMDB_TRANSPORT_BOTH, true, 30716, 30717},
         {"tcp_mtls", DISLMDB_TRANSPORT_TCP, true, 30718, 30719},
+        {"quic", DISLMDB_TRANSPORT_QUIC, false, 30720, 30721},
     };
 
     for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {

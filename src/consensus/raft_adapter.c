@@ -615,9 +615,6 @@ int dislmdb_raft_store_bytecode(DISLMDB_env *env,
     if (bytecode_size == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    if (options & DISLMDB_BYTECODE_COMPRESS) {
-        return DISLMDB_ERR_NOT_IMPLEMENTED;
-    }
     raft_adapter_ctx *actx = env->consensus_context;
     if (!actx->started) {
         return DISLMDB_ERR_NOT_INITIALIZED;

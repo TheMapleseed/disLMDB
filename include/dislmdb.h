@@ -291,6 +291,11 @@ typedef struct DISLMDB_env_config {
     DISLMDB_MIRROR_CONFLICT_POLICY mirror_conflict_policy;
     /** Region id allowed to write under REGION_PRIORITY (see policy enum). */
     char mirror_primary_region[64];
+    /**
+     * When true, put/get/admin paths require a principal with matching ACL
+     * bits (@ref DISLMDB_ACL_*). Off by default (transport crypto unchanged).
+     */
+    bool enable_acl;
 } DISLMDB_env_config;
 
 /**
@@ -487,7 +492,7 @@ int dislmdb_set_status_callback(DISLMDB_env *env,
  * @param[in] options Additional options for bytecode storage
  *            0 - Default behavior
  *            DISLMDB_BYTECODE_VERIFY - Persist SHA-256 and verify on get/apply
- *            DISLMDB_BYTECODE_COMPRESS - Reserved; returns NOT_IMPLEMENTED
+ *            DISLMDB_BYTECODE_COMPRESS - zlib-compress payload on durable store
  * @return #DISLMDB_SUCCESS on success, error code on failure
  */
 int dislmdb_store_bytecode(DISLMDB_env *env, 
@@ -524,6 +529,28 @@ int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32]);
 
 /** @brief Copy the current cluster key (returns DISLMDB_ERR_NOT_INITIALIZED if unset) */
 int dislmdb_get_cluster_key(DISLMDB_env *env, uint8_t out[32]);
+
+/**
+ * @brief Set the calling principal for subsequent ACL checks (thread-local to env).
+ *
+ * When @ref DISLMDB_env_config.enable_acl is false this is a no-op success.
+ * Pass NULL or "" to clear the principal.
+ */
+int dislmdb_acl_set_principal(DISLMDB_env *env, const char *principal);
+
+/**
+ * @brief Grant @p perms bits to @p principal (requires ADMIN, or empty table bootstrap).
+ *
+ * Bootstrap: if the grant table is empty, any caller may grant once (typically
+ * DISLMDB_ACL_ALL to themselves). Afterwards only ADMIN principals may grant.
+ */
+int dislmdb_acl_grant(DISLMDB_env *env, const char *principal, unsigned int perms);
+
+/** @brief Revoke bits from @p principal (requires ADMIN). Zero bits removes the entry. */
+int dislmdb_acl_revoke(DISLMDB_env *env, const char *principal, unsigned int perms);
+
+/** @brief Query effective mask for @p principal (0 if unknown / ACL off). */
+int dislmdb_acl_get(DISLMDB_env *env, const char *principal, unsigned int *perms_out);
 
 /**
  * @brief Distributed put — records the op for consensus replication.

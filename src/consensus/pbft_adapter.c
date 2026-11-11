@@ -875,10 +875,6 @@ int dislmdb_pbft_store_bytecode(DISLMDB_env *env,
     if (bytecode_size == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    if (options & DISLMDB_BYTECODE_COMPRESS) {
-        return DISLMDB_ERR_NOT_IMPLEMENTED;
-    }
-
     ConsensusCore *core = env->consensus_context;
     size_t id_len = strnlen(bytecode_id, 129);
     if (id_len == 0 || id_len > 128) {

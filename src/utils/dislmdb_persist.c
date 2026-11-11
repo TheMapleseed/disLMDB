@@ -20,6 +20,7 @@
 #define META_KEY_LOCALITY "locality"
 #define META_KEY_TOPO_MODE "topo_mode"
 #define META_KEY_PEER_TOPO "peer_topo"
+#define META_KEY_ACL "acl_grants"
 
 /* Packed shard: count u32 + N * (id + prefix + owner [+ flags v2]) */
 #define SHARD_PACK_SIZE_V1 (DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN + 64)
@@ -239,6 +240,27 @@ int dislmdb_persist_save(DISLMDB_env *env)
         v.mv_data = tbuf;
         rc = mdb_put(txn, dbi, &k, &v, 0);
         free(tbuf);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+    }
+
+    /* ACL grant table (independent of transport crypto). */
+    if (env->acl_mutex_ready) {
+        uint8_t *abuf = NULL;
+        size_t asize = 0;
+        rc = dislmdb_acl_persist_pack(env, &abuf, &asize);
+        if (rc != DISLMDB_SUCCESS) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+        k.mv_size = strlen(META_KEY_ACL);
+        k.mv_data = (void *)META_KEY_ACL;
+        v.mv_size = asize;
+        v.mv_data = abuf;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        free(abuf);
         if (rc != 0) {
             mdb_txn_abort(txn);
             return rc;
@@ -470,6 +492,12 @@ int dislmdb_persist_load(DISLMDB_env *env)
                 }
             }
         }
+    }
+
+    k.mv_size = strlen(META_KEY_ACL);
+    k.mv_data = (void *)META_KEY_ACL;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 8) {
+        (void)dislmdb_acl_persist_unpack(env, v.mv_data, v.mv_size);
     }
     mdb_txn_abort(txn);
 

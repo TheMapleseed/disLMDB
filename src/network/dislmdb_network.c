@@ -94,8 +94,12 @@ typedef struct net_quic_pending {
     size_t ch_len;
     uint8_t sh[512];
     size_t sh_len;
+    uint8_t client_initial[512]; /* our outbound Initial for retransmit */
+    size_t client_initial_len;
     uint8_t server_initial[2048];
     size_t server_initial_len;
+    uint8_t server_hs[8192]; /* stashed if HS arrives before Initial */
+    size_t server_hs_len;
     struct sockaddr_in peer;
 } net_quic_pending;
 
@@ -237,6 +241,50 @@ static int quic_pending_store(network_context *ctx, const net_quic_pending *p)
     ctx->quic_pending[0] = *p;
     ctx->quic_pending[0].active = true;
     return 0;
+}
+
+/**
+ * Finish client HS when Initial(SH) + Handshake are both present.
+ * Caller holds ctx->lock. On success fills cfin/hello for post-unlock I/O.
+ */
+static bool quic_pending_try_complete(network_context *ctx, net_quic_pending *pend,
+                                      uint8_t *cfin, size_t cfin_cap,
+                                      size_t *cfin_len, char *hello_id,
+                                      size_t hello_cap, struct sockaddr_in *peer_out)
+{
+    if (!ctx || !pend || !pend->active || !pend->have_sh ||
+        pend->server_hs_len == 0 || !cfin || !cfin_len || !hello_id || !peer_out) {
+        return false;
+    }
+    *cfin_len = 0;
+    hello_id[0] = '\0';
+    const dislmdb_quic_tls_identity *trust =
+        ctx->quic_pki_strict ? ctx->quic_identity : NULL;
+    if (dislmdb_quic_client_complete_handshake(
+            &pend->conn, pend->ch, pend->ch_len, pend->xpriv, pend->server_initial,
+            pend->server_initial_len, pend->server_hs, pend->server_hs_len, trust,
+            cfin, cfin_cap, cfin_len) != 0) {
+        return false;
+    }
+    *peer_out = pend->peer;
+    (void)quic_session_store(ctx, &pend->conn, &pend->peer);
+    for (int ci = 0; ci < ctx->conn_cap; ci++) {
+        if (!ctx->connections[ci].in_use) {
+            continue;
+        }
+        uint16_t lp = ctx->connections[ci].listen_port
+                          ? ctx->connections[ci].listen_port
+                          : ctx->connections[ci].info.port;
+        if (lp == ntohs(pend->peer.sin_port)) {
+            strncpy(hello_id, ctx->connections[ci].info.node_id, hello_cap - 1);
+            hello_id[hello_cap - 1] = '\0';
+            break;
+        }
+    }
+    pend->active = false;
+    pend->server_hs_len = 0;
+    dislmdb_quic_conn_reset(&pend->conn);
+    return true;
 }
 
 static int find_conn_by_id(network_context *ctx, const char *node_id);
@@ -2482,24 +2530,94 @@ static void *network_thread(void *arg)
                                 }
                             } else if (qh.version == DISLMDB_QUIC_VERSION &&
                                        qh.type == DISLMDB_QUIC_LONG_INITIAL) {
+                                /* Simultaneous dial: peer Initial may be their
+                                 * ClientHello, not our ServerHello — only treat
+                                 * as SH when open succeeds; else server-handle
+                                 * and/or retransmit our lost Initial. */
+                                bool took_as_client_sh = false;
+                                uint8_t early_cfin[512];
+                                size_t early_cfin_len = 0;
+                                char early_hello[64] = {0};
+                                struct sockaddr_in early_peer;
+                                bool early_done = false;
+                                uint8_t retx[512];
+                                size_t retx_len = 0;
+                                memset(&early_peer, 0, sizeof(early_peer));
                                 pthread_mutex_lock(&ctx->lock);
                                 net_quic_pending *pend =
                                     quic_pending_find_peer(ctx, &peer);
                                 if (pend && !pend->have_sh &&
                                     (size_t)n <= sizeof(pend->server_initial)) {
-                                    memcpy(pend->server_initial, dgram, (size_t)n);
-                                    pend->server_initial_len = (size_t)n;
                                     uint64_t spn = 0;
+                                    uint8_t try_sh[sizeof(pend->sh)];
+                                    size_t try_sh_len = 0;
                                     if (dislmdb_quic_open_initial_packet(
                                             &pend->conn, false, dgram, (size_t)n,
-                                            &spn, pend->sh, sizeof(pend->sh),
-                                            &pend->sh_len) == 0 &&
-                                        pend->sh_len > 0) {
+                                            &spn, try_sh, sizeof(try_sh),
+                                            &try_sh_len) == 0 &&
+                                        try_sh_len > 0) {
+                                        memcpy(pend->server_initial, dgram,
+                                               (size_t)n);
+                                        pend->server_initial_len = (size_t)n;
+                                        memcpy(pend->sh, try_sh, try_sh_len);
+                                        pend->sh_len = try_sh_len;
                                         pend->have_sh = true;
+                                        took_as_client_sh = true;
+                                        early_done = quic_pending_try_complete(
+                                            ctx, pend, early_cfin,
+                                            sizeof(early_cfin), &early_cfin_len,
+                                            early_hello, sizeof(early_hello),
+                                            &early_peer);
+                                    } else if (pend->client_initial_len > 0 &&
+                                               pend->client_initial_len <=
+                                                   sizeof(retx)) {
+                                        /* Peer CH or lost SH — re-poke dial. */
+                                        memcpy(retx, pend->client_initial,
+                                               pend->client_initial_len);
+                                        retx_len = pend->client_initial_len;
                                     }
+                                }
+                                pthread_mutex_unlock(&ctx->lock);
+                                if (early_done) {
+                                    if (early_cfin_len > 0) {
+                                        (void)sendto(ctx->udp_fd, early_cfin,
+                                                     early_cfin_len, 0,
+                                                     (struct sockaddr *)&early_peer,
+                                                     sizeof(early_peer));
+                                    }
+                                    if (early_hello[0] != '\0') {
+                                        extern int dislmdb_pbft_send_hello(
+                                            DISLMDB_env *e, const char *t);
+                                        (void)dislmdb_pbft_send_hello(ctx->env,
+                                                                      early_hello);
+                                    }
+                                }
+                                if (retx_len > 0) {
+                                    (void)sendto(ctx->udp_fd, retx, retx_len, 0,
+                                                 (struct sockaddr *)&peer, plen);
+                                }
+                                if (!took_as_client_sh) {
+                                    /*
+                                     * Simultaneous open: higher listen port
+                                     * takes server role; lower stays client and
+                                     * waits for SH. No outbound pending → we
+                                     * are the passive peer (always server).
+                                     */
+                                    uint16_t our_port =
+                                        ctx->env
+                                            ? ctx->env->config.network.local_port
+                                            : 0;
+                                    uint16_t peer_port = ntohs(peer.sin_port);
+                                    bool have_outbound = false;
+                                    pthread_mutex_lock(&ctx->lock);
+                                    have_outbound =
+                                        quic_pending_find_peer(ctx, &peer) !=
+                                        NULL;
                                     pthread_mutex_unlock(&ctx->lock);
-                                } else {
-                                    pthread_mutex_unlock(&ctx->lock);
+                                    bool we_should_server =
+                                        !have_outbound ||
+                                        (our_port > peer_port);
+                                    if (we_should_server) {
                                     uint8_t ini[2048], hsp[8192];
                                     size_t ini_len = 0, hsp_len = 0;
                                     dislmdb_quic_conn qconn;
@@ -2521,6 +2639,12 @@ static void *network_thread(void *arg)
                                                          plen);
                                         }
                                         pthread_mutex_lock(&ctx->lock);
+                                        net_quic_pending *drop =
+                                            quic_pending_find_peer(ctx, &peer);
+                                        if (drop) {
+                                            drop->active = false;
+                                            dislmdb_quic_conn_reset(&drop->conn);
+                                        }
                                         (void)quic_session_store(ctx, &qconn,
                                                                  &peer);
                                         ctx->stats.total_messages_sent +=
@@ -2528,67 +2652,39 @@ static void *network_thread(void *arg)
                                             (hsp_len > 0 ? 1u : 0u);
                                         pthread_mutex_unlock(&ctx->lock);
                                     }
+                                    } /* we_should_server */
                                 }
                             } else if (qh.version == DISLMDB_QUIC_VERSION &&
                                        qh.type == DISLMDB_QUIC_LONG_HANDSHAKE) {
+                                uint8_t cfin[512];
+                                size_t cfin_len = 0;
+                                char hello_id[64] = {0};
+                                struct sockaddr_in hs_peer;
+                                bool hs_done = false;
+                                memset(&hs_peer, 0, sizeof(hs_peer));
                                 pthread_mutex_lock(&ctx->lock);
                                 net_quic_pending *pend =
                                     quic_pending_find_peer(ctx, &peer);
-                                if (pend && pend->have_sh) {
-                                    uint8_t cfin[512];
-                                    size_t cfin_len = 0;
-                                    const dislmdb_quic_tls_identity *trust =
-                                        ctx->quic_pki_strict ? ctx->quic_identity
-                                                            : NULL;
-                                    if (dislmdb_quic_client_complete_handshake(
-                                            &pend->conn, pend->ch, pend->ch_len,
-                                            pend->xpriv, pend->server_initial,
-                                            pend->server_initial_len, dgram,
-                                            (size_t)n, trust, cfin, sizeof(cfin),
-                                            &cfin_len) == 0) {
-                                        (void)quic_session_store(ctx, &pend->conn,
-                                                                 &peer);
-                                        char hello_id[64] = {0};
-                                        for (int ci = 0; ci < ctx->conn_cap;
-                                             ci++) {
-                                            if (!ctx->connections[ci].in_use) {
-                                                continue;
-                                            }
-                                            uint16_t lp =
-                                                ctx->connections[ci].listen_port
-                                                    ? ctx->connections[ci]
-                                                          .listen_port
-                                                    : ctx->connections[ci]
-                                                          .info.port;
-                                            if (lp == ntohs(peer.sin_port)) {
-                                                strncpy(
-                                                    hello_id,
-                                                    ctx->connections[ci]
-                                                        .info.node_id,
-                                                    sizeof(hello_id) - 1);
-                                                break;
-                                            }
-                                        }
-                                        pend->active = false;
-                                        dislmdb_quic_conn_reset(&pend->conn);
-                                        pthread_mutex_unlock(&ctx->lock);
-                                        if (cfin_len > 0) {
-                                            (void)sendto(ctx->udp_fd, cfin,
-                                                         cfin_len, 0,
-                                                         (struct sockaddr *)&peer,
-                                                         plen);
-                                        }
-                                        if (hello_id[0] != '\0') {
-                                            extern int dislmdb_pbft_send_hello(
-                                                DISLMDB_env *e, const char *t);
-                                            (void)dislmdb_pbft_send_hello(
-                                                ctx->env, hello_id);
-                                        }
-                                    } else {
-                                        pthread_mutex_unlock(&ctx->lock);
+                                if (pend && (size_t)n <= sizeof(pend->server_hs)) {
+                                    memcpy(pend->server_hs, dgram, (size_t)n);
+                                    pend->server_hs_len = (size_t)n;
+                                    hs_done = quic_pending_try_complete(
+                                        ctx, pend, cfin, sizeof(cfin), &cfin_len,
+                                        hello_id, sizeof(hello_id), &hs_peer);
+                                }
+                                pthread_mutex_unlock(&ctx->lock);
+                                if (hs_done) {
+                                    if (cfin_len > 0) {
+                                        (void)sendto(ctx->udp_fd, cfin, cfin_len, 0,
+                                                     (struct sockaddr *)&hs_peer,
+                                                     sizeof(hs_peer));
                                     }
-                                } else {
-                                    pthread_mutex_unlock(&ctx->lock);
+                                    if (hello_id[0] != '\0') {
+                                        extern int dislmdb_pbft_send_hello(
+                                            DISLMDB_env *e, const char *t);
+                                        (void)dislmdb_pbft_send_hello(ctx->env,
+                                                                      hello_id);
+                                    }
                                 }
                             }
                         }
@@ -3889,9 +3985,10 @@ int dislmdb_network_connect(DISLMDB_env *env,
         memset(&pend, 0, sizeof(pend));
         uint8_t dcid[8], scid[8], ipkt[512];
         size_t ipkt_len = 0;
-        if (dislmdb_quic_client_start(&pend.conn, dcid, scid, pend.xpriv, pend.ch,
-                                      sizeof(pend.ch), &pend.ch_len, ipkt,
-                                      sizeof(ipkt), &ipkt_len) == 0) {
+        int csr = dislmdb_quic_client_start(&pend.conn, dcid, scid, pend.xpriv,
+                                           pend.ch, sizeof(pend.ch), &pend.ch_len,
+                                           ipkt, sizeof(ipkt), &ipkt_len);
+        if (csr == 0) {
             struct sockaddr_in to;
             memset(&to, 0, sizeof(to));
             to.sin_family = AF_INET;
@@ -3899,6 +3996,10 @@ int dislmdb_network_connect(DISLMDB_env *env,
             if (inet_pton(AF_INET, node_addr->hostname, &to.sin_addr) == 1) {
                 pend.peer = to;
                 pend.active = true;
+                if (ipkt_len <= sizeof(pend.client_initial)) {
+                    memcpy(pend.client_initial, ipkt, ipkt_len);
+                    pend.client_initial_len = ipkt_len;
+                }
                 pthread_mutex_lock(&ctx->lock);
                 (void)quic_pending_store(ctx, &pend);
                 pthread_mutex_unlock(&ctx->lock);

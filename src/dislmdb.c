@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
+#include <zlib.h>
 
 #include "dislmdb_internal.h"
 #include "dislmdb_errors.h"
@@ -37,16 +38,42 @@ int dislmdb_bytecode_pack(unsigned int options,
                           uint8_t **out,
                           size_t *out_len)
 {
-    if (!src || src_len == 0 || !out || !out_len) {
+    if (!src || src_len == 0 || !out || !out_len || src_len > 0xffffffffu) {
         return DISLMDB_ERR_INVALID_PARAMETER;
-    }
-    if (options & DISLMDB_BYTECODE_COMPRESS) {
-        return DISLMDB_ERR_NOT_IMPLEMENTED;
     }
     size_t hdr = 4;
     if (options & DISLMDB_BYTECODE_VERIFY) {
         hdr += DISLMDB_SHA256_DIGEST_LENGTH;
     }
+    if (options & DISLMDB_BYTECODE_COMPRESS) {
+        hdr += 4; /* uncompressed length */
+        uLongf bound = compressBound((uLong)src_len);
+        uint8_t *buf = malloc(hdr + (size_t)bound);
+        if (!buf) {
+            return DISLMDB_ERR_MEMORY_ERROR;
+        }
+        dislmdb_write_u32(buf, options);
+        size_t o = 4;
+        if (options & DISLMDB_BYTECODE_VERIFY) {
+            if (dislmdb_crypto_sha256(src, src_len, buf + o) != 0) {
+                free(buf);
+                return DISLMDB_ERR_AUTH_FAILED;
+            }
+            o += DISLMDB_SHA256_DIGEST_LENGTH;
+        }
+        dislmdb_write_u32(buf + o, (uint32_t)src_len);
+        o += 4;
+        uLongf dest_len = bound;
+        int zrc = compress2(buf + o, &dest_len, src, (uLong)src_len, Z_DEFAULT_COMPRESSION);
+        if (zrc != Z_OK) {
+            free(buf);
+            return DISLMDB_ERR_INVALID_OPERATION;
+        }
+        *out = buf;
+        *out_len = o + (size_t)dest_len;
+        return DISLMDB_SUCCESS;
+    }
+
     uint8_t *buf = malloc(hdr + src_len);
     if (!buf) {
         return DISLMDB_ERR_MEMORY_ERROR;
@@ -70,36 +97,78 @@ int dislmdb_bytecode_unpack(const uint8_t *stored,
                             size_t stored_len,
                             unsigned int *options_out,
                             const uint8_t **data_out,
-                            size_t *data_len_out)
+                            size_t *data_len_out,
+                            bool *owned_out)
 {
     if (!stored || stored_len < 4 || !options_out || !data_out || !data_len_out) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    if (owned_out) {
+        *owned_out = false;
+    }
     unsigned int opts = dislmdb_read_u32(stored);
     size_t o = 4;
+    const uint8_t *expect_hash = NULL;
     if (opts & DISLMDB_BYTECODE_VERIFY) {
-        if (stored_len < 4 + DISLMDB_SHA256_DIGEST_LENGTH) {
+        if (stored_len < o + DISLMDB_SHA256_DIGEST_LENGTH) {
             return DISLMDB_ERR_DATA_CORRUPTION;
         }
-        const uint8_t *expect = stored + o;
+        expect_hash = stored + o;
         o += DISLMDB_SHA256_DIGEST_LENGTH;
-        const uint8_t *payload = stored + o;
-        size_t plen = stored_len - o;
+    }
+
+    const uint8_t *plain = NULL;
+    size_t plain_len = 0;
+    uint8_t *owned = NULL;
+
+    if (opts & DISLMDB_BYTECODE_COMPRESS) {
+        if (stored_len < o + 4) {
+            return DISLMDB_ERR_DATA_CORRUPTION;
+        }
+        uint32_t raw_len = dislmdb_read_u32(stored + o);
+        o += 4;
+        if (raw_len == 0 || stored_len < o) {
+            return DISLMDB_ERR_DATA_CORRUPTION;
+        }
+        size_t clen = stored_len - o;
+        owned = malloc(raw_len);
+        if (!owned) {
+            return DISLMDB_ERR_MEMORY_ERROR;
+        }
+        uLongf dest_len = raw_len;
+        int zrc = uncompress(owned, &dest_len, stored + o, (uLong)clen);
+        if (zrc != Z_OK || dest_len != raw_len) {
+            free(owned);
+            return DISLMDB_ERR_DATA_CORRUPTION;
+        }
+        plain = owned;
+        plain_len = raw_len;
+        if (owned_out) {
+            *owned_out = true;
+        } else {
+            free(owned);
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+    } else {
+        plain = stored + o;
+        plain_len = stored_len - o;
+    }
+
+    if (expect_hash) {
         uint8_t got[DISLMDB_SHA256_DIGEST_LENGTH];
-        if (dislmdb_crypto_sha256(payload, plen, got) != 0) {
+        if (dislmdb_crypto_sha256(plain, plain_len, got) != 0) {
+            free(owned);
             return DISLMDB_ERR_AUTH_FAILED;
         }
-        if (memcmp(expect, got, DISLMDB_SHA256_DIGEST_LENGTH) != 0) {
+        if (memcmp(expect_hash, got, DISLMDB_SHA256_DIGEST_LENGTH) != 0) {
+            free(owned);
             return DISLMDB_ERR_DATA_CORRUPTION;
         }
-        *options_out = opts;
-        *data_out = payload;
-        *data_len_out = plen;
-        return DISLMDB_SUCCESS;
     }
+
     *options_out = opts;
-    *data_out = stored + 4;
-    *data_len_out = stored_len - 4;
+    *data_out = plain;
+    *data_len_out = plain_len;
     return DISLMDB_SUCCESS;
 }
 
@@ -158,7 +227,8 @@ static const DISLMDB_env_config default_env_config = {
     .max_peers = 0, /* unlimited */
     .enable_auto_forward = true,
     .mirror_conflict_policy = DISLMDB_MIRROR_LAST_WRITE,
-    .mirror_primary_region = {0}
+    .mirror_primary_region = {0},
+    .enable_acl = false
 };
 
 const char *dislmdb_version(int *major, int *minor, int *patch)
@@ -272,6 +342,10 @@ static void destroy_mutexes(DISLMDB_env *e)
     pthread_mutex_destroy(&e->shard_mutex);
     pthread_mutex_destroy(&e->forward_mutex);
     pthread_cond_destroy(&e->forward_cv);
+    if (e->acl_mutex_ready) {
+        pthread_mutex_destroy(&e->acl_mutex);
+        e->acl_mutex_ready = false;
+    }
 }
 
 int dislmdb_env_create(DISLMDB_env **env)
@@ -299,11 +373,13 @@ int dislmdb_env_create(DISLMDB_env **env)
         pthread_mutex_init(&e->log_mutex, NULL) != 0 ||
         pthread_mutex_init(&e->shard_mutex, NULL) != 0 ||
         pthread_mutex_init(&e->forward_mutex, NULL) != 0 ||
-        pthread_cond_init(&e->forward_cv, NULL) != 0) {
+        pthread_cond_init(&e->forward_cv, NULL) != 0 ||
+        pthread_mutex_init(&e->acl_mutex, NULL) != 0) {
         mdb_env_close(e->mdb_env);
         free(e);
         return DISLMDB_ERR_THREAD_ERROR;
     }
+    e->acl_mutex_ready = true;
 
     e->log_messages = calloc(DISLMDB_MAX_LOG_MESSAGES, sizeof(DISLMDB_log_message));
     if (!e->log_messages) {
@@ -1021,7 +1097,11 @@ int dislmdb_add_node(DISLMDB_env *env, const DISLMDB_node_addr *node_addr)
     if (!env || env->magic != DISLMDB_MAGIC || !node_addr) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    int rc = dislmdb_add_node_internal(env, node_addr);
+    int rc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    rc = dislmdb_add_node_internal(env, node_addr);
     if (rc != DISLMDB_SUCCESS) {
         return rc;
     }
@@ -1081,6 +1161,10 @@ int dislmdb_remove_node(DISLMDB_env *env, const char *node_id)
 {
     if (!env || env->magic != DISLMDB_MAGIC || !node_id || node_id[0] == '\0') {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
     }
     if (strncmp(node_id, env->local_node_id, 63) == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
@@ -1246,11 +1330,12 @@ int dislmdb_store_bytecode(DISLMDB_env *env,
     if (!env->mdb_env) {
         return DISLMDB_ERR_NOT_INITIALIZED;
     }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_WRITE);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
     if (env->config.read_only_node) {
         return DISLMDB_ERR_READ_ONLY;
-    }
-    if (options & DISLMDB_BYTECODE_COMPRESS) {
-        return DISLMDB_ERR_NOT_IMPLEMENTED;
     }
     if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         return dislmdb_pbft_store_bytecode(env, bytecode, bytecode_size, bytecode_id, options);
@@ -1302,6 +1387,10 @@ int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32])
     if (!env || env->magic != DISLMDB_MAGIC) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
     if (key) {
         memcpy(env->cluster_key, key, 32);
     } else {
@@ -1344,6 +1433,10 @@ int dislmdb_checkpoint(DISLMDB_env *env)
 {
     if (!env || env->magic != DISLMDB_MAGIC) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
     }
     if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
         return dislmdb_raft_checkpoint(env);
@@ -1618,6 +1711,10 @@ int dislmdb_get_bytecode(DISLMDB_env *env,
     if (!env->mdb_env) {
         return DISLMDB_ERR_NOT_INITIALIZED;
     }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_READ);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
 
     size_t id_len = strnlen(bytecode_id, 129);
     if (id_len == 0 || id_len > 128) {
@@ -1652,7 +1749,9 @@ int dislmdb_get_bytecode(DISLMDB_env *env,
     unsigned int opts = 0;
     const uint8_t *payload = NULL;
     size_t data_size = 0;
-    rc = dislmdb_bytecode_unpack(val.mv_data, val.mv_size, &opts, &payload, &data_size);
+    bool owned = false;
+    rc = dislmdb_bytecode_unpack(val.mv_data, val.mv_size, &opts, &payload, &data_size,
+                                 &owned);
     if (rc != DISLMDB_SUCCESS) {
         mdb_txn_abort(txn);
         return rc;
@@ -1662,16 +1761,25 @@ int dislmdb_get_bytecode(DISLMDB_env *env,
     }
     if (!bytecode) {
         *bytecode_size = data_size;
+        if (owned) {
+            free((void *)payload);
+        }
         mdb_txn_abort(txn);
         return DISLMDB_SUCCESS;
     }
     if (*bytecode_size < data_size) {
         *bytecode_size = data_size;
+        if (owned) {
+            free((void *)payload);
+        }
         mdb_txn_abort(txn);
         return DISLMDB_ERR_BUFFER_OVERFLOW;
     }
     memcpy(bytecode, payload, data_size);
     *bytecode_size = data_size;
+    if (owned) {
+        free((void *)payload);
+    }
     mdb_txn_abort(txn);
     return DISLMDB_SUCCESS;
 }

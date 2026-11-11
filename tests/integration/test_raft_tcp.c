@@ -101,6 +101,25 @@ int main(void)
     }
     EXPECT_EQ_INT(&ctx, "get_bc", got, 0);
     EXPECT_EQ_INT(&ctx, "bc_len", (int)out_sz, (int)sizeof(bc));
+
+    EXPECT_EQ_INT(&ctx, "store_bc_c",
+                  dislmdb_store_bytecode(writer, bc, sizeof(bc), "raft-bc-c",
+                                         DISLMDB_BYTECODE_COMPRESS),
+                  0);
+    got = -1;
+    for (int w = 0; w < 100 && got != 0; w++) {
+        out_sz = sizeof(out);
+        opts = 0;
+        got = dislmdb_get_bytecode(c, "raft-bc-c", out, &out_sz, &opts);
+        if (got != 0) {
+            usleep(50 * 1000);
+        }
+    }
+    EXPECT_EQ_INT(&ctx, "get_bc_c", got, 0);
+    EXPECT_EQ_INT(&ctx, "bc_c_len", (int)out_sz, (int)sizeof(bc));
+    EXPECT_MEMEQ(&ctx, "bc_c_bytes", out, bc, sizeof(bc));
+    EXPECT_TRUE(&ctx, "bc_c_flag", (opts & DISLMDB_BYTECODE_COMPRESS) != 0);
+
     EXPECT_EQ_INT(&ctx, "checkpoint", dislmdb_checkpoint(writer), 0);
 
     DISLMDB_shard_desc shards[2];

@@ -11,7 +11,7 @@ DEPFLAGS ?= -MMD -MP
 CPPFLAGS += -Iinclude -Isrc -IEnhanced-PBFT-mechanism -IEnhanced-Raft-mechanism \
             -Ithird_party/mbedtls/include -DDISLMDB_USE_COMMONCRYPTO
 LDFLAGS  ?=
-LIBS     ?= -lpthread
+LIBS     ?= -lpthread -lz
 
 MBEDTLS_DIR := third_party/mbedtls
 MBEDTLS_LIBDIR := $(MBEDTLS_DIR)/library
@@ -44,6 +44,7 @@ DISLMDB_SRCS := \
   src/utils/dislmdb_utils.c \
   src/utils/dislmdb_crypto.c \
   src/utils/dislmdb_ops.c \
+  src/utils/dislmdb_acl.c \
   src/utils/dislmdb_persist.c \
   src/utils/dislmdb_shard.c \
   src/utils/dislmdb_topo.c \
@@ -91,6 +92,7 @@ RIG_TESTS := \
 
 INTEGRATION_TESTS := \
   $(BINDIR)/test_ops_persist \
+  $(BINDIR)/test_acl \
   $(BINDIR)/test_op_status \
   $(BINDIR)/test_membership \
   $(BINDIR)/test_shard_map \
@@ -99,6 +101,7 @@ INTEGRATION_TESTS := \
   $(BINDIR)/test_mixed \
   $(BINDIR)/test_mtls_cluster \
   $(BINDIR)/test_raft_udp \
+  $(BINDIR)/test_raft_quic \
   $(BINDIR)/test_raft_tcp \
   $(BINDIR)/test_raft_both \
   $(BINDIR)/test_raft_mtls \
@@ -124,7 +127,7 @@ E2E_RUNNER := $(BINDIR)/e2e_runner
 
 .PHONY: all dirs lib mbedtls examples test-bins check check-sandbox check-integration \
         check-orb check-stress orb-bins unit unit-sandbox rig integration e2e test \
-        clean smoke-example
+        clean smoke-example pc rust-bindings
 
 # Default: build + sandbox-safe suite (works under Cursor agent sandbox)
 all: lib examples test-bins check-sandbox
@@ -229,6 +232,9 @@ $(BINDIR)/test_cluster_rig: tests/rig/test_cluster_rig.c tests/rig/cluster_rig.c
 $(BINDIR)/test_ops_persist: tests/integration/test_ops_persist.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
+$(BINDIR)/test_acl: tests/integration/test_acl.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
 $(BINDIR)/test_op_status: tests/integration/test_op_status.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
@@ -254,6 +260,10 @@ $(BINDIR)/test_mtls_cluster: tests/integration/test_mtls_cluster.c $(LIBDIR)/lib
 	  -Wl,-rpath,$(abspath $(LIBDIR))
 
 $(BINDIR)/test_raft_udp: tests/integration/test_raft_udp.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_quic: tests/integration/test_raft_quic.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
 
@@ -372,6 +382,7 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@echo ">>>> Integration / basic tests (requires unsandboxed mmap)"
 	@cd $(BINDIR) && ./dislmdb_test
 	@cd $(BUILD) && ./bin/test_ops_persist
+	@cd $(BUILD) && ./bin/test_acl
 	@cd $(BUILD) && ./bin/test_op_status
 	@cd $(BUILD) && ./bin/test_membership
 	@cd $(BUILD) && ./bin/test_shard_map
@@ -380,6 +391,7 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@cd $(BUILD) && ./bin/test_mixed
 	@cd $(BUILD) && ./bin/test_mtls_cluster
 	@cd $(BUILD) && ./bin/test_raft_udp
+	@cd $(BUILD) && ./bin/test_raft_quic
 	@cd $(BUILD) && ./bin/test_raft_tcp
 	@cd $(BUILD) && ./bin/test_raft_both
 	@cd $(BUILD) && ./bin/test_raft_mtls
@@ -446,6 +458,17 @@ check: check-sandbox unit check-integration
 	@echo "All DisLMDB suites PASSED (add 'make check-orb' when Docker/OrbStack is available)."
 
 test: check-sandbox
+
+# pkg-config fragment for C ABI consumers (bindings/ABI.kdl)
+PREFIX ?= /usr/local
+pc: | dirs
+	@sed -e 's|@PREFIX@|$(PREFIX)|g' -e 's|@VERSION@|0.1.0|g' dislmdb.pc.in \
+	  > $(BUILD)/dislmdb.pc
+	@echo "Wrote $(BUILD)/dislmdb.pc (PKG_CONFIG_PATH=$(abspath $(BUILD)))"
+
+# High-level Rust binding (edition 2024); requires `make lib` first
+rust-bindings: lib
+	@cd bindings/rust && cargo test
 
 clean:
 	rm -rf $(BUILD)

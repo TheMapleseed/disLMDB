@@ -319,10 +319,19 @@ static int run_line(e2e_state *st, char *line)
     if (strcmp(cmd, "BYTECODE_STORE") == 0) {
         const char *id = NULL;
         char *hex = NULL;
+        unsigned opts = 0;
         for (int i = 0; i < nargs; i++) {
             char *v;
             if ((v = tok_key(args[i], "id"))) id = v;
             else if ((v = tok_key(args[i], "hex"))) hex = v;
+            else if ((v = tok_key(args[i], "opts"))) {
+                if (strstr(v, "compress")) {
+                    opts |= DISLMDB_BYTECODE_COMPRESS;
+                }
+                if (strstr(v, "verify")) {
+                    opts |= DISLMDB_BYTECODE_VERIFY;
+                }
+            }
         }
         uint8_t buf[4096];
         size_t bl = 0;
@@ -330,7 +339,7 @@ static int run_line(e2e_state *st, char *line)
             emit("BYTECODE_STORE", "rc=-1 err=bad_args");
             return DISLMDB_ERR_INVALID_PARAMETER;
         }
-        st->last_rc = dislmdb_store_bytecode(st->env, buf, bl, id, 0);
+        st->last_rc = dislmdb_store_bytecode(st->env, buf, bl, id, opts);
         emit_rc("BYTECODE_STORE", st->last_rc);
         return st->last_rc;
     }
@@ -345,7 +354,7 @@ static int run_line(e2e_state *st, char *line)
         unsigned opts = 0;
         st->last_rc = dislmdb_get_bytecode(st->env, id, buf, &sz, &opts);
         if (st->last_rc) { emit_rc("BYTECODE_GET", st->last_rc); return st->last_rc; }
-        printf("BYTECODE_GET rc=0 size=%zu hex=", sz);
+        printf("BYTECODE_GET rc=0 size=%zu opts=0x%x hex=", sz, opts);
         for (size_t i = 0; i < sz; i++) printf("%02x", buf[i]);
         printf("\n");
         fflush(stdout);

@@ -1,13 +1,16 @@
-# Bytecode store/retrieve round-trip
+# Bytecode store/retrieve round-trip (+ compress)
 OPEN path=./e2e_work/02_bytecode port=29702
 SET_KEY hex=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 BYTECODE_STORE id=model-v1 hex=cafebabe000102030405
 BYTECODE_GET id=model-v1
+BYTECODE_STORE id=model-v1c hex=cafebabe000102030405 opts=compress,verify
+BYTECODE_GET id=model-v1c
 SYNC
 CHECKPOINT
 METRICS
 CLOSE
 REOPEN
 BYTECODE_GET id=model-v1
+BYTECODE_GET id=model-v1c
 CLOSE
 ECHO scenario_02_complete

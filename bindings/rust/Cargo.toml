@@ -1,0 +1,15 @@
+[package]
+name = "dislmdb"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Rust bindings for DisLMDB (C ABI)"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[lib]
+name = "dislmdb"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]

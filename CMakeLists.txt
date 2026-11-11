@@ -88,6 +88,7 @@ set(DISLMDB_SRCS
     src/utils/dislmdb_utils.c
     src/utils/dislmdb_crypto.c
     src/utils/dislmdb_ops.c
+    src/utils/dislmdb_acl.c
     src/utils/dislmdb_persist.c
     src/utils/dislmdb_shard.c
     src/utils/dislmdb_topo.c
@@ -134,9 +135,11 @@ set_target_properties(dislmdb PROPERTIES
     PUBLIC_HEADER "include/dislmdb.h;include/dislmdb_consensus.h;include/dislmdb_network.h;include/dislmdb_errors.h;include/dislmdb_crypto.h"
 )
 
+find_package(ZLIB REQUIRED)
 target_link_libraries(dislmdb
     PRIVATE lmdb
     PRIVATE Threads::Threads
+    PRIVATE ZLIB::ZLIB
 )
 
 if(UNIX AND NOT APPLE)
@@ -177,6 +180,10 @@ add_test(NAME unit_tvb3 COMMAND test_tvb3)
 add_executable(test_ops_persist tests/integration/test_ops_persist.c)
 target_link_libraries(test_ops_persist dislmdb)
 add_test(NAME integration_ops_persist COMMAND test_ops_persist WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_acl tests/integration/test_acl.c)
+target_link_libraries(test_acl dislmdb)
+add_test(NAME integration_acl COMMAND test_acl WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_op_status tests/integration/test_op_status.c)
 target_link_libraries(test_op_status dislmdb)
@@ -237,6 +244,10 @@ add_test(NAME integration_mtls_cluster COMMAND test_mtls_cluster WORKING_DIRECTO
 add_executable(test_raft_udp tests/integration/test_raft_udp.c)
 target_link_libraries(test_raft_udp dislmdb)
 add_test(NAME integration_raft_udp COMMAND test_raft_udp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_quic tests/integration/test_raft_quic.c)
+target_link_libraries(test_raft_quic dislmdb)
+add_test(NAME integration_raft_quic COMMAND test_raft_quic WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_raft_tcp tests/integration/test_raft_tcp.c)
 target_link_libraries(test_raft_tcp dislmdb)

@@ -166,7 +166,27 @@ struct DISLMDB_env {
         uint8_t *reply_val; /**< owned; GET replies only */
         size_t reply_vlen;
     } forward_waiters[16];
+
+    /* Access-control (independent of transport crypto) */
+    pthread_mutex_t acl_mutex;
+    bool acl_mutex_ready;
+    char acl_principal[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+    struct {
+        char name[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+        unsigned int perms;
+        bool used;
+    } acl_grants[DISLMDB_ACL_MAX_PRINCIPALS];
+    uint32_t acl_grant_count;
 };
+
+/** Require @p need bits when enable_acl; no-op success when ACL off. */
+int dislmdb_acl_require(DISLMDB_env *env, unsigned int need);
+
+/** Pack grant table for meta DBI (owns *out). Empty table → len 8 header only. */
+int dislmdb_acl_persist_pack(DISLMDB_env *env, uint8_t **out, size_t *out_len);
+
+/** Replace grant table from packed blob (ignores principal). */
+int dislmdb_acl_persist_unpack(DISLMDB_env *env, const uint8_t *data, size_t len);
 
 /** @brief Pending op recorded for replication */
 typedef struct DISLMDB_pending_op {
@@ -248,8 +268,9 @@ int dislmdb_network_set_auth_key(DISLMDB_env *env, const uint8_t key[32]);
 int dislmdb_network_set_encryption(DISLMDB_env *env, bool enable);
 
 /**
- * Pack bytecode for durable storage: [u32 options][optional sha256][payload].
- * Rejects DISLMDB_BYTECODE_COMPRESS. Owns *out on success.
+ * Pack bytecode for durable storage:
+ * [u32 options][optional sha256 of plaintext][u32 raw_len if COMPRESS][payload].
+ * COMPRESS uses zlib. Owns *out on success.
  */
 int dislmdb_bytecode_pack(unsigned int options,
                           const uint8_t *src,
@@ -258,14 +279,16 @@ int dislmdb_bytecode_pack(unsigned int options,
                           size_t *out_len);
 
 /**
- * Unpack durable bytecode. When VERIFY is set, checks SHA-256.
- * *data_out points into @p stored (not owned).
+ * Unpack durable bytecode. When VERIFY is set, checks SHA-256 of plaintext.
+ * When COMPRESS is set, *data_out is malloc'd (caller frees); otherwise it
+ * points into @p stored. @p owned_out may be NULL if COMPRESS is impossible.
  */
 int dislmdb_bytecode_unpack(const uint8_t *stored,
                             size_t stored_len,
                             unsigned int *options_out,
                             const uint8_t **data_out,
-                            size_t *data_len_out);
+                            size_t *data_len_out,
+                            bool *owned_out);
 
 /**
  * @brief Log a message to the environment's log

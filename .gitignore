@@ -43,6 +43,11 @@ testdb/
 tmp/
 *.tmp
 *.log
+it_*/
+it_*_certs/
+it_*_db/
+qd_a/
+qd_b/
 
 # Dependencies
 external/

@@ -4,12 +4,12 @@ Last updated: 2026-11-11
 
 ## Status
 
-Working system: Raft + Enhanced-PBFT, TCP/UDP/BOTH, mTLS 1.3, DQGM v3, shard map,
-leave/membership, outbox buffers, sandbox/integration/orb/stress lanes green.
+Working system: Raft + Enhanced-PBFT, TCP/UDP/BOTH/QUIC, mTLS 1.3, DQGM v3, shard map,
+leave/membership, outbox, ACL, bytecode compress, sandbox/integration/orb lanes green.
 
 Membership/network peer tables are **heap-growable**; `DISLMDB_MAX_NODES` is an initial
-size hint only. Soft cap via `max_peers` / `DISLMDB_MAX_PEERS` (0 = unlimited). Practical
-scale still bounded by **latency / full-mesh fan-out** until Phase B hierarchy lands.
+size hint only. Soft cap via `max_peers` / `DISLMDB_MAX_PEERS` (0 = unlimited). Regional
+Raft + learners (Phase B) bound voter fan-out; latency / RTT budgets still apply.
 
 ## Green (do not regress)
 
@@ -18,7 +18,7 @@ scale still bounded by **latency / full-mesh fan-out** until Phase B hierarchy l
 | `make check-sandbox` | Pass |
 | `make check-integration` | Pass |
 | `make check-orb` | Pass |
-| `make check-stress` | Pass (target) |
+| `make check-stress` | Pass (soak; flake-prone cells repeated) |
 | PBFT / Raft matrix + leave / membership / shard | Pass |
 | DQGM v3 + CID rebind + pkt_num + ACK + peer-restart | Pass |
 | Per-peer outbox + sock buffers | Pass |
@@ -165,11 +165,19 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 
 ### Phase H — Product surface (post scale/QUIC)
 
-- [ ] `DISLMDB_BYTECODE_COMPRESS` (store/get path; flag already reserved)
-- [ ] Access-control layer (authz on put/get/admin; independent of transport crypto)
-- [ ] Language bindings (C ABI stable first; then one high-level binding)
-- [ ] Optional Prometheus HTTP scrape listener (or document sidecar-only forever)
-- [ ] QUIC IT: multi-node `TRANSPORT_QUIC` cluster smoke (beyond unit substrate)
+- [x] `DISLMDB_BYTECODE_COMPRESS` (zlib store/get; VERIFY hashes plaintext)
+- [x] Access-control layer (enable_acl + principal grants; put/write/admin gates)
+- [x] Language bindings (`bindings/ABI.kdl` + pkg-config + Rust crate `bindings/rust`)
+- [x] Metrics: sidecar-only forever (`dislmdb_format_metrics`; no embedded scrape HTTP)
+- [x] QUIC IT: multi-node `TRANSPORT_QUIC` Raft smoke (`test_raft_quic`, 2-node)
+
+### Phase I — Harden product surface
+
+- [x] Persist ACL grants in meta DBI across reopen (`acl_grants`; `test_acl` reopen)
+- [x] Ignore IT leftover dirs in `.gitignore` (`it_*`, cert scratch)
+- [x] README/TODO status honesty after Phase H
+- [x] QUIC 3-node Raft IT (`test_raft_quic` mesh + compress bytecode)
+- [ ] Optional: commit / push Phase H+I session work (when asked)
 
 ---
 
@@ -183,6 +191,7 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 6. **F** Raft WAL/snapshots  
 7. **G** I/O parallelism + QUIC  
 8. **H** bytecode compress → ACL → bindings → scrape  
+9. **I** ACL persist → hygiene → optional QUIC 3-node  
 
 ## Smaller follow-ups
 
@@ -225,6 +234,14 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 - 1-RTT CRYPTO → DQGM framed RX; `dislmdb_quic_client_start`
 - QUIC client dial on connect; `stack_ready` true (ephemeral ECDSA CV)
 - QUIC X.509 CertificateVerify (PEM / self-signed; strict CA when configured)
+- `DISLMDB_BYTECODE_COMPRESS` zlib pack/unpack + VERIFY-on-plaintext; `-lz`
+- QUIC simultaneous-open tie-break + Initial retransmit; `test_raft_quic`
+- ACL `enable_acl` + grant/revoke/require; `test_acl`
+- Metrics scrape: documented sidecar-only (no in-process HTTP)
+- Bindings: `ABI.kdl` + `dislmdb.pc.in` + Rust `bindings/rust` (`make rust-bindings`)
+- Test coverage: ACL admin/bytecode/off; compress probe/overflow/big; Raft TCP+QUIC
+  compress apply; matrix `quic` cell; e2e `opts=compress,verify`
+- ACL grant table persisted in meta (`acl_grants`) + reopen IT
 - InstallSnapshot FSM dump/restore for `kv` (`raft_set_fsm_hooks`)
 - Phase G: Raft inbound queue (ELECTION/SYNC off net thread)
 - Phase G: mTLS handshake worker pool (`network.handshake_workers`)

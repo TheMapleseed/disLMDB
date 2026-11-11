@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: dislmdb
+Description: Distributed LMDB (Raft/PBFT, QUIC, ACL)
+Version: @VERSION@
+Libs: -L${libdir} -ldislmdb -lpthread -lz
+Cflags: -I${includedir}

@@ -92,6 +92,18 @@ enum {
 #define DISLMDB_BYTECODE_VERIFY   0x0001u
 #define DISLMDB_BYTECODE_COMPRESS 0x0002u
 
+/** @brief ACL capability bits (OR into grant masks) */
+#define DISLMDB_ACL_NONE  0x0000u
+#define DISLMDB_ACL_READ  0x0001u /**< get / read paths */
+#define DISLMDB_ACL_WRITE 0x0002u /**< put / del / store bytecode */
+#define DISLMDB_ACL_ADMIN 0x0004u /**< membership, keys, ACL grants, checkpoint */
+#define DISLMDB_ACL_ALL   (DISLMDB_ACL_READ | DISLMDB_ACL_WRITE | DISLMDB_ACL_ADMIN)
+
+/** @brief Max ACL principal id length (excluding NUL) */
+#define DISLMDB_ACL_PRINCIPAL_MAX 64
+/** @brief Max principals in the in-memory ACL table */
+#define DISLMDB_ACL_MAX_PRINCIPALS 64
+
 #ifdef __cplusplus
 }
 #endif
