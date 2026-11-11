@@ -185,6 +185,14 @@ add_executable(test_acl tests/integration/test_acl.c)
 target_link_libraries(test_acl dislmdb)
 add_test(NAME integration_acl COMMAND test_acl WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_system_surface tests/integration/test_system_surface.c)
+target_link_libraries(test_system_surface dislmdb)
+add_test(NAME integration_system_surface COMMAND test_system_surface WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_learner tests/integration/test_raft_learner.c)
+target_link_libraries(test_raft_learner dislmdb)
+add_test(NAME integration_raft_learner COMMAND test_raft_learner WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_op_status tests/integration/test_op_status.c)
 target_link_libraries(test_op_status dislmdb)
 add_test(NAME integration_op_status COMMAND test_op_status WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -318,10 +326,12 @@ add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     DEPENDS dislmdb_test test_crypto test_tvb3 test_raft test_raft_membership
             test_mtls test_transport_adapt test_quic_substrate
-            test_ops_persist test_op_status test_membership test_shard_map test_topo_modes
+            test_ops_persist test_acl test_system_surface test_op_status
+            test_membership test_shard_map test_topo_modes
             test_topo_forward test_topo_plane test_raft_wal test_raft_wal_chaos
             test_multinode test_udp test_mixed
-            test_mtls_cluster test_raft_udp test_raft_tcp test_raft_both
+            test_mtls_cluster test_raft_udp test_raft_quic test_raft_tcp
+            test_raft_learner test_raft_both
             test_raft_mtls test_raft_mtls_tcp test_raft_fault test_raft_stage
             test_raft_membership_it test_raft_leave test_pbft_viewchange
             test_fault_tolerance e2e_runner

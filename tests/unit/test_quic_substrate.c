@@ -487,6 +487,62 @@ int main(void)
                           0);
             EXPECT_EQ_INT(&ctx, "pem_scheme", (int)scheme,
                           (int)DISLMDB_QUIC_TLS_SIG_RSA_PKCS1_SHA256);
+
+            /* CA mismatch: peer leaf signed by other CA must fail strict verify */
+            dislmdb_quic_tls_identity *other =
+                dislmdb_quic_tls_identity_self_signed("other-ca");
+            EXPECT_TRUE(&ctx, "other_id", other != NULL);
+            if (other) {
+                const uint8_t *oder = NULL;
+                size_t oder_len = 0;
+                EXPECT_EQ_INT(&ctx, "other_leaf",
+                              dislmdb_quic_tls_identity_leaf_der(other, &oder,
+                                                                 &oder_len),
+                              0);
+                uint8_t cert_msg[2048];
+                size_t cert_msg_len = 0;
+                EXPECT_EQ_INT(&ctx, "other_cert_enc",
+                              dislmdb_quic_tls_encode_certificate(
+                                  oder, oder_len, cert_msg, sizeof(cert_msg),
+                                  &cert_msg_len),
+                              0);
+                uint8_t cv_content[160];
+                size_t cv_content_len = 0;
+                uint8_t tr[32];
+                memset(tr, 0x11, sizeof(tr));
+                EXPECT_EQ_INT(&ctx, "cv_content",
+                              dislmdb_quic_tls_cert_verify_content(
+                                  true, tr, sizeof(tr), cv_content,
+                                  sizeof(cv_content), &cv_content_len),
+                              0);
+                uint8_t osig[512];
+                size_t osig_len = 0;
+                uint16_t oscheme = 0;
+                EXPECT_EQ_INT(&ctx, "other_sign",
+                              dislmdb_quic_tls_identity_sign(
+                                  other, cv_content, cv_content_len, &oscheme,
+                                  osig, sizeof(osig), &osig_len),
+                              0);
+                uint8_t cv_msg[640];
+                size_t cv_msg_len = 0;
+                EXPECT_EQ_INT(&ctx, "cv_enc",
+                              dislmdb_quic_tls_encode_certificate_verify(
+                                  oscheme, osig, osig_len, cv_msg,
+                                  sizeof(cv_msg), &cv_msg_len),
+                              0);
+                /* Strict CA (pem) rejects unrelated self-signed leaf */
+                EXPECT_TRUE(&ctx, "ca_reject",
+                            dislmdb_quic_tls_verify_peer_certificate(
+                                cert_msg, cert_msg_len, cv_msg, cv_msg_len,
+                                cv_content, cv_content_len, pem) != 0);
+                /* TOFU (NULL trust) accepts CV against leaf */
+                EXPECT_EQ_INT(&ctx, "tofu_ok",
+                              dislmdb_quic_tls_verify_peer_certificate(
+                                  cert_msg, cert_msg_len, cv_msg, cv_msg_len,
+                                  cv_content, cv_content_len, NULL),
+                              0);
+                dislmdb_quic_tls_identity_destroy(other);
+            }
             dislmdb_quic_tls_identity_destroy(pem);
         }
     }

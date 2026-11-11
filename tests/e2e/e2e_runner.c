@@ -24,6 +24,11 @@
  *   VERSION
  *   BYTECODE_STORE id=<id> hex=<bytes>
  *   BYTECODE_GET id=<id>
+ *   ACL_GRANT principal=<id> perms=read|write|admin|all
+ *   ACL_REVOKE principal=<id> perms=...
+ *   ACL_PRINCIPAL name=<id>
+ *   ACL_GET principal=<id>
+ *   REGION | LOCALITY | TOPO | VOTING
  *   EXPECT_OK | EXPECT_ERR <code>
  *   ECHO <text...>
  */
@@ -121,6 +126,20 @@ static int cmd_open(e2e_state *st, char **args, int nargs)
             st->cfg.network.local_port = (uint16_t)atoi(v);
         } else if ((v = tok_key(args[i], "persist_key"))) {
             st->cfg.consensus.persist_cluster_key = (atoi(v) != 0);
+        } else if ((v = tok_key(args[i], "acl"))) {
+            st->cfg.enable_acl = (atoi(v) != 0);
+        } else if ((v = tok_key(args[i], "region"))) {
+            strncpy(st->cfg.region, v, sizeof(st->cfg.region) - 1);
+        } else if ((v = tok_key(args[i], "locality"))) {
+            strncpy(st->cfg.locality, v, sizeof(st->cfg.locality) - 1);
+        } else if ((v = tok_key(args[i], "topo"))) {
+            if (strcmp(v, "mirror") == 0) {
+                st->cfg.topology_mode = DISLMDB_TOPO_MIRROR;
+            } else if (strcmp(v, "shard") == 0) {
+                st->cfg.topology_mode = DISLMDB_TOPO_SHARD;
+            } else if (strcmp(v, "hybrid") == 0) {
+                st->cfg.topology_mode = DISLMDB_TOPO_HYBRID;
+            }
         }
     }
     mkdir(st->path, 0700);
@@ -137,7 +156,28 @@ static int cmd_reopen(e2e_state *st)
 {
     if (st->txn) { dislmdb_txn_abort(st->txn); st->txn = NULL; }
     if (st->env) { dislmdb_env_close(st->env); st->env = NULL; st->open = false; }
+    /* Preserve path + topology/ACL knobs from the prior OPEN. */
+    char path_save[512];
+    strncpy(path_save, st->path, sizeof(path_save) - 1);
+    path_save[sizeof(path_save) - 1] = '\0';
+    bool acl = st->cfg.enable_acl;
+    DISLMDB_TOPOLOGY_MODE topo = st->cfg.topology_mode;
+    char region[64], locality[64];
+    strncpy(region, st->cfg.region, sizeof(region) - 1);
+    region[sizeof(region) - 1] = '\0';
+    strncpy(locality, st->cfg.locality, sizeof(locality) - 1);
+    locality[sizeof(locality) - 1] = '\0';
+    uint16_t port = st->cfg.network.local_port;
+    bool persist_key = st->cfg.consensus.persist_cluster_key;
     reset_cfg(st);
+    strncpy(st->path, path_save, sizeof(st->path) - 1);
+    st->cfg.path = st->path;
+    st->cfg.enable_acl = acl;
+    st->cfg.topology_mode = topo;
+    strncpy(st->cfg.region, region, sizeof(st->cfg.region) - 1);
+    strncpy(st->cfg.locality, locality, sizeof(st->cfg.locality) - 1);
+    st->cfg.network.local_port = port;
+    st->cfg.consensus.persist_cluster_key = persist_key;
     int rc = dislmdb_env_create(&st->env);
     if (rc) { st->last_rc = rc; emit_rc("REOPEN", rc); return rc; }
     rc = dislmdb_env_open(st->env, &st->cfg);
@@ -357,6 +397,117 @@ static int run_line(e2e_state *st, char *line)
         printf("BYTECODE_GET rc=0 size=%zu opts=0x%x hex=", sz, opts);
         for (size_t i = 0; i < sz; i++) printf("%02x", buf[i]);
         printf("\n");
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "ACL_GRANT") == 0 || strcmp(cmd, "ACL_REVOKE") == 0) {
+        const char *principal = NULL;
+        unsigned perms = 0;
+        for (int i = 0; i < nargs; i++) {
+            char *v;
+            if ((v = tok_key(args[i], "principal"))) {
+                principal = v;
+            } else if ((v = tok_key(args[i], "perms"))) {
+                if (strstr(v, "all")) {
+                    perms = DISLMDB_ACL_ALL;
+                } else {
+                    if (strstr(v, "read")) {
+                        perms |= DISLMDB_ACL_READ;
+                    }
+                    if (strstr(v, "write")) {
+                        perms |= DISLMDB_ACL_WRITE;
+                    }
+                    if (strstr(v, "admin")) {
+                        perms |= DISLMDB_ACL_ADMIN;
+                    }
+                }
+            }
+        }
+        if (!principal) {
+            emit(cmd, "rc=-1 err=missing_principal");
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        if (strcmp(cmd, "ACL_GRANT") == 0) {
+            st->last_rc = dislmdb_acl_grant(st->env, principal, perms);
+        } else {
+            st->last_rc = dislmdb_acl_revoke(st->env, principal, perms);
+        }
+        emit_rc(cmd, st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "ACL_PRINCIPAL") == 0) {
+        const char *name = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v = tok_key(args[i], "name");
+            if (v) {
+                name = v;
+            }
+        }
+        st->last_rc = dislmdb_acl_set_principal(st->env, name);
+        emit_rc("ACL_PRINCIPAL", st->last_rc);
+        return st->last_rc;
+    }
+    if (strcmp(cmd, "ACL_GET") == 0) {
+        const char *principal = NULL;
+        for (int i = 0; i < nargs; i++) {
+            char *v = tok_key(args[i], "principal");
+            if (v) {
+                principal = v;
+            }
+        }
+        unsigned mask = 0;
+        st->last_rc = dislmdb_acl_get(st->env, principal, &mask);
+        if (st->last_rc) {
+            emit_rc("ACL_GET", st->last_rc);
+            return st->last_rc;
+        }
+        printf("ACL_GET rc=0 principal=%s perms=0x%x\n",
+               principal ? principal : "", mask);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "REGION") == 0) {
+        char buf[64] = {0};
+        st->last_rc = dislmdb_get_region(st->env, buf, sizeof(buf));
+        if (st->last_rc) {
+            emit_rc("REGION", st->last_rc);
+            return st->last_rc;
+        }
+        printf("REGION rc=0 value=%s\n", buf);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "LOCALITY") == 0) {
+        char buf[64] = {0};
+        st->last_rc = dislmdb_get_locality(st->env, buf, sizeof(buf));
+        if (st->last_rc) {
+            emit_rc("LOCALITY", st->last_rc);
+            return st->last_rc;
+        }
+        printf("LOCALITY rc=0 value=%s\n", buf);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "TOPO") == 0) {
+        DISLMDB_TOPOLOGY_MODE mode = DISLMDB_TOPO_MIRROR;
+        st->last_rc = dislmdb_get_topology_mode(st->env, &mode);
+        if (st->last_rc) {
+            emit_rc("TOPO", st->last_rc);
+            return st->last_rc;
+        }
+        const char *name = "mirror";
+        if (mode == DISLMDB_TOPO_SHARD) {
+            name = "shard";
+        } else if (mode == DISLMDB_TOPO_HYBRID) {
+            name = "hybrid";
+        }
+        printf("TOPO rc=0 value=%s\n", name);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "VOTING") == 0) {
+        printf("VOTING rc=0 value=%s\n",
+               dislmdb_voting_enabled(st->env) ? "on" : "off");
         fflush(stdout);
         return 0;
     }

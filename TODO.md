@@ -179,6 +179,19 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 - [x] QUIC 3-node Raft IT (`test_raft_quic` mesh + compress bytecode)
 - [ ] Optional: commit / push Phase H+I session work (when asked)
 
+### Phase J — System-wide test coverage
+
+Goal: close gaps so unit/IT/e2e exercise the full product surface (not only happy paths).
+
+- [x] Soft `max_peers` reject (`add_node` / `reconfigure` / open) — `test_system_surface`
+- [x] `DISLMDB_VOTING=off` + live metrics/format + multi named-DBI persist
+- [x] Mirror `LAST_WRITE` vs `REGION_PRIORITY` (`test_topo_modes` + system surface)
+- [x] Raft hub + non-voting learner AE IT (`test_raft_learner`)
+- [x] WAL `raft_wal_sync_every=0` + named DBI across checkpoint/reopen (`test_raft_wal`)
+- [x] QUIC strict-CA reject vs TOFU (`test_quic_substrate`)
+- [x] E2E ACL + topo getters (`04_acl_topo`)
+- [ ] Optional: commit / push Phase J coverage (when asked)
+
 ---
 
 ## Implementation order (recommended)
@@ -192,6 +205,7 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 7. **G** I/O parallelism + QUIC  
 8. **H** bytecode compress → ACL → bindings → scrape  
 9. **I** ACL persist → hygiene → optional QUIC 3-node  
+10. **J** system-wide test coverage expansion  
 
 ## Smaller follow-ups
 
@@ -245,3 +259,6 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 - InstallSnapshot FSM dump/restore for `kv` (`raft_set_fsm_hooks`)
 - Phase G: Raft inbound queue (ELECTION/SYNC off net thread)
 - Phase G: mTLS handshake worker pool (`network.handshake_workers`)
+- Phase J: system_surface + raft_learner + e2e ACL/topo; QUIC CA/TOFU
+- Close-path deadlock fix: unlock around Raft apply; persist snapshot before LMDB;
+  raft_sync_peers without holding nodes_mutex across raft_add_*

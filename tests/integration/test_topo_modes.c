@@ -123,6 +123,32 @@ int main(void)
         dislmdb_env_close(env);
     }
 
+    /* --- mirror LAST_WRITE: non-primary region still writable --- */
+    {
+        reset_db();
+        DISLMDB_env *env = NULL;
+        int rc = dislmdb_env_create(&env);
+        EXPECT_EQ_INT(&ctx, "mlw_create", rc, 0);
+        DISLMDB_env_config cfg;
+        dislmdb_env_config_init(&cfg);
+        cfg.path = DBPATH;
+        cfg.mapsize = 4 * 1024 * 1024;
+        cfg.maxdbs = 8;
+        strncpy(cfg.node_name, "edge-west-lw", sizeof(cfg.node_name) - 1);
+        cfg.network.local_port = 30916;
+        cfg.consensus.mechanism = DISLMDB_CONSENSUS_SOLO;
+        cfg.topology_mode = DISLMDB_TOPO_MIRROR;
+        cfg.mirror_conflict_policy = DISLMDB_MIRROR_LAST_WRITE;
+        strncpy(cfg.region, "us-west", sizeof(cfg.region) - 1);
+        strncpy(cfg.mirror_primary_region, "us-east",
+                sizeof(cfg.mirror_primary_region) - 1);
+        EXPECT_EQ_INT(&ctx, "mlw_open", dislmdb_env_open(env, &cfg), 0);
+        EXPECT_EQ_INT(&ctx, "mlw_ok", put_key(env, "lw/k", "v"), 0);
+        EXPECT_EQ_INT(&ctx, "mlw_writable",
+                      dislmdb_topo_key_writable(env, "lw/k", 4), DISLMDB_SUCCESS);
+        dislmdb_env_close(env);
+    }
+
     /* --- shard: only owner may write matching keys --- */
     {
         reset_db();

@@ -177,6 +177,19 @@ static void raft_apply(uint64_t index, const uint8_t *data, size_t len, void *us
 static void raft_sync_peers_from_env(raft_adapter_ctx *actx)
 {
     DISLMDB_env *env = actx->env;
+    /*
+     * Snapshot peer decisions under nodes_mutex, then call raft_* without it.
+     * Holding nodes_mutex across raft_add_peer deadlocks with apply_committed
+     * (raft lock → apply → persist_save → nodes_mutex).
+     */
+    typedef struct {
+        char id[RAFT_NODE_ID_LEN];
+        bool remove;
+        bool as_learner;
+    } sync_peer;
+    sync_peer *ops = NULL;
+    uint32_t nops = 0;
+
     pthread_mutex_lock(&env->nodes_mutex);
     for (uint32_t i = 0; i < env->node_count; i++) {
         const char *id = env->nodes[i].node_id;
@@ -209,21 +222,34 @@ static void raft_sync_peers_from_env(raft_adapter_ctx *actx)
                                 sizeof(env->config.region)) != 0;
             }
         }
-        if (cross && env->config.topology_mode == DISLMDB_TOPO_SHARD) {
-            (void)raft_remove_peer(actx->node, id);
+        sync_peer *nops_arr =
+            realloc(ops, (size_t)(nops + 1) * sizeof(sync_peer));
+        if (!nops_arr) {
             continue;
         }
-        bool as_learner = false;
-        if (env->config.consensus.enable_voting && (cross || !peer_votes)) {
-            as_learner = true;
-        }
-        if (as_learner) {
-            (void)raft_add_learner(actx->node, id);
+        ops = nops_arr;
+        memset(&ops[nops], 0, sizeof(ops[nops]));
+        strncpy(ops[nops].id, id, RAFT_NODE_ID_LEN - 1);
+        if (cross && env->config.topology_mode == DISLMDB_TOPO_SHARD) {
+            ops[nops].remove = true;
         } else {
-            (void)raft_add_peer(actx->node, id);
+            ops[nops].as_learner =
+                env->config.consensus.enable_voting && (cross || !peer_votes);
         }
+        nops++;
     }
     pthread_mutex_unlock(&env->nodes_mutex);
+
+    for (uint32_t i = 0; i < nops; i++) {
+        if (ops[i].remove) {
+            (void)raft_remove_peer(actx->node, ops[i].id);
+        } else if (ops[i].as_learner) {
+            (void)raft_add_learner(actx->node, ops[i].id);
+        } else {
+            (void)raft_add_peer(actx->node, ops[i].id);
+        }
+    }
+    free(ops);
 }
 
 int dislmdb_raft_init(DISLMDB_env *env)

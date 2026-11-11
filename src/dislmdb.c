@@ -818,10 +818,11 @@ void dislmdb_env_close(DISLMDB_env *env)
 
     dislmdb_log(env, DISLMDB_LOG_INFO, "ENV", "Closing environment");
 
-    if (env->lmdb_opened) {
-        (void)dislmdb_persist_save(env);
-    }
-
+    /*
+     * Stop consensus + network before meta persist. Background Raft apply /
+     * WAL / reader threads can hold LMDB locks; persist_save needs a write
+     * txn and would otherwise block forever on close (seen with hub+learner).
+     */
     if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         if (env->consensus_context) {
             dislmdb_pbft_shutdown(env);
@@ -836,6 +837,10 @@ void dislmdb_env_close(DISLMDB_env *env)
 
     if (env->network_context) {
         dislmdb_network_shutdown(env);
+    }
+
+    if (env->lmdb_opened) {
+        (void)dislmdb_persist_save(env);
     }
 
     if (env->mdb_env) {

@@ -1,0 +1,28 @@
+OPEN rc=0 err=Success
+ACL_PRINCIPAL rc=0 err=Success
+ACL_GRANT rc=0 err=Success
+SET_KEY rc=0 err=Success
+REGION rc=0 value=us-east
+LOCALITY rc=0 value=az-a
+TOPO rc=0 value=mirror
+VOTING rc=0 value=on
+ACL_GET rc=0 principal=alice perms=0x7
+BEGIN rc=0 err=Success
+PUT rc=0 err=Success
+COMMIT rc=0 err=Success
+EXPECT_OK pass
+ACL_GRANT rc=0 err=Success
+ACL_PRINCIPAL rc=0 err=Success
+BEGIN rc=0 err=Success
+PUT rc=1013 err=Not authorized for operation
+EXPECT_ERR want=1013 got=1013 pass
+ABORT ok
+ACL_PRINCIPAL rc=0 err=Success
+CHECKPOINT rc=0 err=Success
+CLOSE ok
+REOPEN rc=0 err=Success
+ACL_GET rc=0 principal=alice perms=0x7
+REGION rc=0 value=us-east
+CLOSE ok
+ECHO scenario_04_complete
+E2E_DONE failures=0

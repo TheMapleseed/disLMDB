@@ -93,6 +93,8 @@ RIG_TESTS := \
 INTEGRATION_TESTS := \
   $(BINDIR)/test_ops_persist \
   $(BINDIR)/test_acl \
+  $(BINDIR)/test_system_surface \
+  $(BINDIR)/test_raft_learner \
   $(BINDIR)/test_op_status \
   $(BINDIR)/test_membership \
   $(BINDIR)/test_shard_map \
@@ -234,6 +236,13 @@ $(BINDIR)/test_ops_persist: tests/integration/test_ops_persist.c $(LIBDIR)/libdi
 
 $(BINDIR)/test_acl: tests/integration/test_acl.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
+$(BINDIR)/test_system_surface: tests/integration/test_system_surface.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
+$(BINDIR)/test_raft_learner: tests/integration/test_raft_learner.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
 
 $(BINDIR)/test_op_status: tests/integration/test_op_status.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
@@ -383,6 +392,7 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@cd $(BINDIR) && ./dislmdb_test
 	@cd $(BUILD) && ./bin/test_ops_persist
 	@cd $(BUILD) && ./bin/test_acl
+	@cd $(BUILD) && ./bin/test_system_surface
 	@cd $(BUILD) && ./bin/test_op_status
 	@cd $(BUILD) && ./bin/test_membership
 	@cd $(BUILD) && ./bin/test_shard_map
@@ -393,6 +403,7 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@cd $(BUILD) && ./bin/test_raft_udp
 	@cd $(BUILD) && ./bin/test_raft_quic
 	@cd $(BUILD) && ./bin/test_raft_tcp
+	@cd $(BUILD) && ./bin/test_raft_learner
 	@cd $(BUILD) && ./bin/test_raft_both
 	@cd $(BUILD) && ./bin/test_raft_mtls
 	@cd $(BUILD) && ./bin/test_raft_mtls_tcp

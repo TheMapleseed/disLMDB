@@ -699,9 +699,20 @@ static void apply_committed(RaftNode *n)
         if (li >= 0 && n->apply) {
             const uint8_t *d = n->log[li].data;
             size_t dl = n->log[li].data_len;
+            uint64_t idx = n->log[li].index;
             /* Membership entries reconfigure the voter set on append; skip app apply. */
             if (!is_membership_entry(d, dl)) {
-                n->apply(n->log[li].index, d, dl, n->user_data);
+                /*
+                 * Drop n->lock around FSM apply (same pattern as InstallSnapshot
+                 * restore). Apply may take env nodes_mutex / LMDB; net thread
+                 * holds nodes_mutex while calling raft_add_peer which needs
+                 * this lock — keeping it here deadlocks env_close.
+                 */
+                raft_apply_fn apply = n->apply;
+                void *ud = n->user_data;
+                pthread_mutex_unlock(&n->lock);
+                apply(idx, d, dl, ud);
+                pthread_mutex_lock(&n->lock);
             }
         }
         if (n->propose_inflight && n->propose_index == n->last_applied) {

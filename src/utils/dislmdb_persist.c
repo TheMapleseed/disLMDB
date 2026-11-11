@@ -43,176 +43,85 @@ int dislmdb_persist_save(DISLMDB_env *env)
         return DISLMDB_SUCCESS;
     }
 
-    MDB_txn *txn = NULL;
-    int rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
-    if (rc != 0) {
-        return rc;
-    }
-    MDB_dbi dbi;
-    rc = mdb_dbi_open(txn, DISLMDB_META_DBI, MDB_CREATE, &dbi);
-    if (rc != 0) {
-        mdb_txn_abort(txn);
-        return rc;
-    }
-
-    uint8_t buf[8];
-    dislmdb_write_u64(buf, env->pbft_state.view);
-    MDB_val k = {.mv_size = strlen(META_KEY_VIEW), .mv_data = (void *)META_KEY_VIEW};
-    MDB_val v = {.mv_size = 8, .mv_data = buf};
-    rc = mdb_put(txn, dbi, &k, &v, 0);
-    if (rc != 0) {
-        mdb_txn_abort(txn);
-        return rc;
-    }
-
-    dislmdb_write_u64(buf, env->pbft_state.sequence);
-    k.mv_size = strlen(META_KEY_SEQ);
-    k.mv_data = (void *)META_KEY_SEQ;
-    rc = mdb_put(txn, dbi, &k, &v, 0);
-    if (rc != 0) {
-        mdb_txn_abort(txn);
-        return rc;
-    }
-
-    if (env->has_cluster_key && env->config.consensus.persist_cluster_key) {
-        k.mv_size = strlen(META_KEY_CK);
-        k.mv_data = (void *)META_KEY_CK;
-        v.mv_size = 32;
-        v.mv_data = env->cluster_key;
-        rc = mdb_put(txn, dbi, &k, &v, 0);
-        if (rc != 0) {
-            mdb_txn_abort(txn);
-            return rc;
-        }
-    }
-
     /*
-     * Length-prefixed replica stream (REPL v2): no fixed-N packing limit.
-     * Each record: id_len u16 + id, host_len u16 + host, port u16,
-     * region_len u16 + region, locality_len u16 + locality.
+     * Snapshot mutex-guarded tables BEFORE the LMDB write txn. Never take
+     * nodes_mutex/shard_mutex while holding a write txn (lock-order vs net
+     * thread: nodes_mutex → raft → apply → persist).
      */
-    pthread_mutex_lock(&env->nodes_mutex);
-    size_t rneed = 12; /* magic + ver + count */
-    for (uint32_t i = 0; i < env->node_count; i++) {
-        rneed += 2 + strnlen(env->nodes[i].node_id, 63);
-        rneed += 2 + strnlen(env->nodes[i].hostname, 255);
-        rneed += 2; /* port */
-        rneed += 2 + strnlen(env->nodes[i].region, 63);
-        rneed += 2 + strnlen(env->nodes[i].locality, 63);
-    }
-    uint8_t *rbuf = calloc(1, rneed ? rneed : 12);
-    if (!rbuf) {
-        pthread_mutex_unlock(&env->nodes_mutex);
-        mdb_txn_abort(txn);
-        return DISLMDB_ERR_MEMORY_ERROR;
-    }
+    uint8_t *rbuf = NULL;
     size_t ro = 0;
-    dislmdb_write_u32(rbuf + ro, DISLMDB_REPL_MAGIC); ro += 4;
-    dislmdb_write_u32(rbuf + ro, 2); ro += 4;
-    dislmdb_write_u32(rbuf + ro, env->node_count); ro += 4;
-    for (uint32_t i = 0; i < env->node_count; i++) {
-        size_t idl = strnlen(env->nodes[i].node_id, 63);
-        size_t hl = strnlen(env->nodes[i].hostname, 255);
-        size_t rl = strnlen(env->nodes[i].region, 63);
-        size_t ll = strnlen(env->nodes[i].locality, 63);
-        dislmdb_write_u16(rbuf + ro, (uint16_t)idl); ro += 2;
-        memcpy(rbuf + ro, env->nodes[i].node_id, idl); ro += idl;
-        dislmdb_write_u16(rbuf + ro, (uint16_t)hl); ro += 2;
-        memcpy(rbuf + ro, env->nodes[i].hostname, hl); ro += hl;
-        dislmdb_write_u16(rbuf + ro, env->nodes[i].port); ro += 2;
-        dislmdb_write_u16(rbuf + ro, (uint16_t)rl); ro += 2;
-        memcpy(rbuf + ro, env->nodes[i].region, rl); ro += rl;
-        dislmdb_write_u16(rbuf + ro, (uint16_t)ll); ro += 2;
-        memcpy(rbuf + ro, env->nodes[i].locality, ll); ro += ll;
-    }
-    pthread_mutex_unlock(&env->nodes_mutex);
-    k.mv_size = strlen(META_KEY_REPLICAS);
-    k.mv_data = (void *)META_KEY_REPLICAS;
-    v.mv_size = ro;
-    v.mv_data = rbuf;
-    rc = mdb_put(txn, dbi, &k, &v, 0);
-    free(rbuf);
-    if (rc != 0) {
-        mdb_txn_abort(txn);
-        return rc;
-    }
-
-    pthread_mutex_lock(&env->shard_mutex);
-    uint32_t sc = env->shard_count;
-    size_t ssize = 4 + (size_t)sc * SHARD_PACK_SIZE;
-    uint8_t *sbuf = calloc(1, ssize ? ssize : 4);
-    if (!sbuf) {
-        pthread_mutex_unlock(&env->shard_mutex);
-        mdb_txn_abort(txn);
-        return DISLMDB_ERR_MEMORY_ERROR;
-    }
-    dislmdb_write_u32(sbuf, sc);
-    for (uint32_t i = 0; i < sc; i++) {
-        size_t o = 4 + (size_t)i * SHARD_PACK_SIZE;
-        memcpy(sbuf + o, env->shards[i].shard_id, DISLMDB_SHARD_ID_LEN);
-        memcpy(sbuf + o + DISLMDB_SHARD_ID_LEN, env->shards[i].key_prefix,
-               DISLMDB_SHARD_PREFIX_LEN);
-        memcpy(sbuf + o + DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN,
-               env->shards[i].owner_node_id, 64);
-        dislmdb_write_u32(sbuf + o + SHARD_PACK_SIZE_V1, env->shards[i].flags);
-    }
-    pthread_mutex_unlock(&env->shard_mutex);
-    k.mv_size = strlen(META_KEY_SHARDS);
-    k.mv_data = (void *)META_KEY_SHARDS;
-    v.mv_size = ssize;
-    v.mv_data = sbuf;
-    rc = mdb_put(txn, dbi, &k, &v, 0);
-    free(sbuf);
-    if (rc != 0) {
-        mdb_txn_abort(txn);
-        return rc;
-    }
-
-    /* Regional topology metadata (dedicated plane inside meta DBI). */
-    if (env->config.region[0] != '\0') {
-        k.mv_size = strlen(META_KEY_REGION);
-        k.mv_data = (void *)META_KEY_REGION;
-        v.mv_size = strnlen(env->config.region, sizeof(env->config.region));
-        v.mv_data = env->config.region;
-        rc = mdb_put(txn, dbi, &k, &v, 0);
-        if (rc != 0) {
-            mdb_txn_abort(txn);
-            return rc;
-        }
-    }
-    if (env->config.locality[0] != '\0') {
-        k.mv_size = strlen(META_KEY_LOCALITY);
-        k.mv_data = (void *)META_KEY_LOCALITY;
-        v.mv_size = strnlen(env->config.locality, sizeof(env->config.locality));
-        v.mv_data = env->config.locality;
-        rc = mdb_put(txn, dbi, &k, &v, 0);
-        if (rc != 0) {
-            mdb_txn_abort(txn);
-            return rc;
-        }
-    }
     {
-        uint8_t mode = (uint8_t)env->config.topology_mode;
-        k.mv_size = strlen(META_KEY_TOPO_MODE);
-        k.mv_data = (void *)META_KEY_TOPO_MODE;
-        v.mv_size = 1;
-        v.mv_data = &mode;
-        rc = mdb_put(txn, dbi, &k, &v, 0);
-        if (rc != 0) {
-            mdb_txn_abort(txn);
-            return rc;
+        pthread_mutex_lock(&env->nodes_mutex);
+        size_t rneed = 12; /* magic + ver + count */
+        for (uint32_t i = 0; i < env->node_count; i++) {
+            rneed += 2 + strnlen(env->nodes[i].node_id, 63);
+            rneed += 2 + strnlen(env->nodes[i].hostname, 255);
+            rneed += 2; /* port */
+            rneed += 2 + strnlen(env->nodes[i].region, 63);
+            rneed += 2 + strnlen(env->nodes[i].locality, 63);
         }
+        rbuf = calloc(1, rneed ? rneed : 12);
+        if (!rbuf) {
+            pthread_mutex_unlock(&env->nodes_mutex);
+            return DISLMDB_ERR_MEMORY_ERROR;
+        }
+        dislmdb_write_u32(rbuf + ro, DISLMDB_REPL_MAGIC); ro += 4;
+        dislmdb_write_u32(rbuf + ro, 2); ro += 4;
+        dislmdb_write_u32(rbuf + ro, env->node_count); ro += 4;
+        for (uint32_t i = 0; i < env->node_count; i++) {
+            size_t idl = strnlen(env->nodes[i].node_id, 63);
+            size_t hl = strnlen(env->nodes[i].hostname, 255);
+            size_t rl = strnlen(env->nodes[i].region, 63);
+            size_t ll = strnlen(env->nodes[i].locality, 63);
+            dislmdb_write_u16(rbuf + ro, (uint16_t)idl); ro += 2;
+            memcpy(rbuf + ro, env->nodes[i].node_id, idl); ro += idl;
+            dislmdb_write_u16(rbuf + ro, (uint16_t)hl); ro += 2;
+            memcpy(rbuf + ro, env->nodes[i].hostname, hl); ro += hl;
+            dislmdb_write_u16(rbuf + ro, env->nodes[i].port); ro += 2;
+            dislmdb_write_u16(rbuf + ro, (uint16_t)rl); ro += 2;
+            memcpy(rbuf + ro, env->nodes[i].region, rl); ro += rl;
+            dislmdb_write_u16(rbuf + ro, (uint16_t)ll); ro += 2;
+            memcpy(rbuf + ro, env->nodes[i].locality, ll); ro += ll;
+        }
+        pthread_mutex_unlock(&env->nodes_mutex);
     }
 
-    /* Peer topology map v2: endpoints + region/locality + RTT EWMA. */
+    uint8_t *sbuf = NULL;
+    size_t ssize = 0;
+    {
+        pthread_mutex_lock(&env->shard_mutex);
+        uint32_t sc = env->shard_count;
+        ssize = 4 + (size_t)sc * SHARD_PACK_SIZE;
+        sbuf = calloc(1, ssize ? ssize : 4);
+        if (!sbuf) {
+            pthread_mutex_unlock(&env->shard_mutex);
+            free(rbuf);
+            return DISLMDB_ERR_MEMORY_ERROR;
+        }
+        dislmdb_write_u32(sbuf, sc);
+        for (uint32_t i = 0; i < sc; i++) {
+            size_t o = 4 + (size_t)i * SHARD_PACK_SIZE;
+            memcpy(sbuf + o, env->shards[i].shard_id, DISLMDB_SHARD_ID_LEN);
+            memcpy(sbuf + o + DISLMDB_SHARD_ID_LEN, env->shards[i].key_prefix,
+                   DISLMDB_SHARD_PREFIX_LEN);
+            memcpy(sbuf + o + DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN,
+                   env->shards[i].owner_node_id, 64);
+            dislmdb_write_u32(sbuf + o + SHARD_PACK_SIZE_V1, env->shards[i].flags);
+        }
+        pthread_mutex_unlock(&env->shard_mutex);
+    }
+
+    uint8_t *tbuf = NULL;
+    size_t tsize = 0;
     {
         pthread_mutex_lock(&env->nodes_mutex);
         uint32_t nc = env->node_count;
-        size_t tsize = 8 + (size_t)nc * PEER_TOPO_REC_V2;
-        uint8_t *tbuf = calloc(1, tsize ? tsize : 8);
+        tsize = 8 + (size_t)nc * PEER_TOPO_REC_V2;
+        tbuf = calloc(1, tsize ? tsize : 8);
         if (!tbuf) {
             pthread_mutex_unlock(&env->nodes_mutex);
-            mdb_txn_abort(txn);
+            free(rbuf);
+            free(sbuf);
             return DISLMDB_ERR_MEMORY_ERROR;
         }
         dislmdb_write_u32(tbuf, nc);
@@ -234,16 +143,148 @@ int dislmdb_persist_save(DISLMDB_env *env)
             dislmdb_write_u32(tbuf + o + 450, rtt);
         }
         pthread_mutex_unlock(&env->nodes_mutex);
-        k.mv_size = strlen(META_KEY_PEER_TOPO);
-        k.mv_data = (void *)META_KEY_PEER_TOPO;
-        v.mv_size = tsize;
-        v.mv_data = tbuf;
-        rc = mdb_put(txn, dbi, &k, &v, 0);
+    }
+
+    MDB_txn *txn = NULL;
+    int rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        free(rbuf);
+        free(sbuf);
         free(tbuf);
+        return rc;
+    }
+    MDB_dbi dbi;
+    rc = mdb_dbi_open(txn, DISLMDB_META_DBI, MDB_CREATE, &dbi);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        free(rbuf);
+        free(sbuf);
+        free(tbuf);
+        return rc;
+    }
+
+    uint8_t buf[8];
+    dislmdb_write_u64(buf, env->pbft_state.view);
+    MDB_val k = {.mv_size = strlen(META_KEY_VIEW), .mv_data = (void *)META_KEY_VIEW};
+    MDB_val v = {.mv_size = 8, .mv_data = buf};
+    rc = mdb_put(txn, dbi, &k, &v, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        free(rbuf);
+        free(sbuf);
+        free(tbuf);
+        return rc;
+    }
+
+    dislmdb_write_u64(buf, env->pbft_state.sequence);
+    k.mv_size = strlen(META_KEY_SEQ);
+    k.mv_data = (void *)META_KEY_SEQ;
+    rc = mdb_put(txn, dbi, &k, &v, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        free(rbuf);
+        free(sbuf);
+        free(tbuf);
+        return rc;
+    }
+
+    if (env->has_cluster_key && env->config.consensus.persist_cluster_key) {
+        k.mv_size = strlen(META_KEY_CK);
+        k.mv_data = (void *)META_KEY_CK;
+        v.mv_size = 32;
+        v.mv_data = env->cluster_key;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
         if (rc != 0) {
             mdb_txn_abort(txn);
+            free(rbuf);
+            free(sbuf);
+            free(tbuf);
             return rc;
         }
+    }
+
+    /*
+     * Length-prefixed replica stream (REPL v2): no fixed-N packing limit.
+     * Each record: id_len u16 + id, host_len u16 + host, port u16,
+     * region_len u16 + region, locality_len u16 + locality.
+     */
+    k.mv_size = strlen(META_KEY_REPLICAS);
+    k.mv_data = (void *)META_KEY_REPLICAS;
+    v.mv_size = ro;
+    v.mv_data = rbuf;
+    rc = mdb_put(txn, dbi, &k, &v, 0);
+    free(rbuf);
+    rbuf = NULL;
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        free(sbuf);
+        free(tbuf);
+        return rc;
+    }
+
+    k.mv_size = strlen(META_KEY_SHARDS);
+    k.mv_data = (void *)META_KEY_SHARDS;
+    v.mv_size = ssize;
+    v.mv_data = sbuf;
+    rc = mdb_put(txn, dbi, &k, &v, 0);
+    free(sbuf);
+    sbuf = NULL;
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        free(tbuf);
+        return rc;
+    }
+
+    /* Regional topology metadata (dedicated plane inside meta DBI). */
+    if (env->config.region[0] != '\0') {
+        k.mv_size = strlen(META_KEY_REGION);
+        k.mv_data = (void *)META_KEY_REGION;
+        v.mv_size = strnlen(env->config.region, sizeof(env->config.region));
+        v.mv_data = env->config.region;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            free(tbuf);
+            return rc;
+        }
+    }
+    if (env->config.locality[0] != '\0') {
+        k.mv_size = strlen(META_KEY_LOCALITY);
+        k.mv_data = (void *)META_KEY_LOCALITY;
+        v.mv_size = strnlen(env->config.locality, sizeof(env->config.locality));
+        v.mv_data = env->config.locality;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            free(tbuf);
+            return rc;
+        }
+    }
+    {
+        uint8_t mode = (uint8_t)env->config.topology_mode;
+        k.mv_size = strlen(META_KEY_TOPO_MODE);
+        k.mv_data = (void *)META_KEY_TOPO_MODE;
+        v.mv_size = 1;
+        v.mv_data = &mode;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            free(tbuf);
+            return rc;
+        }
+    }
+
+    /* Peer topology map v2 (snapshotted above). */
+    k.mv_size = strlen(META_KEY_PEER_TOPO);
+    k.mv_data = (void *)META_KEY_PEER_TOPO;
+    v.mv_size = tsize;
+    v.mv_data = tbuf;
+    rc = mdb_put(txn, dbi, &k, &v, 0);
+    free(tbuf);
+    tbuf = NULL;
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return rc;
     }
 
     /* ACL grant table (independent of transport crypto). */

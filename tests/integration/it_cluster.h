@@ -142,6 +142,13 @@ typedef struct it_raft_opts {
     const uint8_t *region_key; /* 32 bytes */
     const uint8_t *cross_region_key; /* 32 bytes */
     uint32_t rtt_budget_ms;
+    /* Optional consensus / net knobs (defaults keep prior IT behavior) */
+    bool set_enable_voting;
+    bool enable_voting;
+    uint32_t max_peers; /* 0 = unlimited / unset */
+    uint32_t handshake_workers; /* 0 = library default */
+    uint32_t raft_wal_sync_every; /* UINT32_MAX = unset; else 0/N */
+    bool set_raft_wal_sync_every;
 } it_raft_opts;
 
 static inline it_raft_opts it_raft_opts_default(void)
@@ -230,6 +237,18 @@ static inline int it_open_raft(DISLMDB_env **out, const it_raft_opts *opts)
     }
     if (opts->rtt_budget_ms) {
         cfg.rtt_budget_ms = opts->rtt_budget_ms;
+    }
+    if (opts->set_enable_voting) {
+        cfg.consensus.enable_voting = opts->enable_voting;
+    }
+    if (opts->max_peers) {
+        cfg.max_peers = opts->max_peers;
+    }
+    if (opts->handshake_workers) {
+        cfg.network.handshake_workers = opts->handshake_workers;
+    }
+    if (opts->set_raft_wal_sync_every) {
+        cfg.consensus.raft_wal_sync_every = opts->raft_wal_sync_every;
     }
     rc = dislmdb_env_open(env, &cfg);
     if (rc != 0) {

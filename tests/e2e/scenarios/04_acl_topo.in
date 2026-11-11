@@ -1,0 +1,28 @@
+# ACL bootstrap + topo getters
+OPEN path=./e2e_work/04_acl_topo port=29704 acl=1 region=us-east locality=az-a topo=mirror
+ACL_PRINCIPAL name=alice
+ACL_GRANT principal=alice perms=all
+SET_KEY hex=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+REGION
+LOCALITY
+TOPO
+VOTING
+ACL_GET principal=alice
+BEGIN
+PUT db=kv key=secret value=ok
+COMMIT
+EXPECT_OK
+ACL_GRANT principal=bob perms=read
+ACL_PRINCIPAL name=bob
+BEGIN
+PUT db=kv key=denied value=x
+EXPECT_ERR 1013
+ABORT
+ACL_PRINCIPAL name=alice
+CHECKPOINT
+CLOSE
+REOPEN
+ACL_GET principal=alice
+REGION
+CLOSE
+ECHO scenario_04_complete
