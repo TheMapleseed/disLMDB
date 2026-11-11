@@ -134,6 +134,14 @@ typedef struct it_raft_opts {
     uint32_t heartbeat_ms;
     uint32_t election_min_ms;
     uint32_t election_max_ms;
+    /* Optional topology / plane keys (NULL / 0 = unset) */
+    const char *region;
+    const char *locality;
+    DISLMDB_TOPOLOGY_MODE topology_mode;
+    bool set_topology_mode;
+    const uint8_t *region_key; /* 32 bytes */
+    const uint8_t *cross_region_key; /* 32 bytes */
+    uint32_t rtt_budget_ms;
 } it_raft_opts;
 
 static inline it_raft_opts it_raft_opts_default(void)
@@ -146,6 +154,7 @@ static inline it_raft_opts it_raft_opts_default(void)
     o.heartbeat_ms = 80;
     o.election_min_ms = 250;
     o.election_max_ms = 500;
+    o.topology_mode = DISLMDB_TOPO_MIRROR;
     return o;
 }
 
@@ -202,6 +211,26 @@ static inline int it_open_raft(DISLMDB_env **out, const it_raft_opts *opts)
         opts->election_max_ms ? opts->election_max_ms : 500;
     cfg.consensus.enable_liveness = true;
     cfg.consensus.persist_state = true;
+    if (opts->region && opts->region[0] != '\0') {
+        strncpy(cfg.region, opts->region, sizeof(cfg.region) - 1);
+    }
+    if (opts->locality && opts->locality[0] != '\0') {
+        strncpy(cfg.locality, opts->locality, sizeof(cfg.locality) - 1);
+    }
+    if (opts->set_topology_mode) {
+        cfg.topology_mode = opts->topology_mode;
+    }
+    if (opts->region_key) {
+        memcpy(cfg.region_key, opts->region_key, 32);
+        cfg.has_region_key = true;
+    }
+    if (opts->cross_region_key) {
+        memcpy(cfg.cross_region_key, opts->cross_region_key, 32);
+        cfg.has_cross_region_key = true;
+    }
+    if (opts->rtt_budget_ms) {
+        cfg.rtt_budget_ms = opts->rtt_budget_ms;
+    }
     rc = dislmdb_env_open(env, &cfg);
     if (rc != 0) {
         dislmdb_env_close(env);
@@ -217,6 +246,15 @@ static inline void it_peer(DISLMDB_node_addr *out, const char *id, uint16_t port
     strncpy(out->node_id, id, sizeof(out->node_id) - 1);
     strncpy(out->hostname, "127.0.0.1", sizeof(out->hostname) - 1);
     out->port = port;
+}
+
+static inline void it_peer_region(DISLMDB_node_addr *out, const char *id,
+                                  uint16_t port, const char *region)
+{
+    it_peer(out, id, port);
+    if (region) {
+        strncpy(out->region, region, sizeof(out->region) - 1);
+    }
 }
 
 static inline void it_mesh_warmup(DISLMDB_env *envs[], int n, int rounds)

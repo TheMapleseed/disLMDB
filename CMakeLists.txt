@@ -90,11 +90,13 @@ set(DISLMDB_SRCS
     src/utils/dislmdb_ops.c
     src/utils/dislmdb_persist.c
     src/utils/dislmdb_shard.c
+    src/utils/dislmdb_topo.c
     src/network/dislmdb_network.c
     src/network/dislmdb_mtls.c
     src/consensus/dislmdb_consensus.c
     src/consensus/pbft_adapter.c
     src/consensus/raft_adapter.c
+    src/consensus/raft_wal.c
     Enhanced-Raft-mechanism/raft.c
     ${ENHANCED_PBFT_SRCS}
 )
@@ -184,6 +186,26 @@ add_test(NAME integration_membership COMMAND test_membership WORKING_DIRECTORY $
 add_executable(test_shard_map tests/integration/test_shard_map.c)
 target_link_libraries(test_shard_map dislmdb)
 add_test(NAME integration_shard_map COMMAND test_shard_map WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_topo_modes tests/integration/test_topo_modes.c)
+target_link_libraries(test_topo_modes dislmdb)
+add_test(NAME integration_topo_modes COMMAND test_topo_modes WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_topo_forward tests/integration/test_topo_forward.c)
+target_link_libraries(test_topo_forward dislmdb)
+add_test(NAME integration_topo_forward COMMAND test_topo_forward WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_topo_plane tests/integration/test_topo_plane.c)
+target_link_libraries(test_topo_plane dislmdb)
+add_test(NAME integration_topo_plane COMMAND test_topo_plane WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_wal tests/integration/test_raft_wal.c)
+target_link_libraries(test_raft_wal dislmdb)
+add_test(NAME integration_raft_wal COMMAND test_raft_wal WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_raft_wal_chaos tests/integration/test_raft_wal_chaos.c)
+target_link_libraries(test_raft_wal_chaos dislmdb)
+add_test(NAME integration_raft_wal_chaos COMMAND test_raft_wal_chaos WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_multinode tests/integration/test_multinode.c)
 target_link_libraries(test_multinode dislmdb)
@@ -278,7 +300,9 @@ add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     DEPENDS dislmdb_test test_crypto test_tvb3 test_raft test_raft_membership
             test_mtls test_transport_adapt
-            test_ops_persist test_op_status test_membership test_shard_map test_multinode test_udp test_mixed
+            test_ops_persist test_op_status test_membership test_shard_map test_topo_modes
+            test_topo_forward test_topo_plane test_raft_wal test_raft_wal_chaos
+            test_multinode test_udp test_mixed
             test_mtls_cluster test_raft_udp test_raft_tcp test_raft_both
             test_raft_mtls test_raft_mtls_tcp test_raft_fault test_raft_stage
             test_raft_membership_it test_raft_leave test_pbft_viewchange

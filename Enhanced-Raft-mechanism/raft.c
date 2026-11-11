@@ -6,6 +6,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
@@ -23,7 +24,9 @@ struct RaftNode {
     char voted_for[RAFT_NODE_ID_LEN];
     char leader_id[RAFT_NODE_ID_LEN];
     RaftLogEntry log[RAFT_MAX_LOG];
-    size_t log_count; /* number of entries; index = position+1 */
+    size_t log_count; /* number of in-memory entries */
+    uint64_t log_base; /* last_included_index from snapshot (0 = none) */
+    uint64_t log_base_term; /* term of last_included entry */
     uint64_t commit_index;
     uint64_t last_applied;
     /* Growable peer tables (cfg.peer_count is authoritative length). */
@@ -44,16 +47,55 @@ struct RaftNode {
     uint32_t new_peer_cap;
     raft_outbound_fn outbound;
     raft_apply_fn apply;
+    raft_fsm_snapshot_fn fsm_snapshot;
+    raft_fsm_restore_fn fsm_restore;
     void *user_data;
+    RaftPersistHooks persist;
+    void *persist_ud;
     pthread_mutex_t lock;
     pthread_cond_t commit_cv;
     pthread_t tick_thread;
     bool running;
     uint64_t election_deadline_ms;
     uint64_t last_heartbeat_ms;
+    uint64_t last_learner_ae_ms; /* dedicated cross-region / learner AE lane */
+    uint32_t learner_ae_ms;      /* resolved cadence (cfg or 4× heartbeat) */
     bool propose_inflight;
     uint64_t propose_index;
 };
+
+/** Who receives this AppendEntries / InstallSnapshot sweep. */
+enum {
+    RAFT_AE_VOTERS = 1,
+    RAFT_AE_LEARNERS = 2,
+    RAFT_AE_ALL = 3
+};
+
+static void persist_hard_state_locked(RaftNode *n)
+{
+    if (!n->persist.on_hard_state) {
+        return;
+    }
+    n->persist.on_hard_state(n->current_term, n->voted_for, n->commit_index,
+                             n->last_applied, n->persist_ud);
+}
+
+static void persist_log_append_locked(RaftNode *n, uint64_t index, uint64_t term,
+                                      const uint8_t *data, size_t len)
+{
+    if (!n->persist.on_log_append) {
+        return;
+    }
+    n->persist.on_log_append(index, term, data, len, n->persist_ud);
+}
+
+static void persist_log_truncate_locked(RaftNode *n, uint64_t from_index)
+{
+    if (!n->persist.on_log_truncate) {
+        return;
+    }
+    n->persist.on_log_truncate(from_index, n->persist_ud);
+}
 
 static int ensure_peer_cap(RaftNode *n, uint32_t need)
 {
@@ -547,6 +589,7 @@ RaftConfig raft_config_default(void)
     c.election_timeout_min_ms = 300;
     c.election_timeout_max_ms = 600;
     c.heartbeat_ms = 100;
+    c.learner_ae_ms = 0; /* resolve to 4× heartbeat at create */
     c.enable_voting = true;
     return c;
 }
@@ -581,15 +624,28 @@ static void reset_election_deadline(RaftNode *n)
 
 static uint64_t last_log_index(const RaftNode *n)
 {
-    return n->log_count;
+    return n->log_base + (uint64_t)n->log_count;
 }
 
 static uint64_t last_log_term(const RaftNode *n)
 {
     if (n->log_count == 0) {
-        return 0;
+        return n->log_base_term;
     }
     return n->log[n->log_count - 1].term;
+}
+
+/** Absolute Raft index → slot in log[], or -1 if not in memory. */
+static int log_slot(const RaftNode *n, uint64_t index)
+{
+    if (index == 0 || index <= n->log_base) {
+        return -1;
+    }
+    uint64_t pos = index - n->log_base - 1;
+    if (pos >= n->log_count) {
+        return -1;
+    }
+    return (int)pos;
 }
 
 static int peer_index(const RaftNode *n, const char *id)
@@ -622,6 +678,7 @@ static void send_msg(RaftNode *n, RaftMessage *msg)
 
 static void become_follower(RaftNode *n, uint64_t term)
 {
+    bool dirty = (term != n->current_term) || (n->voted_for[0] != '\0');
     n->role = RAFT_FOLLOWER;
     n->current_term = term;
     n->voted_for[0] = '\0';
@@ -629,14 +686,17 @@ static void become_follower(RaftNode *n, uint64_t term)
     n->votes = 0;
     n->votes_new = 0;
     reset_election_deadline(n);
+    if (dirty) {
+        persist_hard_state_locked(n);
+    }
 }
 
 static void apply_committed(RaftNode *n)
 {
     while (n->last_applied < n->commit_index) {
         n->last_applied++;
-        size_t li = (size_t)n->last_applied - 1;
-        if (li < n->log_count && n->apply) {
+        int li = log_slot(n, n->last_applied);
+        if (li >= 0 && n->apply) {
             const uint8_t *d = n->log[li].data;
             size_t dl = n->log[li].data_len;
             /* Membership entries reconfigure the voter set on append; skip app apply. */
@@ -649,17 +709,19 @@ static void apply_committed(RaftNode *n)
             pthread_cond_broadcast(&n->commit_cv);
         }
     }
+    persist_hard_state_locked(n);
 }
 
-static void broadcast_append(RaftNode *n, bool heartbeat_only);
+static void broadcast_append(RaftNode *n, bool heartbeat_only, int target);
 
 static void advance_commit(RaftNode *n)
 {
     if (n->role != RAFT_LEADER) {
         return;
     }
-    for (uint64_t N = n->log_count; N > n->commit_index; N--) {
-        if (n->log[N - 1].term != n->current_term) {
+    for (uint64_t N = last_log_index(n); N > n->commit_index; N--) {
+        int si = log_slot(n, N);
+        if (si < 0 || n->log[si].term != n->current_term) {
             continue;
         }
         if (entry_committed_by_quorum(n, N)) {
@@ -671,29 +733,135 @@ static void advance_commit(RaftNode *n)
              * the next heartbeat window leaves a visible lag (and flakes
              * under BOTH/mTLS when heartbeats contend with TCP upgrade).
              */
-            broadcast_append(n, true);
+            broadcast_append(n, true, RAFT_AE_VOTERS);
             break;
         }
     }
 }
 
-static void broadcast_append(RaftNode *n, bool heartbeat_only)
+static void send_install_snapshot(RaftNode *n, uint32_t peer_i)
 {
+    if (n->log_base == 0) {
+        return;
+    }
+    RaftMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = RAFT_MSG_INSTALL_SNAPSHOT;
+    msg.term = n->current_term;
+    strncpy(msg.to, n->peers[peer_i], RAFT_NODE_ID_LEN - 1);
+    /* Reuse RequestVote fields for included index/term (wire-compatible). */
+    msg.last_log_index = n->log_base;
+    msg.last_log_term = n->log_base_term;
+    /*
+     * Attach FSM dump when available so followers with last_applied < log_base
+     * can catch up. Produced unlocked to avoid blocking AE under the node lock.
+     */
+    if (n->fsm_snapshot) {
+        uint64_t included = n->log_base;
+        raft_fsm_snapshot_fn snap = n->fsm_snapshot;
+        void *ud = n->user_data;
+        pthread_mutex_unlock(&n->lock);
+        uint8_t *blob = NULL;
+        size_t blen = 0;
+        int src = snap(included, &blob, &blen, ud);
+        pthread_mutex_lock(&n->lock);
+        if (src == 0 && blob && blen > 0) {
+            msg.snapshot_data = blob;
+            msg.snapshot_len = blen;
+            /* Wire: also as entries[0] for serialize path. */
+            msg.entries = calloc(1, sizeof(RaftLogEntry));
+            if (msg.entries) {
+                msg.entry_count = 1;
+                msg.entries[0].term = n->log_base_term;
+                msg.entries[0].index = n->log_base;
+                msg.entries[0].data = blob;
+                msg.entries[0].data_len = blen;
+                msg.snapshot_data = NULL; /* owned by entries[0] */
+                msg.snapshot_len = 0;
+            } else {
+                free(blob);
+            }
+        } else {
+            free(blob);
+        }
+    }
+    send_msg(n, &msg);
+    raft_message_clear(&msg);
+}
+
+static bool peer_in_ae_target(const RaftNode *n, uint32_t i, int target)
+{
+    bool voting = !n->peer_voting || n->peer_voting[i];
+    if (target == RAFT_AE_ALL) {
+        return true;
+    }
+    if (target == RAFT_AE_VOTERS) {
+        return voting;
+    }
+    if (target == RAFT_AE_LEARNERS) {
+        return !voting;
+    }
+    return true;
+}
+
+/**
+ * @param heartbeat_only Prefer empty AE when caught up (timer path).
+ * @param target RAFT_AE_VOTERS (local quorum lane), RAFT_AE_LEARNERS
+ *        (cross-region / edge lane), or RAFT_AE_ALL.
+ */
+static void broadcast_append(RaftNode *n, bool heartbeat_only, int target)
+{
+    uint64_t last = last_log_index(n);
     for (uint32_t i = 0; i < n->cfg.peer_count; i++) {
+        if (!peer_in_ae_target(n, i, target)) {
+            continue;
+        }
+
+        uint64_t next = n->next_index[i];
+        bool need_entries = (next > 0 && next <= last);
+
+        /* Peer is behind our compacted prefix — InstallSnapshot, not AE. */
+        if (n->log_base > 0 && next <= n->log_base) {
+            send_install_snapshot(n, i);
+            continue;
+        }
+        /*
+         * Learner lane: only ship when behind (no empty keepalives).
+         * Voter heartbeat path may still send empty AE when caught up.
+         */
+        if (target == RAFT_AE_LEARNERS && !need_entries) {
+            continue;
+        }
+        (void)heartbeat_only;
+
         RaftMessage msg;
         memset(&msg, 0, sizeof(msg));
         msg.type = RAFT_MSG_APPEND_ENTRIES;
         msg.term = n->current_term;
         strncpy(msg.to, n->peers[i], RAFT_NODE_ID_LEN - 1);
-        uint64_t next = n->next_index[i];
         msg.prev_log_index = next > 0 ? next - 1 : 0;
         msg.prev_log_term = 0;
-        if (msg.prev_log_index > 0 && msg.prev_log_index <= n->log_count) {
-            msg.prev_log_term = n->log[msg.prev_log_index - 1].term;
+        if (msg.prev_log_index > 0) {
+            if (msg.prev_log_index == n->log_base) {
+                msg.prev_log_term = n->log_base_term;
+            } else {
+                int psi = log_slot(n, msg.prev_log_index);
+                if (psi >= 0) {
+                    msg.prev_log_term = n->log[psi].term;
+                } else if (msg.prev_log_index < n->log_base) {
+                    send_install_snapshot(n, i);
+                    continue;
+                }
+            }
         }
         msg.leader_commit = n->commit_index;
-        if (!heartbeat_only && next <= n->log_count) {
-            size_t count = n->log_count - (size_t)(next - 1);
+        if (need_entries) {
+            int nsi = log_slot(n, next);
+            if (nsi < 0) {
+                send_install_snapshot(n, i);
+                continue;
+            }
+            size_t count = n->log_count - (size_t)nsi;
             if (count > 16) {
                 count = 16;
             }
@@ -701,7 +869,7 @@ static void broadcast_append(RaftNode *n, bool heartbeat_only)
             if (msg.entries) {
                 msg.entry_count = count;
                 for (size_t e = 0; e < count; e++) {
-                    size_t li = (size_t)(next - 1) + e;
+                    size_t li = (size_t)nsi + e;
                     msg.entries[e].term = n->log[li].term;
                     msg.entries[e].index = n->log[li].index;
                     msg.entries[e].data_len = n->log[li].data_len;
@@ -717,7 +885,13 @@ static void broadcast_append(RaftNode *n, bool heartbeat_only)
         send_msg(n, &msg);
         raft_message_clear(&msg);
     }
-    n->last_heartbeat_ms = now_ms();
+    uint64_t now = now_ms();
+    if (target & RAFT_AE_VOTERS) {
+        n->last_heartbeat_ms = now;
+    }
+    if (target & RAFT_AE_LEARNERS) {
+        n->last_learner_ae_ms = now;
+    }
 }
 
 static void start_election(RaftNode *n)
@@ -735,6 +909,7 @@ static void start_election(RaftNode *n)
     n->votes_new = n->in_joint ? 1 : 0;
     n->leader_id[0] = '\0';
     reset_election_deadline(n);
+    persist_hard_state_locked(n);
 
     if (election_won(n)) {
         /* Solo / already-quorum wins immediately */
@@ -744,7 +919,7 @@ static void start_election(RaftNode *n)
             n->next_index[i] = last_log_index(n) + 1;
             n->match_index[i] = 0;
         }
-        broadcast_append(n, true);
+        broadcast_append(n, true, RAFT_AE_ALL);
         return;
     }
 
@@ -767,8 +942,14 @@ static void *tick_thread(void *arg)
         pthread_mutex_lock(&n->lock);
         uint64_t now = now_ms();
         if (n->role == RAFT_LEADER) {
+            /* Local voter lane — keep quorum HB tight. */
             if (now - n->last_heartbeat_ms >= n->cfg.heartbeat_ms) {
-                broadcast_append(n, true);
+                broadcast_append(n, true, RAFT_AE_VOTERS);
+            }
+            /* Cross-region / learner lane — paced separately. */
+            if (n->learner_ae_ms > 0 &&
+                now - n->last_learner_ae_ms >= n->learner_ae_ms) {
+                broadcast_append(n, false, RAFT_AE_LEARNERS);
             }
         } else if (n->cfg.enable_voting && now >= n->election_deadline_ms) {
             start_election(n);
@@ -797,6 +978,13 @@ RaftNode *raft_create(const RaftConfig *cfg,
     }
     n->cfg = *cfg;
     n->cfg.peer_count = 0;
+    /* Dedicated learner AE lane: default 4× voter heartbeat. */
+    if (n->cfg.learner_ae_ms == 0) {
+        uint32_t hb = n->cfg.heartbeat_ms ? n->cfg.heartbeat_ms : 100u;
+        n->learner_ae_ms = hb * 4u;
+    } else {
+        n->learner_ae_ms = n->cfg.learner_ae_ms;
+    }
     uint32_t need = cfg->peer_count > 0 ? cfg->peer_count : RAFT_PEER_INITIAL_CAP;
     if (ensure_peer_cap(n, need) != 0) {
         free(n);
@@ -959,10 +1147,12 @@ static RaftError append_and_wait_locked(RaftNode *node,
     }
     size_t idx = node->log_count;
     node->log[idx].term = node->current_term;
-    node->log[idx].index = idx + 1;
+    node->log[idx].index = node->log_base + (uint64_t)idx + 1;
     node->log[idx].data_len = len;
     node->log[idx].data = owned_data;
     node->log_count++;
+    persist_log_append_locked(node, node->log[idx].index, node->log[idx].term,
+                              owned_data, len);
     if (is_membership_entry(owned_data, len)) {
         activate_membership_locked(node, owned_data, len);
     }
@@ -980,7 +1170,12 @@ static RaftError append_and_wait_locked(RaftNode *node,
         return RAFT_OK;
     }
 
-    broadcast_append(node, false);
+    /* Quorum path first — learners are not on the critical commit path. */
+    broadcast_append(node, false, RAFT_AE_VOTERS);
+    /* Self-only voter majority (all peers learners) must commit without AE acks. */
+    advance_commit(node);
+    /* Opportunistic mirror push (dedicated lane; does not pace voter HB). */
+    broadcast_append(node, false, RAFT_AE_LEARNERS);
 
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
@@ -1186,6 +1381,7 @@ static void handle_request_vote(RaftNode *n, const RaftMessage *msg)
         strncpy(n->voted_for, msg->from, RAFT_NODE_ID_LEN - 1);
         reply.vote_granted = true;
         reset_election_deadline(n);
+        persist_hard_state_locked(n);
     } else {
         reply.vote_granted = false;
     }
@@ -1222,7 +1418,7 @@ static void handle_request_vote_reply(RaftNode *n, const RaftMessage *msg)
                 n->next_index[i] = last_log_index(n) + 1;
                 n->match_index[i] = 0;
             }
-            broadcast_append(n, true);
+            broadcast_append(n, true, RAFT_AE_ALL);
         }
     }
 }
@@ -1248,25 +1444,44 @@ static void handle_append_entries(RaftNode *n, const RaftMessage *msg)
     reset_election_deadline(n);
 
     if (msg->prev_log_index > 0) {
-        if (msg->prev_log_index > n->log_count ||
-            n->log[msg->prev_log_index - 1].term != msg->prev_log_term) {
+        if (msg->prev_log_index > last_log_index(n)) {
             reply.success = false;
             send_msg(n, &reply);
             return;
+        }
+        if (msg->prev_log_index == n->log_base) {
+            if (n->log_base > 0 && msg->prev_log_term != n->log_base_term &&
+                n->log_base_term != 0) {
+                reply.success = false;
+                send_msg(n, &reply);
+                return;
+            }
+        } else {
+            int psi = log_slot(n, msg->prev_log_index);
+            if (psi < 0 || n->log[psi].term != msg->prev_log_term) {
+                reply.success = false;
+                send_msg(n, &reply);
+                return;
+            }
         }
     }
 
     /* Append / conflict resolution */
     for (size_t i = 0; i < msg->entry_count; i++) {
         uint64_t index = msg->prev_log_index + 1 + i;
-        if (index <= n->log_count) {
-            if (n->log[index - 1].term != msg->entries[i].term) {
-                for (size_t j = (size_t)index - 1; j < n->log_count; j++) {
+        if (index <= n->log_base) {
+            continue; /* already compacted */
+        }
+        if (index <= last_log_index(n)) {
+            int esi = log_slot(n, index);
+            if (esi >= 0 && n->log[esi].term != msg->entries[i].term) {
+                persist_log_truncate_locked(n, index);
+                for (size_t j = (size_t)esi; j < n->log_count; j++) {
                     free(n->log[j].data);
                     memset(&n->log[j], 0, sizeof(n->log[j]));
                 }
-                n->log_count = (size_t)index - 1;
-            } else {
+                n->log_count = (size_t)esi;
+            } else if (esi >= 0) {
                 continue;
             }
         }
@@ -1285,6 +1500,8 @@ static void handle_append_entries(RaftNode *n, const RaftMessage *msg)
             }
         }
         n->log_count++;
+        persist_log_append_locked(n, n->log[li].index, n->log[li].term,
+                                  n->log[li].data, n->log[li].data_len);
         /* Membership takes effect as soon as it is appended (Raft §4.1). */
         if (is_membership_entry(n->log[li].data, n->log[li].data_len)) {
             activate_membership_locked(n, n->log[li].data, n->log[li].data_len);
@@ -1314,13 +1531,153 @@ static void handle_append_entries_reply(RaftNode *n, const RaftMessage *msg)
     if (pi < 0) {
         return;
     }
+    int lane = (n->peer_voting && !n->peer_voting[pi]) ? RAFT_AE_LEARNERS
+                                                       : RAFT_AE_VOTERS;
     if (msg->success) {
         n->match_index[pi] = msg->match_index;
         n->next_index[pi] = msg->match_index + 1;
         advance_commit(n);
+        /* Still lagging — push the next batch without waiting for HB timer. */
+        if (n->next_index[pi] > 0 && n->next_index[pi] <= last_log_index(n)) {
+            broadcast_append(n, false, lane);
+        }
     } else if (n->next_index[pi] > 1) {
         n->next_index[pi]--;
-        broadcast_append(n, false);
+        if (n->log_base > 0 && n->next_index[pi] <= n->log_base) {
+            send_install_snapshot(n, (uint32_t)pi);
+        } else {
+            broadcast_append(n, false, lane);
+        }
+    }
+}
+
+/**
+ * InstallSnapshot (metadata): align follower log_base with leader compaction.
+ * FSM bytes are already in LMDB when last_applied >= included; otherwise the
+ * follower rejects (needs full state transfer — not yet shipped).
+ */
+static void handle_install_snapshot(RaftNode *n, const RaftMessage *msg)
+{
+    RaftMessage reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.type = RAFT_MSG_INSTALL_SNAPSHOT_REPLY;
+    reply.term = n->current_term;
+    strncpy(reply.to, msg->from, RAFT_NODE_ID_LEN - 1);
+
+    if (msg->term < n->current_term) {
+        reply.success = false;
+        send_msg(n, &reply);
+        return;
+    }
+    if (msg->term > n->current_term) {
+        become_follower(n, msg->term);
+        reply.term = n->current_term;
+    }
+    reset_election_deadline(n);
+    strncpy(n->leader_id, msg->from, RAFT_NODE_ID_LEN - 1);
+
+    uint64_t included = msg->last_log_index;
+    uint64_t included_term = msg->last_log_term;
+    if (included == 0) {
+        reply.success = false;
+        send_msg(n, &reply);
+        return;
+    }
+    /* Behind the snapshot: need FSM dump (entries[0] or snapshot_data). */
+    if (n->last_applied < included) {
+        const uint8_t *fsm = msg->snapshot_data;
+        size_t fsm_len = msg->snapshot_len;
+        if ((!fsm || fsm_len == 0) && msg->entry_count > 0 && msg->entries &&
+            msg->entries[0].data && msg->entries[0].data_len > 0) {
+            fsm = msg->entries[0].data;
+            fsm_len = msg->entries[0].data_len;
+        }
+        if (!fsm || fsm_len == 0 || !n->fsm_restore) {
+            reply.success = false;
+            send_msg(n, &reply);
+            return;
+        }
+        raft_fsm_restore_fn restore = n->fsm_restore;
+        void *ud = n->user_data;
+        pthread_mutex_unlock(&n->lock);
+        int rrc = restore(included, included_term, fsm, fsm_len, ud);
+        pthread_mutex_lock(&n->lock);
+        if (rrc != 0) {
+            reply.success = false;
+            send_msg(n, &reply);
+            return;
+        }
+        n->last_applied = included;
+        if (n->commit_index < included) {
+            n->commit_index = included;
+        }
+    }
+
+    /* Drop any conflicting suffix past included; set snapshot boundary. */
+    if (last_log_index(n) > included) {
+        persist_log_truncate_locked(n, included + 1);
+        int slot = log_slot(n, included + 1);
+        if (slot >= 0) {
+            for (size_t j = (size_t)slot; j < n->log_count; j++) {
+                free(n->log[j].data);
+                memset(&n->log[j], 0, sizeof(n->log[j]));
+            }
+            n->log_count = (size_t)slot;
+        }
+    }
+    /* Compact local prefix through included. */
+    if (included > n->log_base) {
+        int drop_end = log_slot(n, included);
+        if (drop_end >= 0) {
+            n->log_base_term = included_term ? included_term : n->log[drop_end].term;
+            size_t drop = (size_t)drop_end + 1;
+            for (size_t i = 0; i < drop; i++) {
+                free(n->log[i].data);
+                memset(&n->log[i], 0, sizeof(n->log[i]));
+            }
+            size_t remain = n->log_count - drop;
+            if (remain > 0) {
+                memmove(n->log, n->log + drop, remain * sizeof(RaftLogEntry));
+                memset(n->log + remain, 0, drop * sizeof(RaftLogEntry));
+            }
+            n->log_count = remain;
+        } else {
+            n->log_base_term = included_term;
+        }
+        n->log_base = included;
+    } else if (included_term != 0) {
+        n->log_base_term = included_term;
+    }
+    if (n->commit_index < included) {
+        n->commit_index = included;
+    }
+    persist_hard_state_locked(n);
+
+    reply.success = true;
+    reply.match_index = included;
+    send_msg(n, &reply);
+}
+
+static void handle_install_snapshot_reply(RaftNode *n, const RaftMessage *msg)
+{
+    if (msg->term > n->current_term) {
+        become_follower(n, msg->term);
+        return;
+    }
+    if (n->role != RAFT_LEADER || msg->term != n->current_term) {
+        return;
+    }
+    int pi = peer_index(n, msg->from);
+    if (pi < 0) {
+        return;
+    }
+    if (msg->success) {
+        n->match_index[pi] = msg->match_index;
+        n->next_index[pi] = msg->match_index + 1;
+        advance_commit(n);
+        int lane = (n->peer_voting && !n->peer_voting[pi]) ? RAFT_AE_LEARNERS
+                                                           : RAFT_AE_VOTERS;
+        broadcast_append(n, false, lane);
     }
 }
 
@@ -1342,6 +1699,12 @@ RaftError raft_handle_message(RaftNode *node, const RaftMessage *msg)
             break;
         case RAFT_MSG_APPEND_ENTRIES_REPLY:
             handle_append_entries_reply(node, msg);
+            break;
+        case RAFT_MSG_INSTALL_SNAPSHOT:
+            handle_install_snapshot(node, msg);
+            break;
+        case RAFT_MSG_INSTALL_SNAPSHOT_REPLY:
+            handle_install_snapshot_reply(node, msg);
             break;
         default:
             break;
@@ -1368,6 +1731,42 @@ uint64_t raft_commit_index(const RaftNode *node)
 uint64_t raft_last_applied(const RaftNode *node)
 {
     return node ? node->last_applied : 0;
+}
+
+uint64_t raft_log_base(const RaftNode *node)
+{
+    return node ? node->log_base : 0;
+}
+
+uint64_t raft_log_base_term(const RaftNode *node)
+{
+    return node ? node->log_base_term : 0;
+}
+
+uint64_t raft_safe_compact_index(const RaftNode *node)
+{
+    if (!node) {
+        return 0;
+    }
+    uint64_t lim = node->last_applied;
+    if (node->cfg.peer_count == 0) {
+        return lim;
+    }
+    bool any = false;
+    uint64_t min_match = UINT64_MAX;
+    for (uint32_t i = 0; i < node->cfg.peer_count; i++) {
+        if (node->match_index[i] == 0) {
+            continue; /* never matched — do not block forever on brand-new peers */
+        }
+        any = true;
+        if (node->match_index[i] < min_match) {
+            min_match = node->match_index[i];
+        }
+    }
+    if (any && min_match < lim) {
+        lim = min_match;
+    }
+    return lim;
 }
 
 bool raft_is_leader(const RaftNode *node)
@@ -1424,6 +1823,9 @@ void raft_message_clear(RaftMessage *msg)
     }
     msg->entries = NULL;
     msg->entry_count = 0;
+    free(msg->snapshot_data);
+    msg->snapshot_data = NULL;
+    msg->snapshot_len = 0;
 }
 
 static void write_u64(uint8_t *p, uint64_t v)
@@ -1552,4 +1954,160 @@ int raft_message_deserialize(const uint8_t *buf, size_t len, RaftMessage *out)
         }
     }
     return 0;
+}
+
+void raft_set_persist_hooks(RaftNode *node, const RaftPersistHooks *hooks, void *ud)
+{
+    if (!node) {
+        return;
+    }
+    pthread_mutex_lock(&node->lock);
+    if (hooks) {
+        node->persist = *hooks;
+    } else {
+        memset(&node->persist, 0, sizeof(node->persist));
+    }
+    node->persist_ud = ud;
+    pthread_mutex_unlock(&node->lock);
+}
+
+void raft_set_fsm_hooks(RaftNode *node, raft_fsm_snapshot_fn snapshot,
+                        raft_fsm_restore_fn restore, void *ud)
+{
+    (void)ud; /* FSM hooks share node->user_data with apply/outbound */
+    if (!node) {
+        return;
+    }
+    pthread_mutex_lock(&node->lock);
+    node->fsm_snapshot = snapshot;
+    node->fsm_restore = restore;
+    pthread_mutex_unlock(&node->lock);
+}
+
+RaftError raft_restore_hard_state(RaftNode *node, uint64_t term, const char *voted_for,
+                                  uint64_t commit_index, uint64_t last_applied)
+{
+    if (!node || node->running) {
+        return RAFT_ERR_INVALID;
+    }
+    pthread_mutex_lock(&node->lock);
+    node->current_term = term;
+    memset(node->voted_for, 0, sizeof(node->voted_for));
+    if (voted_for && voted_for[0] != '\0') {
+        strncpy(node->voted_for, voted_for, RAFT_NODE_ID_LEN - 1);
+    }
+    node->commit_index = commit_index;
+    node->last_applied = last_applied;
+    if (node->last_applied > node->commit_index) {
+        node->last_applied = node->commit_index;
+    }
+    pthread_mutex_unlock(&node->lock);
+    return RAFT_OK;
+}
+
+RaftError raft_restore_log_entry(RaftNode *node, uint64_t index, uint64_t term,
+                                 const uint8_t *data, size_t len)
+{
+    if (!node || node->running || index == 0) {
+        return RAFT_ERR_INVALID;
+    }
+    pthread_mutex_lock(&node->lock);
+    /* Contiguous restore after log_base */
+    if (index != node->log_base + (uint64_t)node->log_count + 1) {
+        pthread_mutex_unlock(&node->lock);
+        return RAFT_ERR_INVALID;
+    }
+    if (node->log_count >= RAFT_MAX_LOG) {
+        pthread_mutex_unlock(&node->lock);
+        return RAFT_ERR_FULL;
+    }
+    size_t li = node->log_count;
+    node->log[li].term = term;
+    node->log[li].index = index;
+    node->log[li].data_len = len;
+    node->log[li].data = NULL;
+    if (len > 0 && data) {
+        node->log[li].data = malloc(len);
+        if (!node->log[li].data) {
+            pthread_mutex_unlock(&node->lock);
+            return RAFT_ERR_MEMORY;
+        }
+        memcpy(node->log[li].data, data, len);
+    }
+    node->log_count++;
+    if (is_membership_entry(node->log[li].data, node->log[li].data_len)) {
+        activate_membership_locked(node, node->log[li].data, node->log[li].data_len);
+    }
+    pthread_mutex_unlock(&node->lock);
+    return RAFT_OK;
+}
+
+RaftError raft_compact_log_through(RaftNode *node, uint64_t last_included_index)
+{
+    if (!node) {
+        return RAFT_ERR_INVALID;
+    }
+    pthread_mutex_lock(&node->lock);
+    if (last_included_index == 0 || last_included_index <= node->log_base) {
+        pthread_mutex_unlock(&node->lock);
+        return RAFT_OK;
+    }
+    if (last_included_index > last_log_index(node)) {
+        pthread_mutex_unlock(&node->lock);
+        return RAFT_ERR_INVALID;
+    }
+    int drop_end = log_slot(node, last_included_index);
+    if (drop_end < 0) {
+        pthread_mutex_unlock(&node->lock);
+        return RAFT_ERR_INVALID;
+    }
+    node->log_base_term = node->log[drop_end].term;
+    size_t drop = (size_t)drop_end + 1;
+    for (size_t i = 0; i < drop; i++) {
+        free(node->log[i].data);
+        memset(&node->log[i], 0, sizeof(node->log[i]));
+    }
+    size_t remain = node->log_count - drop;
+    if (remain > 0) {
+        memmove(node->log, node->log + drop, remain * sizeof(RaftLogEntry));
+        memset(node->log + remain, 0, drop * sizeof(RaftLogEntry));
+    }
+    node->log_count = remain;
+    node->log_base = last_included_index;
+    for (uint32_t pi = 0; pi < node->cfg.peer_count; pi++) {
+        if (node->next_index[pi] <= last_included_index) {
+            node->next_index[pi] = last_included_index + 1;
+        }
+        if (node->match_index[pi] < last_included_index) {
+            /* match may lag; leave as-is unless ahead of base absurdly */
+        }
+    }
+    if (node->last_applied < last_included_index) {
+        node->last_applied = last_included_index;
+    }
+    if (node->commit_index < last_included_index) {
+        node->commit_index = last_included_index;
+    }
+    pthread_mutex_unlock(&node->lock);
+    return RAFT_OK;
+}
+
+/** Set log_base before restoring post-snapshot entries (pre-start only). */
+RaftError raft_restore_snapshot_meta(RaftNode *node, uint64_t last_included_index,
+                                     uint64_t last_included_term)
+{
+    if (!node || node->running) {
+        return RAFT_ERR_INVALID;
+    }
+    pthread_mutex_lock(&node->lock);
+    node->log_base = last_included_index;
+    node->log_base_term = last_included_term;
+    if (node->last_applied < last_included_index) {
+        node->last_applied = last_included_index;
+    }
+    if (node->commit_index < last_included_index) {
+        node->commit_index = last_included_index;
+    }
+    pthread_mutex_unlock(&node->lock);
+    return RAFT_OK;
 }

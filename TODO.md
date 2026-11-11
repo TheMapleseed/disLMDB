@@ -51,7 +51,7 @@ Goal: membership/network grow with topology; only latency/RTT budgets constrain 
 
 - [x] Replace fixed arrays (`connections`, Raft peer/index tables) with growable heap
 - [x] Cap policy becomes **soft**: `max_peers` / `DISLMDB_MAX_PEERS` (0 = unlimited)
-- [ ] Persist replica set without fixed N packing limits (length-prefixed stream)
+- [x] Persist replica set without fixed N packing limits (REPL v2 length-prefixed stream)
 - [x] Unit: `test_raft_peer_growth` past 64; IT: `test_topo_env`
 - [ ] Rig soak spawn to N≫64 / hash map peer id → slot
 
@@ -68,10 +68,10 @@ Goal: thousands of nodes via **regions**, not one global voter set.
      local nodes      local nodes      local nodes    gossip / leaf
 ```
 
-- [ ] **Local Raft group per region** (voters = regional peers only)
-- [ ] **Cross-region**: async mirror *or* sharded ownership (config mode)
-- [ ] Prefer nearest peer: RTT probe + region affinity for dial/HELLO
-- [ ] Heartbeats / AE only inside the local voter set; cross-region on a separate lane
+- [x] **Local Raft group per region** (voters = same-region peers; cross → learner or absent)
+- [x] **Cross-region**: mirror/hybrid → learners; shard → not in Raft (ownership local)
+- [x] Prefer nearest peer: RTT probe + region affinity for dial/HELLO
+- [x] Heartbeats / AE only inside the local voter set; dedicated cross-region learner AE lane (`learner_ae_ms`, default 4× HB)
 
 ### Phase C — Regional / localization secrets via env
 
@@ -99,45 +99,52 @@ Membership and crypto scoped by deployment env (never commit secrets).
 - [x] `consensus.enable_voting` + Raft learner quorum + `DISLMDB_VOTING` env overlay
 - [x] Load region/locality/secrets/topo mode/RTT/max_peers from env at `env_open`
 - [x] Persist region/locality/topo_mode in meta DBI + public getters
-- [ ] Derive traffic keys per plane (local vs cross) — fail closed on mismatch
-  (extends `test_auth_reject`)
-- [x] Nearest-peer selection (v1): `node_addr.region/locality` + dial backoff prefers
-      same region/locality (RTT probe still TODO)
-- [ ] RTT EWMA probe tied to `DISLMDB_RTT_BUDGET_MS` admit/reject
-- [ ] Auto-register cross-region peers as learners when `DISLMDB_VOTING=off` on the edge
-- [ ] Document secret rotation without full cluster outage
+- [x] Derive traffic keys per plane (local vs cross) — fail closed on mismatch
+- [x] Nearest-peer selection (v1): region/locality dial backoff + HELLO topo trailer
+- [x] RTT EWMA on TX/RX + soft reject when `rtt_budget_ms` exceeded
+- [x] Cross-region / non-voting HELLO peers → Raft learners on voting hubs
+- [x] Document secret rotation without full cluster outage (README)
+- [x] Dedicated IT: `test_topo_plane` (cross-region key plane + RTT reject)
 
 ### Phase D — Topology modes: mirror vs shard
 
-- [ ] **`mirror`**: every region holds full KV; cross-region async replicate
-      (eventual; conflict policy explicit — last-write / region priority)
-- [ ] **`shard`**: key → region/owner via shard map (existing `dislmdb_shard_map_*`);
-      redirects / proxy reads to owner region
-- [ ] **`hybrid`**: hot prefixes mirrored; cold prefixes sharded
+- [x] **`mirror`**: full KV; put/del unrestricted; cross-region Raft learners (AE)
+- [x] **`shard`**: write gate via `dislmdb_topo_key_writable` / shard owner;
+      cross-region peers excluded from Raft
+- [x] **`hybrid`**: `DISLMDB_SHARD_FLAG_MIRRORED` prefixes free; others owner-gated
+- [x] IT: `test_topo_modes` (mirror/shard/hybrid + flag persist)
+- [x] Owner resolve API (`dislmdb_topo_resolve_owner`) for app-level redirect
+- [x] Forward writes to owner: `dislmdb_topo_forward_put` / `_del` + FORWARD RPC (IT: `test_topo_forward`)
+- [ ] Proxy/redirect reads; auto-forward inside `dislmdb_put` when rejected (explicit API shipped)
 - [ ] Orb scenarios for mirror vs shard across “fake regions” (containers + env)
+- [ ] Explicit conflict policy for mirror (last-write / region priority)
 
 ### Phase E — Dedicated DB namespace for regional metadata
 
 Store topology in LMDB (not only env), so peers learn maps after join:
 
-- [ ] Meta / dedicated DBI e.g. `dislmdb_topo`:
-      region id, locality, endpoints, RTT EWMA, mode, generation
-- [ ] Replicate topo updates via consensus (SMAP-like `TOPO` opcode) or regional
-      gossip with signed envelopes
-- [ ] Optional: reserve key-prefix `~topo/` or named DBI so apps never collide
-- [ ] On boot: env secrets seed → merge with persisted topo → dial nearest
+- [x] Meta plane `peer_topo`: id + region/locality/host/port per peer (+ local region fields)
+- [x] Replicate topo updates via consensus (`dislmdb_topo_map_publish` / TOPO blob)
+- [x] Stored under meta DBI key `peer_topo` (apps use named DBI / avoid collision)
+- [x] On boot: restore peer_topo + REPL stream into node table
+- [ ] Persist RTT EWMA samples in peer_topo (optional next)
 
 ### Phase F — Durability for large / crashy clusters
 
-- [ ] **Raft WAL + snapshots** to LMDB or sidecar log (term, vote, log entries)
-- [ ] Configurable sync: sync-every-N / group-commit / NOSYNC+cooldown timer
-- [ ] Catch-up from snapshot + WAL after regional rejoin
-- [ ] Chaos IT: kill leader mid-commit; verify no silent divergence after WAL
+- [x] **Raft WAL + snapshots** in LMDB DBI `__dislmdb_raft__` (hard state, per-index entries, snap meta)
+- [x] Load WAL before `raft_start`; checkpoint → snapshot + compact (`log_base`)
+- [x] IT: `test_raft_wal` (reopen restores term/commit; post-reopen propose)
+- [x] Configurable sync: `raft_wal_sync_every` (1 = every append; 0 = checkpoint/close only; hard-state always syncs)
+- [x] InstallSnapshot RPC (metadata): align `log_base` when follower `last_applied >= included`; reject if FSM dump still needed
+- [x] Chaos IT: `test_raft_wal_chaos` (checkpoint → kill leader → reelect → revive → catch-up)
+- [x] Full FSM blob on InstallSnapshot: `kv` DBI dump/restore hooks (`raft_set_fsm_hooks`)
+- [ ] Expand FSM snapshot beyond `kv` (multi-DBI / unnamed)
 
 ### Phase G — Concurrency (supports Phases A–B)
 
-- [ ] Net thread = bytes only; handshake + consensus on worker pool
-- [ ] Parallel per-peer send (pipelined AE)
+- [x] Raft inbound queue: ELECTION + SYNC_REQUEST handled off the net thread
+- [x] mTLS handshake worker pool (`handshake_workers`, default 2; inline fallback)
+- [ ] Parallel per-peer send without starving net-thread RX
 - [ ] io_uring / kqueue path where available
 - [ ] Full QUIC / WebTransport (TLS 1.3 over UDP) atop DQGM
 
@@ -166,3 +173,9 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 - Test expansion: matrix, connect_churn, auth_reject, chaos spawn/kill, check-stress  
 - Env topo + soft uncap; growable net connections + Raft peer heap; `test_topo_env` /
   `test_raft_peer_growth`
+- Raft WAL + safe compact + InstallSnapshot (meta) + `test_raft_wal_chaos`
+- Heartbeat catch-up fix; voter vs learner AE lanes (`learner_ae_ms`)
+- Shard owner forward RPC (`dislmdb_topo_forward_put`/`_del`, `test_topo_forward`)
+- InstallSnapshot FSM dump/restore for `kv` (`raft_set_fsm_hooks`)
+- Phase G: Raft inbound queue (ELECTION/SYNC off net thread)
+- Phase G: mTLS handshake worker pool (`network.handshake_workers`)

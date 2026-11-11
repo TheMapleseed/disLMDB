@@ -46,11 +46,13 @@ DISLMDB_SRCS := \
   src/utils/dislmdb_ops.c \
   src/utils/dislmdb_persist.c \
   src/utils/dislmdb_shard.c \
+  src/utils/dislmdb_topo.c \
   src/network/dislmdb_network.c \
   src/network/dislmdb_mtls.c \
   src/consensus/dislmdb_consensus.c \
   src/consensus/pbft_adapter.c \
   src/consensus/raft_adapter.c \
+  src/consensus/raft_wal.c \
   Enhanced-PBFT-mechanism/epdft.c \
   Enhanced-PBFT-mechanism/messaging.c \
   Enhanced-PBFT-mechanism/security_manager.c \
@@ -101,6 +103,11 @@ INTEGRATION_TESTS := \
   $(BINDIR)/test_connect_churn \
   $(BINDIR)/test_auth_reject \
   $(BINDIR)/test_topo_env \
+  $(BINDIR)/test_topo_modes \
+  $(BINDIR)/test_topo_forward \
+  $(BINDIR)/test_topo_plane \
+  $(BINDIR)/test_raft_wal \
+  $(BINDIR)/test_raft_wal_chaos \
   $(BINDIR)/test_raft_fault \
   $(BINDIR)/test_raft_stage \
   $(BINDIR)/test_raft_membership_it \
@@ -275,6 +282,26 @@ $(BINDIR)/test_topo_env: tests/integration/test_topo_env.c $(LIBDIR)/libdislmdb.
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
 
+$(BINDIR)/test_topo_modes: tests/integration/test_topo_modes.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_topo_forward: tests/integration/test_topo_forward.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_topo_plane: tests/integration/test_topo_plane.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_wal: tests/integration/test_raft_wal.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_raft_wal_chaos: tests/integration/test_raft_wal_chaos.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
 $(BINDIR)/test_raft_fault: tests/integration/test_raft_fault.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
@@ -353,6 +380,11 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@cd $(BUILD) && ./bin/test_connect_churn
 	@cd $(BUILD) && ./bin/test_auth_reject
 	@cd $(BUILD) && ./bin/test_topo_env
+	@cd $(BUILD) && ./bin/test_topo_modes
+	@cd $(BUILD) && ./bin/test_topo_forward
+	@cd $(BUILD) && ./bin/test_topo_plane
+	@cd $(BUILD) && ./bin/test_raft_wal
+	@cd $(BUILD) && ./bin/test_raft_wal_chaos
 	@cd $(BUILD) && ./bin/test_raft_fault
 	@cd $(BUILD) && ./bin/test_raft_stage
 	@cd $(BUILD) && ./bin/test_raft_membership_it

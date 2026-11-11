@@ -12,9 +12,10 @@ Proprietary software — The Mapleseed Inc. Commercial license required.
 | **Voting** | First-class; `DISLMDB_VOTING=off` / `enable_voting=false` → learner (no campaign / no vote grant) |
 | **Transports** | TCP, UDP (DQGM v3: pkt_num, cumulative ACK, CID rebind, peer-restart), **BOTH** (UDP signalling + TCP data) |
 | **Crypto** | Cluster key HMAC + AEAD payload encryption; portable mTLS 1.3 via vendored Mbed TLS |
-| **Topology** | Env: `DISLMDB_REGION` / `LOCALITY` / `TOPOLOGY_MODE` / secrets / `MAX_PEERS`; persisted region fields; same-region dial preference |
-| **Scale** | Heap-growable peer + connection tables; soft `max_peers` (0 = unlimited). Full mesh still latency-bound |
-| **Shard map** | `dislmdb_shard_map_*` + SMAP consensus blob; longest-prefix owner lookup |
+| **Topology** | Env: `DISLMDB_REGION` / `LOCALITY` / `TOPOLOGY_MODE` / secrets / `MAX_PEERS`; persisted region + peer_topo; same-region dial preference |
+| **Topo modes** | `mirror` (full replicate / learners), `shard` (owner write-gate; cross-region out of Raft), `hybrid` (`DISLMDB_SHARD_FLAG_MIRRORED`) |
+| **Scale** | Heap-growable peer + connection tables; soft `max_peers` (0 = unlimited). Regional voters; voter HB vs learner AE lanes |
+| **Shard map** | `dislmdb_shard_map_*` + SMAP v2 (flags); longest-prefix owner lookup; `dislmdb_topo_key_writable` |
 | **Bytecode** | Consensus-replicated (or SOLO) store/get; `DISLMDB_BYTECODE_VERIFY` (SHA-256 on disk). Compress flag reserved (`NOT_IMPLEMENTED`) |
 | **Metrics** | `dislmdb_get_metrics` + `dislmdb_format_metrics` (Prometheus text). Covers commits, consensus, Raft term/commit, DQGM, outbox |
 | **Ops status** | `dislmdb_consensus_get_operation_status` / `get_last_op_id` via local oplog ring |
@@ -26,15 +27,16 @@ Proprietary software — The Mapleseed Inc. Commercial license required.
 | --- | --- |
 | User KV / LMDB pages | **Yes** — mmap + commit / `dislmdb_force_sync` / checkpoint |
 | Meta (view, replicas, shard map, region) | **Yes** when `persist_state` |
-| Raft / PBFT log | **RAM** — catch-up after restart; Raft WAL is roadmap |
+| Raft log / hard state | **Yes** when `persist_state` — `__dislmdb_raft__` WAL + snapshot compact |
+| PBFT view/seq | **Yes** when `persist_state` (meta DBI) |
 | Network outbox / DQGM counters | RAM |
 
 Local ACID properties of LMDB still apply per node. Cross-node linearizability depends on the consensus path completing before the client sees success.
 
 ## Not done / not claimed
 
-- Regional hierarchical Raft (global mesh still the default)
-- Raft WAL + snapshots
+- FSM InstallSnapshot beyond the `kv` DBI (hooks ship `kv` dump/restore today)
+- Shard owner read proxy; auto-forward inside `dislmdb_put` (explicit `dislmdb_topo_forward_put`/`_del` shipped)
 - `DISLMDB_BYTECODE_COMPRESS`
 - Access-control layer / language bindings / full QUIC stack
 - Built-in Prometheus HTTP scrape port (format text yourself and expose)
@@ -119,10 +121,22 @@ Multi-node deployments **must** set a shared cluster key (`dislmdb_set_cluster_k
 | `DISLMDB_VOTING` | `on`/`off` — hubs vote; edges can be learners |
 | `DISLMDB_REGION` / `DISLMDB_LOCALITY` | Affinity for dial preference + persist |
 | `DISLMDB_REGION_SECRET` / `DISLMDB_CROSS_REGION_SECRET` | Intra- / inter-region key material |
-| `DISLMDB_TOPOLOGY_MODE` | `mirror` \| `shard` \| `hybrid` |
+| `DISLMDB_TOPOLOGY_MODE` | `mirror` (default) \| `shard` \| `hybrid` — gates writes + Raft peer role |
 | `DISLMDB_MAX_PEERS` | Soft membership cap (`0` = unlimited) |
 | `DISLMDB_RTT_BUDGET_MS` | Soft RTT budget (admit policy evolving) |
 | `DISLMDB_SEED_REGIONAL` | Comma-separated `host:port` seeds |
+
+### Secret rotation (no full outage)
+
+Plane keys are process-local (`DISLMDB_REGION_SECRET` / `DISLMDB_CROSS_REGION_SECRET` or `dislmdb_network_set_plane_keys`). Rotate without a cluster restart by rolling nodes:
+
+1. Deploy the **new** key as an additional candidate on receivers first (set both old and new via a short dual-key window — today the cross plane is a single key, so overlap means briefly configuring the new key cluster-wide before dropping the old).
+2. Flip senders to the new key (`set_plane_keys` / env + process reload) region-by-region.
+3. Remove the old key after every peer has advanced.
+
+Mismatched cross-region keys fail closed (`plane_auth_fail`); intra-region traffic keeps using the region/cluster key. Prefer rotating **cross** keys before **region** keys so local quorum is undisturbed.
+
+`dislmdb_topo_map_publish` replicates peer endpoints after join; `dislmdb_topo_resolve_owner` lets apps redirect shard writes when this node is not the owner.
 
 ## Architecture
 
@@ -151,7 +165,7 @@ See [TRIBUTE_HOWARD_CHU.md](TRIBUTE_HOWARD_CHU.md).
 
 ## Roadmap
 
-Tracked in [TODO.md](TODO.md): regional Raft groups, Raft WAL/snapshots, RTT admit, cross-region key planes, QUIC, I/O worker pool.
+Tracked in [TODO.md](TODO.md): multi-DBI FSM snapshots, put auto-forward, parallel send (net-safe), QUIC / io_uring.
 
 ## License
 

@@ -110,6 +110,12 @@ int dislmdb_put(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data, unsi
     if (!txn || txn->magic != DISLMDB_MAGIC || !key) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    if (txn->is_distributed && txn->is_write_txn && key->mv_data && key->mv_size > 0) {
+        int trc = dislmdb_topo_key_writable(txn->env, key->mv_data, key->mv_size);
+        if (trc != DISLMDB_SUCCESS) {
+            return trc;
+        }
+    }
     int rc = mdb_put(txn->mdb_txn, dbi, key, data, flags);
     if (rc != 0) {
         return rc;
@@ -124,6 +130,12 @@ int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data)
 {
     if (!txn || txn->magic != DISLMDB_MAGIC || !key) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (txn->is_distributed && txn->is_write_txn && key->mv_data && key->mv_size > 0) {
+        int trc = dislmdb_topo_key_writable(txn->env, key->mv_data, key->mv_size);
+        if (trc != DISLMDB_SUCCESS) {
+            return trc;
+        }
     }
     int rc = mdb_del(txn->mdb_txn, dbi, key, data);
     if (rc != 0) {

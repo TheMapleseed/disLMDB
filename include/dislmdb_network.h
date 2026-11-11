@@ -77,6 +77,10 @@ typedef struct DISLMDB_connection_info {
     uint32_t messages_received;      /**< Total messages received */
     uint32_t error_count;            /**< Number of errors encountered */
     DISLMDB_NODE_STATE node_state;    /**< State of the connected node */
+    uint32_t rtt_ewma_ms;            /**< Smoothed RTT (0 = not sampled yet) */
+    char region[64];                 /**< Peer region from HELLO / node_addr */
+    char locality[64];               /**< Peer locality */
+    bool peer_voting;                /**< Peer participates in quorum (HELLO flag) */
 } DISLMDB_connection_info;
 
 /** @brief Network statistics structure */
@@ -102,6 +106,8 @@ typedef struct DISLMDB_network_stats {
     uint64_t outbox_enqueued;        /**< Messages buffered for later send */
     uint64_t outbox_drained;         /**< Buffered messages successfully sent */
     uint64_t outbox_dropped;         /**< Dropped when per-peer queue was full */
+    uint64_t rtt_rejects;            /**< Soft-rejects when peer RTT > budget */
+    uint64_t plane_auth_fail;        /**< Auth failed for selected crypto plane */
 } DISLMDB_network_stats;
 
 /** @brief Callback for handling received messages */
@@ -277,6 +283,31 @@ int dislmdb_network_bind_peer_id(DISLMDB_env *env,
  * is warranted.
  */
 bool dislmdb_network_take_hello_reengage(DISLMDB_env *env, const char *node_id);
+
+/**
+ * @brief True if peer RTT is within env rtt_budget_ms (or budget/sample unset).
+ */
+bool dislmdb_network_rtt_within_budget(DISLMDB_env *env, const char *node_id);
+
+/**
+ * @brief Override peer RTT EWMA (milliseconds). Useful for ops/tests of budget policy.
+ * @param ms Sample to install; 0 clears the sample (budget checks treat as unknown).
+ */
+int dislmdb_network_set_rtt_ewma(DISLMDB_env *env, const char *node_id, uint32_t ms);
+
+/**
+ * @brief Install regional / cross-region plane keys (optional; fail-closed send).
+ */
+int dislmdb_network_set_plane_keys(DISLMDB_env *env,
+                                   const uint8_t *region_key, bool has_region,
+                                   const uint8_t *cross_key, bool has_cross);
+
+/** @brief Update live connection topo/voting from HELLO (no-op if peer unknown). */
+int dislmdb_network_set_peer_topo(DISLMDB_env *env,
+                                  const char *node_id,
+                                  const char *region,
+                                  const char *locality,
+                                  bool peer_voting);
 
 /**
  * @brief True for signalling traffic (HELLO/JOIN, HEARTBEAT, ELECTION, LEAVE)

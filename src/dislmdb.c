@@ -138,6 +138,7 @@ static const DISLMDB_env_config default_env_config = {
         .fault_tolerance = 0,
         .enable_liveness = true,
         .persist_state = true,
+        .raft_wal_sync_every = 1,
         .persist_cluster_key = false,
         .enable_voting = true
     },
@@ -265,6 +266,8 @@ static void destroy_mutexes(DISLMDB_env *e)
     pthread_mutex_destroy(&e->status_mutex);
     pthread_mutex_destroy(&e->log_mutex);
     pthread_mutex_destroy(&e->shard_mutex);
+    pthread_mutex_destroy(&e->forward_mutex);
+    pthread_cond_destroy(&e->forward_cv);
 }
 
 int dislmdb_env_create(DISLMDB_env **env)
@@ -290,7 +293,9 @@ int dislmdb_env_create(DISLMDB_env **env)
         pthread_mutex_init(&e->nodes_mutex, NULL) != 0 ||
         pthread_mutex_init(&e->status_mutex, NULL) != 0 ||
         pthread_mutex_init(&e->log_mutex, NULL) != 0 ||
-        pthread_mutex_init(&e->shard_mutex, NULL) != 0) {
+        pthread_mutex_init(&e->shard_mutex, NULL) != 0 ||
+        pthread_mutex_init(&e->forward_mutex, NULL) != 0 ||
+        pthread_cond_init(&e->forward_cv, NULL) != 0) {
         mdb_env_close(e->mdb_env);
         free(e);
         return DISLMDB_ERR_THREAD_ERROR;
@@ -823,6 +828,14 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
 
     if (env->config.read_only_node && txn->is_write_txn) {
         return DISLMDB_ERR_READ_ONLY;
+    }
+
+    if (txn->is_write_txn && txn->is_distributed) {
+        int trc = dislmdb_topo_check_txn_writes(txn);
+        if (trc != DISLMDB_SUCCESS) {
+            dislmdb_set_error(env, trc, "Topology mode rejected transaction writes");
+            return trc;
+        }
     }
 
     int rc = DISLMDB_SUCCESS;

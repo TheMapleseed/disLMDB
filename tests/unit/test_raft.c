@@ -10,6 +10,9 @@
 static int applied;
 static uint8_t last_payload[64];
 static size_t last_len;
+static int ae_voter;
+static int ae_learner;
+static int ae_empty_learner;
 
 static void on_out(const RaftMessage *msg, void *ud)
 {
@@ -25,6 +28,22 @@ static void on_apply(uint64_t index, const uint8_t *data, size_t len, void *ud)
     last_len = len < sizeof(last_payload) ? len : sizeof(last_payload);
     if (data && last_len) {
         memcpy(last_payload, data, last_len);
+    }
+}
+
+static void lane_out(const RaftMessage *msg, void *ud)
+{
+    (void)ud;
+    if (!msg || msg->type != RAFT_MSG_APPEND_ENTRIES) {
+        return;
+    }
+    if (strcmp(msg->to, "hub-v") == 0) {
+        ae_voter++;
+    } else if (strcmp(msg->to, "edge-l") == 0) {
+        ae_learner++;
+        if (msg->entry_count == 0) {
+            ae_empty_learner++;
+        }
     }
 }
 
@@ -75,6 +94,50 @@ int main(void)
     EXPECT_TRUE(&ctx, "learner_not_leader", !raft_is_leader(L));
     raft_stop(L);
     raft_destroy(L);
+
+    /*
+     * Learner AE lane: voter heartbeats must not fan out empty AE to learners;
+     * learners still receive AppendEntries that carry log data.
+     */
+    ae_voter = ae_learner = ae_empty_learner = 0;
+    applied = 0;
+
+    RaftConfig hub = raft_config_default();
+    strncpy(hub.node_id, "hub", sizeof(hub.node_id) - 1);
+    hub.heartbeat_ms = 40;
+    hub.learner_ae_ms = 200; /* slower than voter HB */
+    hub.election_timeout_min_ms = 40;
+    hub.election_timeout_max_ms = 80;
+    RaftNode *H = raft_create(&hub, lane_out, on_apply, NULL);
+    EXPECT_TRUE(&ctx, "hub_create", H != NULL);
+    /* Learner first so solo election can win; add voter peer after lead. */
+    EXPECT_EQ_INT(&ctx, "add_learner", (int)raft_add_learner(H, "edge-l"), (int)RAFT_OK);
+    raft_start(H);
+    for (int i = 0; i < 50 && !raft_is_leader(H); i++) {
+        usleep(20 * 1000);
+    }
+    EXPECT_TRUE(&ctx, "hub_leader", raft_is_leader(H));
+    ae_voter = ae_learner = ae_empty_learner = 0;
+    usleep(180 * 1000); /* under one learner cadence — must stay quiet to edge */
+    EXPECT_EQ_INT(&ctx, "idle_no_learner_ae", ae_learner, 0);
+    EXPECT_EQ_INT(&ctx, "no_empty_learner_hb", ae_empty_learner, 0);
+
+    const char *p2 = "lane-op";
+    EXPECT_EQ_INT(&ctx, "propose_lane",
+                  (int)raft_propose(H, (const uint8_t *)p2, strlen(p2), 2000),
+                  (int)RAFT_OK);
+    usleep(50 * 1000);
+    /* Opportunistic learner push on propose (entries only, never empty). */
+    EXPECT_TRUE(&ctx, "learner_got_entries", ae_learner >= 1);
+    EXPECT_EQ_INT(&ctx, "still_no_empty_learner", ae_empty_learner, 0);
+
+    /* After lead: add a voter peer and confirm HB lane hits voters. */
+    ae_voter = 0;
+    EXPECT_EQ_INT(&ctx, "add_voter", (int)raft_add_peer(H, "hub-v"), (int)RAFT_OK);
+    usleep(150 * 1000);
+    EXPECT_TRUE(&ctx, "voter_hb", ae_voter >= 2);
+    raft_stop(H);
+    raft_destroy(H);
 
     return test_end(&ctx);
 }

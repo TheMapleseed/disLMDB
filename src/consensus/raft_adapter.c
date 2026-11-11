@@ -8,6 +8,7 @@
  */
 #include "raft_adapter.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -17,13 +18,121 @@
 #include "dislmdb_crypto.h"
 #include "dislmdb_network.h"
 #include "../../Enhanced-Raft-mechanism/raft.h"
+#include "raft_wal.h"
 #include "pbft_adapter.h" /* serialize + apply oplog helpers + HELLO */
+
+#define RAFT_INBOX_MAX 4096u
+
+typedef struct raft_inbox_item {
+    DISLMDB_MESSAGE_TYPE type;
+    uint8_t *payload;
+    uint32_t payload_size;
+    struct raft_inbox_item *next;
+} raft_inbox_item;
 
 typedef struct {
     DISLMDB_env *env;
     RaftNode *node;
     bool started;
+    /* Phase G: Raft / SYNC work off the network thread. */
+    pthread_mutex_t inbox_mu;
+    pthread_cond_t inbox_cv;
+    pthread_t inbox_thread;
+    bool inbox_running;
+    raft_inbox_item *inbox_head;
+    raft_inbox_item *inbox_tail;
+    uint32_t inbox_depth;
 } raft_adapter_ctx;
+
+static void raft_inbox_clear(raft_adapter_ctx *actx)
+{
+    while (actx->inbox_head) {
+        raft_inbox_item *it = actx->inbox_head;
+        actx->inbox_head = it->next;
+        free(it->payload);
+        free(it);
+    }
+    actx->inbox_tail = NULL;
+    actx->inbox_depth = 0;
+}
+
+static int raft_inbox_push(raft_adapter_ctx *actx, DISLMDB_MESSAGE_TYPE type,
+                           const uint8_t *payload, uint32_t payload_size)
+{
+    if (!payload || payload_size == 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    pthread_mutex_lock(&actx->inbox_mu);
+    if (!actx->inbox_running || actx->inbox_depth >= RAFT_INBOX_MAX) {
+        pthread_mutex_unlock(&actx->inbox_mu);
+        return DISLMDB_ERR_IN_PROGRESS;
+    }
+    raft_inbox_item *it = calloc(1, sizeof(*it));
+    if (!it) {
+        pthread_mutex_unlock(&actx->inbox_mu);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    it->payload = malloc(payload_size);
+    if (!it->payload) {
+        free(it);
+        pthread_mutex_unlock(&actx->inbox_mu);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    memcpy(it->payload, payload, payload_size);
+    it->payload_size = payload_size;
+    it->type = type;
+    if (actx->inbox_tail) {
+        actx->inbox_tail->next = it;
+    } else {
+        actx->inbox_head = it;
+    }
+    actx->inbox_tail = it;
+    actx->inbox_depth++;
+    pthread_cond_signal(&actx->inbox_cv);
+    pthread_mutex_unlock(&actx->inbox_mu);
+    return DISLMDB_SUCCESS;
+}
+
+static void *raft_inbox_main(void *arg)
+{
+    raft_adapter_ctx *actx = arg;
+    DISLMDB_env *env = actx->env;
+    for (;;) {
+        pthread_mutex_lock(&actx->inbox_mu);
+        while (actx->inbox_running && !actx->inbox_head) {
+            pthread_cond_wait(&actx->inbox_cv, &actx->inbox_mu);
+        }
+        if (!actx->inbox_running && !actx->inbox_head) {
+            pthread_mutex_unlock(&actx->inbox_mu);
+            break;
+        }
+        raft_inbox_item *it = actx->inbox_head;
+        actx->inbox_head = it->next;
+        if (!actx->inbox_head) {
+            actx->inbox_tail = NULL;
+        }
+        actx->inbox_depth--;
+        pthread_mutex_unlock(&actx->inbox_mu);
+
+        if (it->type == DISLMDB_MESSAGE_SYNC_REQUEST) {
+            if (actx->started && raft_is_leader(actx->node)) {
+                (void)raft_propose(actx->node, it->payload, it->payload_size,
+                                   env->config.consensus.timeout_ms);
+            }
+        } else if (it->type == DISLMDB_MESSAGE_ELECTION) {
+            RaftMessage msg;
+            if (raft_message_deserialize(it->payload, it->payload_size, &msg) == 0) {
+                (void)raft_handle_message(actx->node, &msg);
+                raft_message_clear(&msg);
+                env->pbft_state.is_primary = raft_is_leader(actx->node);
+                raft_leader_id(actx->node, env->pbft_state.primary_id);
+            }
+        }
+        free(it->payload);
+        free(it);
+    }
+    return NULL;
+}
 
 static void raft_outbound(const RaftMessage *msg, void *user_data)
 {
@@ -77,7 +186,42 @@ static void raft_sync_peers_from_env(raft_adapter_ctx *actx)
         if (strncmp(id, "seed-", 5) == 0) {
             continue;
         }
-        (void)raft_add_peer(actx->node, id);
+        /*
+         * Regional voter set: same-region peers vote; cross-region policy
+         * depends on topology_mode (Phase B + D).
+         *  - mirror/hybrid: cross-region → learners (async full/hot replicate)
+         *  - shard: cross-region → not in Raft (ownership redirects locally)
+         * Non-voting HELLO peers are always learners on a voting hub.
+         */
+        bool cross = env->config.region[0] != '\0' &&
+                     env->nodes[i].region[0] != '\0' &&
+                     strncmp(env->config.region, env->nodes[i].region,
+                             sizeof(env->config.region)) != 0;
+        bool peer_votes = true;
+        DISLMDB_connection_info ci;
+        if (dislmdb_network_get_connection_info(env, id, &ci) == DISLMDB_SUCCESS) {
+            peer_votes = ci.peer_voting;
+            if (ci.region[0] != '\0' && env->nodes[i].region[0] == '\0') {
+                strncpy(env->nodes[i].region, ci.region, sizeof(env->nodes[i].region) - 1);
+                cross = env->config.region[0] != '\0' &&
+                        env->nodes[i].region[0] != '\0' &&
+                        strncmp(env->config.region, env->nodes[i].region,
+                                sizeof(env->config.region)) != 0;
+            }
+        }
+        if (cross && env->config.topology_mode == DISLMDB_TOPO_SHARD) {
+            (void)raft_remove_peer(actx->node, id);
+            continue;
+        }
+        bool as_learner = false;
+        if (env->config.consensus.enable_voting && (cross || !peer_votes)) {
+            as_learner = true;
+        }
+        if (as_learner) {
+            (void)raft_add_learner(actx->node, id);
+        } else {
+            (void)raft_add_peer(actx->node, id);
+        }
     }
     pthread_mutex_unlock(&env->nodes_mutex);
 }
@@ -109,11 +253,19 @@ int dislmdb_raft_init(DISLMDB_env *env)
     }
     actx->env = env;
     actx->started = false;
+    if (pthread_mutex_init(&actx->inbox_mu, NULL) != 0 ||
+        pthread_cond_init(&actx->inbox_cv, NULL) != 0) {
+        free(actx);
+        return DISLMDB_ERR_THREAD_ERROR;
+    }
     actx->node = raft_create(&cfg, raft_outbound, raft_apply, env);
     if (!actx->node) {
+        pthread_mutex_destroy(&actx->inbox_mu);
+        pthread_cond_destroy(&actx->inbox_cv);
         free(actx);
         return DISLMDB_ERR_MEMORY_ERROR;
     }
+    (void)dislmdb_raft_wal_attach(env, actx->node);
     raft_sync_peers_from_env(actx);
     env->consensus_context = actx;
     env->pbft_state.is_primary = false;
@@ -121,9 +273,28 @@ int dislmdb_raft_init(DISLMDB_env *env)
     env->pbft_state.f = 0;
     strncpy(env->pbft_state.primary_id, "", sizeof(env->pbft_state.primary_id) - 1);
 
+    actx->inbox_running = true;
+    if (pthread_create(&actx->inbox_thread, NULL, raft_inbox_main, actx) != 0) {
+        actx->inbox_running = false;
+        raft_destroy(actx->node);
+        pthread_mutex_destroy(&actx->inbox_mu);
+        pthread_cond_destroy(&actx->inbox_cv);
+        free(actx);
+        env->consensus_context = NULL;
+        return DISLMDB_ERR_THREAD_ERROR;
+    }
+
     int rc = dislmdb_network_set_message_callback(env, dislmdb_raft_message_handler, env);
     if (rc != DISLMDB_SUCCESS) {
+        pthread_mutex_lock(&actx->inbox_mu);
+        actx->inbox_running = false;
+        pthread_cond_signal(&actx->inbox_cv);
+        pthread_mutex_unlock(&actx->inbox_mu);
+        pthread_join(actx->inbox_thread, NULL);
+        raft_inbox_clear(actx);
         raft_destroy(actx->node);
+        pthread_mutex_destroy(&actx->inbox_mu);
+        pthread_cond_destroy(&actx->inbox_cv);
         free(actx);
         env->consensus_context = NULL;
         return rc;
@@ -163,6 +334,8 @@ int dislmdb_raft_start(DISLMDB_env *env)
     }
 
     raft_sync_peers_from_env(actx);
+    /* Replay durable hard state + log before the election ticker starts. */
+    (void)dislmdb_raft_wal_load(env, actx->node);
     raft_start(actx->node);
     actx->started = true;
     env->consensus_running = true;
@@ -178,8 +351,16 @@ int dislmdb_raft_shutdown(DISLMDB_env *env)
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
     raft_adapter_ctx *actx = env->consensus_context;
+    pthread_mutex_lock(&actx->inbox_mu);
+    actx->inbox_running = false;
+    pthread_cond_signal(&actx->inbox_cv);
+    pthread_mutex_unlock(&actx->inbox_mu);
+    pthread_join(actx->inbox_thread, NULL);
+    raft_inbox_clear(actx);
     raft_stop(actx->node);
     raft_destroy(actx->node);
+    pthread_mutex_destroy(&actx->inbox_mu);
+    pthread_cond_destroy(&actx->inbox_cv);
     free(actx);
     env->consensus_context = NULL;
     env->consensus_running = false;
@@ -481,7 +662,12 @@ int dislmdb_raft_checkpoint(DISLMDB_env *env)
     env->pbft_state.is_primary = raft_is_leader(actx->node);
     raft_leader_id(actx->node, env->pbft_state.primary_id);
     env->checkpoints++;
-    return dislmdb_persist_save(env);
+    (void)dislmdb_raft_wal_snapshot(env, actx->node);
+    int rc = dislmdb_persist_save(env);
+    if (rc == DISLMDB_SUCCESS) {
+        (void)dislmdb_raft_wal_sync(env);
+    }
+    return rc;
 }
 
 int dislmdb_raft_current_leader(DISLMDB_env *env, char *out, size_t out_len)
@@ -587,6 +773,10 @@ void dislmdb_raft_message_handler(const DISLMDB_network_message *message, void *
     }
     raft_adapter_ctx *actx = env->consensus_context;
 
+    if (dislmdb_topo_handle_forward_message(env, message)) {
+        return;
+    }
+
     /* Membership engages before / alongside Raft elections */
     if (message->header.type == DISLMDB_MESSAGE_JOIN) {
         dislmdb_pbft_handle_hello(env, message);
@@ -613,22 +803,14 @@ void dislmdb_raft_message_handler(const DISLMDB_network_message *message, void *
     }
 
     if (message->header.type == DISLMDB_MESSAGE_SYNC_REQUEST && message->payload) {
-        if (actx->started && raft_is_leader(actx->node)) {
-            (void)raft_propose(actx->node, message->payload, message->header.payload_size,
-                               env->config.consensus.timeout_ms);
-        }
+        (void)raft_inbox_push(actx, DISLMDB_MESSAGE_SYNC_REQUEST, message->payload,
+                              message->header.payload_size);
         return;
     }
     if (message->header.type != DISLMDB_MESSAGE_ELECTION || !message->payload) {
         return;
     }
-    /* Accept election traffic once armed; tick thread only after start. */
-    RaftMessage msg;
-    if (raft_message_deserialize(message->payload, message->header.payload_size, &msg) != 0) {
-        return;
-    }
-    (void)raft_handle_message(actx->node, &msg);
-    raft_message_clear(&msg);
-    env->pbft_state.is_primary = raft_is_leader(actx->node);
-    raft_leader_id(actx->node, env->pbft_state.primary_id);
+    /* Phase G: deserialize + handle on the Raft inbox worker. */
+    (void)raft_inbox_push(actx, DISLMDB_MESSAGE_ELECTION, message->payload,
+                          message->header.payload_size);
 }

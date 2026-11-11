@@ -71,7 +71,9 @@ typedef enum DISLMDB_MESSAGE_TYPE {
     DISLMDB_MESSAGE_JOIN,          /**< Request to join the network */
     DISLMDB_MESSAGE_LEAVE,         /**< Notification that a node is leaving */
     DISLMDB_MESSAGE_HEARTBEAT,     /**< Heartbeat message to check node status */
-    DISLMDB_MESSAGE_ELECTION       /**< Leader election message */
+    DISLMDB_MESSAGE_ELECTION,      /**< Leader election message */
+    DISLMDB_MESSAGE_FORWARD,       /**< Shard owner write forward (put/del) */
+    DISLMDB_MESSAGE_FORWARD_REPLY  /**< Owner ack/nack for FORWARD */
 } DISLMDB_MESSAGE_TYPE;
 
 /** @brief Network address information for nodes */
@@ -113,6 +115,11 @@ typedef struct DISLMDB_network_config {
     char tls_cert_path[512];       /**< PEM leaf certificate (mTLS) */
     char tls_key_path[512];        /**< PEM private key (mTLS) */
     char tls_ca_path[512];         /**< PEM CA bundle for peer verification (mTLS) */
+    /**
+     * Phase G: threads for blocking mTLS handshakes (0 = default 2).
+     * Keeps the net thread on select/bytes while workers finish TLS 1.3.
+     */
+    uint32_t handshake_workers;
 } DISLMDB_network_config;
 
 /** @brief Consensus configuration parameters */
@@ -134,6 +141,11 @@ typedef struct DISLMDB_consensus_config {
      * Overridable by env `DISLMDB_VOTING=0|off|false` (or 1|on|true).
      */
     bool enable_voting;
+    /**
+     * Raft WAL: fsync LMDB every N durable appends (1 = every append; 0 = rely on
+     * checkpoint / env close only). Hard-state (term/vote) still syncs every write.
+     */
+    uint32_t raft_wal_sync_every;
 } DISLMDB_consensus_config;
 
 /** @brief Runtime metrics for DisLMDB (snapshot via dislmdb_get_metrics) */
@@ -180,15 +192,22 @@ typedef struct DISLMDB_metrics {
 #define DISLMDB_SHARD_ID_LEN 64
 #define DISLMDB_SHARD_PREFIX_LEN 128
 
+/** @brief Shard descriptor flags (OR into DISLMDB_shard_desc.flags) */
+#define DISLMDB_SHARD_FLAG_MIRRORED 0x0001u /**< Hybrid: prefix fully replicated; any node may write */
+
 /**
  * @brief One shard: keys matching key_prefix (longest match wins) affinity to owner.
  *
  * Replaces the orb key-prefix convention with an explicit, queryable map.
+ * In `DISLMDB_TOPO_SHARD`, writes for a key must land on `owner_node_id`.
+ * In `DISLMDB_TOPO_HYBRID`, prefixes with `DISLMDB_SHARD_FLAG_MIRRORED` skip
+ * ownership checks; other prefixes behave like shard mode.
  */
 typedef struct DISLMDB_shard_desc {
     char shard_id[DISLMDB_SHARD_ID_LEN];       /**< Stable shard identifier */
     char key_prefix[DISLMDB_SHARD_PREFIX_LEN]; /**< Key prefix owned by this shard */
     char owner_node_id[64];                    /**< Affinity / primary owner node */
+    uint32_t flags;                            /**< DISLMDB_SHARD_FLAG_* */
 } DISLMDB_shard_desc;
 
 /** @brief Opaque structure for a distributed environment */
@@ -199,9 +218,9 @@ typedef struct DISLMDB_txn DISLMDB_txn;
 
 /** @brief Cross-region / multi-region data placement */
 typedef enum DISLMDB_TOPOLOGY_MODE {
-    DISLMDB_TOPO_MIRROR = 0, /**< Every region holds a full replica (async) */
-    DISLMDB_TOPO_SHARD = 1,  /**< Key → region/owner via shard map */
-    DISLMDB_TOPO_HYBRID = 2  /**< Hot prefixes mirrored; cold sharded */
+    DISLMDB_TOPO_MIRROR = 0, /**< Full KV everywhere; cross-region = Raft learners */
+    DISLMDB_TOPO_SHARD = 1,  /**< Writes only on shard owner; cross-region not in Raft */
+    DISLMDB_TOPO_HYBRID = 2  /**< Mirrored prefixes + sharded cold prefixes */
 } DISLMDB_TOPOLOGY_MODE;
 
 /**
@@ -553,5 +572,63 @@ int dislmdb_shard_lookup_id(DISLMDB_env *env,
                             const void *key,
                             size_t key_len,
                             char shard_id[DISLMDB_SHARD_ID_LEN]);
+
+/**
+ * @brief Whether this node may locally write @p key under the current topology mode.
+ *
+ * Mirror: always yes. Shard: key must match a shard owned by this node.
+ * Hybrid: mirrored prefixes always yes; others same as shard.
+ * @return DISLMDB_SUCCESS, DISLMDB_ERR_OPERATION_REJECTED, or DISLMDB_ERR_NODE_NOT_FOUND.
+ */
+int dislmdb_topo_key_writable(DISLMDB_env *env,
+                              const void *key,
+                              size_t key_len);
+
+/**
+ * @brief Resolve the owning node id for @p key under the current topology mode.
+ *
+ * Mirror: returns the local node id. Shard/hybrid: longest-prefix shard owner
+ * (mirrored hybrid prefixes still report their advisory owner).
+ * @return DISLMDB_SUCCESS or DISLMDB_ERR_NODE_NOT_FOUND when no shard matches.
+ */
+int dislmdb_topo_resolve_owner(DISLMDB_env *env,
+                               const void *key,
+                               size_t key_len,
+                               char owner_node_id[64]);
+
+/**
+ * @brief Forward a put to the shard owner when this node cannot write locally.
+ *
+ * Resolves owner via @ref dislmdb_topo_resolve_owner. If this node is the
+ * owner, returns DISLMDB_ERR_INVALID_PARAMETER (use @ref dislmdb_put).
+ * Otherwise sends DISLMDB_MESSAGE_FORWARD and waits up to @p timeout_ms for
+ * FORWARD_REPLY. Does not mutate the caller's local LMDB (shard isolation).
+ *
+ * @param dbname Named DBI (NULL = default unnamed DB).
+ */
+int dislmdb_topo_forward_put(DISLMDB_env *env,
+                             const char *dbname,
+                             const void *key,
+                             size_t key_len,
+                             const void *data,
+                             size_t data_len,
+                             uint32_t timeout_ms);
+
+/**
+ * @brief Forward a delete to the shard owner (see @ref dislmdb_topo_forward_put).
+ */
+int dislmdb_topo_forward_del(DISLMDB_env *env,
+                             const char *dbname,
+                             const void *key,
+                             size_t key_len,
+                             uint32_t timeout_ms);
+
+/**
+ * @brief Publish the current peer topology map via consensus (TOPO blob).
+ *
+ * Solo: persist peer_topo only. Raft/PBFT: propose; apply on commit merges
+ * endpoints into the node table on every replica.
+ */
+int dislmdb_topo_map_publish(DISLMDB_env *env);
 
 #endif /* DISLMDB_H */

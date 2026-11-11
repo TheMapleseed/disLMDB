@@ -134,6 +134,7 @@ struct DISLMDB_env {
     uint64_t total_operations;               /**< Total number of operations */
     uint64_t total_sync_bytes;               /**< Total bytes synchronized */
     uint64_t consensus_proposes;
+    uint64_t raft_wal_appends;               /**< Durable Raft log appends (sync policy) */
     uint64_t consensus_commits;
     uint64_t view_changes;
     uint64_t checkpoints;
@@ -151,6 +152,17 @@ struct DISLMDB_env {
     pthread_mutex_t shard_mutex;
     DISLMDB_shard_desc shards[DISLMDB_MAX_SHARDS];
     uint32_t shard_count;
+
+    /* Shard owner forward waiters (FORWARD → FORWARD_REPLY) */
+    pthread_mutex_t forward_mutex;
+    pthread_cond_t forward_cv;
+    uint64_t forward_corr_seq;
+    struct {
+        uint64_t corr_id;
+        int status;
+        bool active;
+        bool done;
+    } forward_waiters[16];
 };
 
 /** @brief Pending op recorded for replication */
@@ -187,6 +199,8 @@ struct DISLMDB_txn {
 #define DISLMDB_META_DBI "__dislmdb_meta__"
 #define DISLMDB_OPLOG_MAGIC 0x4F504C47u /* OPLG */
 #define DISLMDB_SMAP_MAGIC 0x534D4150u  /* SMAP — shard map consensus blob */
+#define DISLMDB_TOPO_MAGIC 0x544F504Fu  /* TOPO — peer topology consensus blob */
+#define DISLMDB_REPL_MAGIC 0x5245504Cu  /* REPL — length-prefixed replica stream */
 #define DISLMDB_LEAV_MAGIC 0x4C454156u  /* LEAV — graceful leave */
 #define DISLMDB_DQGM_MAGIC 0x4451474Du  /* DQGM — UDP datagram session envelope */
 #define DISLMDB_DGRAM_ENVELOPE_V1_SIZE 16 /* magic+ver+flags+stream+cid */
@@ -211,6 +225,16 @@ int dislmdb_shard_map_encode(const DISLMDB_shard_desc *shards,
                              size_t count,
                              uint8_t **out,
                              size_t *out_len);
+/** Reject txn writes that violate topology_mode / shard ownership. */
+int dislmdb_topo_check_txn_writes(const DISLMDB_txn *txn);
+/** Apply a committed TOPO consensus payload into the node table. */
+int dislmdb_topo_map_apply_payload(DISLMDB_env *env, const uint8_t *data, size_t size);
+/**
+ * @brief Handle inbound FORWARD / FORWARD_REPLY.
+ * @return true if the message was consumed (caller must not treat as consensus).
+ */
+bool dislmdb_topo_handle_forward_message(DISLMDB_env *env,
+                                         const DISLMDB_network_message *message);
 void dislmdb_free_pending_ops(DISLMDB_txn *txn);
 /** Record a consensus outcome into the env operation-status ring. */
 void dislmdb_record_consensus_result(DISLMDB_env *env,

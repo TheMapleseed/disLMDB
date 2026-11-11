@@ -300,6 +300,14 @@ int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t
         return rc;
     }
 
+    if (size >= 12 && dislmdb_read_u32(data) == DISLMDB_TOPO_MAGIC) {
+        int rc = dislmdb_topo_map_apply_payload(env, data, size);
+        if (rc == DISLMDB_SUCCESS) {
+            env->consensus_commits++;
+        }
+        return rc;
+    }
+
     if (size >= 16 && dislmdb_read_u32(data) == BCOD_MAGIC) {
         size_t o = 0;
         (void)dislmdb_read_u32(data + o); o += 4;
@@ -534,17 +542,51 @@ void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *
         return;
     }
     const uint8_t *p = message->payload;
+    size_t plen = message->header.payload_size;
     if (dislmdb_read_u32(p) != HELO_MAGIC) {
         return;
     }
     uint16_t peer_port = dislmdb_read_u16(p + 4);
     uint8_t id_len = p[6];
-    if ((size_t)7 + id_len > message->header.payload_size || id_len == 0 || id_len >= 64) {
+    if ((size_t)7 + id_len > plen || id_len == 0 || id_len >= 64) {
         return;
     }
     char peer_id[64];
     memset(peer_id, 0, sizeof(peer_id));
     memcpy(peer_id, p + 7, id_len);
+    size_t o = 7 + id_len;
+
+    /* Optional trailer: region_len, region, loc_len, locality, flags */
+    char peer_region[64];
+    char peer_locality[64];
+    bool peer_voting = true;
+    memset(peer_region, 0, sizeof(peer_region));
+    memset(peer_locality, 0, sizeof(peer_locality));
+    if (o < plen) {
+        uint8_t rlen = p[o++];
+        if (o + rlen > plen || rlen >= sizeof(peer_region)) {
+            return;
+        }
+        if (rlen > 0) {
+            memcpy(peer_region, p + o, rlen);
+        }
+        o += rlen;
+        if (o >= plen) {
+            return;
+        }
+        uint8_t llen = p[o++];
+        if (o + llen > plen || llen >= sizeof(peer_locality)) {
+            return;
+        }
+        if (llen > 0) {
+            memcpy(peer_locality, p + o, llen);
+        }
+        o += llen;
+        if (o < plen) {
+            uint8_t flags = p[o];
+            peer_voting = (flags & 0x01u) != 0;
+        }
+    }
 
     /* Ignore self-advertisements */
     if (strncmp(peer_id, env->local_node_id, 63) == 0) {
@@ -556,6 +598,8 @@ void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *
     strncpy(addr.node_id, peer_id, sizeof(addr.node_id) - 1);
     strncpy(addr.hostname, "127.0.0.1", sizeof(addr.hostname) - 1);
     addr.port = peer_port;
+    strncpy(addr.region, peer_region, sizeof(addr.region) - 1);
+    strncpy(addr.locality, peer_locality, sizeof(addr.locality) - 1);
 
     /* Prefer hostname already known on the wire connection */
     DISLMDB_connection_info ci;
@@ -591,6 +635,9 @@ void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *
     (void)dislmdb_network_bind_peer_id(env, message->header.sender_id, peer_id, peer_port);
     (void)dislmdb_add_node_internal(env, &addr);
 
+    (void)dislmdb_network_set_peer_topo(env, peer_id, peer_region, peer_locality,
+                                        peer_voting);
+
     /* consensus_context is ConsensusCore* only under PBFT */
     if (env->consensus_context &&
         env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
@@ -599,7 +646,10 @@ void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *
                                        env->config.consensus.fault_tolerance);
     }
     dislmdb_log(env, DISLMDB_LOG_INFO, "HELLO",
-                "Learned peer id=%s port=%u%s", peer_id, (unsigned)peer_port,
+                "Learned peer id=%s port=%u region=%s voting=%d%s",
+                peer_id, (unsigned)peer_port,
+                peer_region[0] ? peer_region : "-",
+                peer_voting ? 1 : 0,
                 peer_reengage ? " (re-engage)" : "");
 
     /*
@@ -618,7 +668,9 @@ int dislmdb_pbft_send_hello(DISLMDB_env *env, const char *target_node_id)
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
     size_t id_len = strnlen(env->local_node_id, 63);
-    uint8_t buf[4 + 2 + 1 + 64];
+    size_t rlen = strnlen(env->config.region, 63);
+    size_t llen = strnlen(env->config.locality, 63);
+    uint8_t buf[4 + 2 + 1 + 64 + 1 + 64 + 1 + 64 + 1];
     size_t o = 0;
     dislmdb_write_u32(buf + o, HELO_MAGIC); o += 4;
     dislmdb_write_u16(buf + o, env->config.network.local_port
@@ -628,6 +680,17 @@ int dislmdb_pbft_send_hello(DISLMDB_env *env, const char *target_node_id)
     buf[o++] = (uint8_t)id_len;
     memcpy(buf + o, env->local_node_id, id_len);
     o += id_len;
+    buf[o++] = (uint8_t)rlen;
+    if (rlen > 0) {
+        memcpy(buf + o, env->config.region, rlen);
+        o += rlen;
+    }
+    buf[o++] = (uint8_t)llen;
+    if (llen > 0) {
+        memcpy(buf + o, env->config.locality, llen);
+        o += llen;
+    }
+    buf[o++] = env->config.consensus.enable_voting ? 0x01u : 0x00u;
 
     DISLMDB_network_message nm;
     const char *target = (target_node_id && target_node_id[0] != '\0') ? target_node_id : NULL;
@@ -726,6 +789,10 @@ void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *
 {
     DISLMDB_env *env = user_data;
     if (!env || !message) {
+        return;
+    }
+
+    if (dislmdb_topo_handle_forward_message(env, message)) {
         return;
     }
 

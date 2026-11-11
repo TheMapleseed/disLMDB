@@ -19,9 +19,13 @@
 #define META_KEY_REGION "region"
 #define META_KEY_LOCALITY "locality"
 #define META_KEY_TOPO_MODE "topo_mode"
+#define META_KEY_PEER_TOPO "peer_topo"
 
-/* Packed shard: count u32 + N * (64 + 128 + 64) */
-#define SHARD_PACK_SIZE (DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN + 64)
+/* Packed shard: count u32 + N * (id + prefix + owner [+ flags v2]) */
+#define SHARD_PACK_SIZE_V1 (DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN + 64)
+#define SHARD_PACK_SIZE (SHARD_PACK_SIZE_V1 + 4)
+/* Peer topo: id[64] + region[64] + locality[64] + host[256] + port u16 */
+#define PEER_TOPO_REC_SIZE (64 + 64 + 64 + 256 + 2)
 
 int dislmdb_persist_save(DISLMDB_env *env)
 {
@@ -75,22 +79,49 @@ int dislmdb_persist_save(DISLMDB_env *env)
         }
     }
 
-    /* Pack replicas: count u32 + N * 64 */
-    size_t rsize = 4 + (size_t)env->node_count * 64;
-    uint8_t *rbuf = calloc(1, rsize ? rsize : 4);
+    /*
+     * Length-prefixed replica stream (REPL v2): no fixed-N packing limit.
+     * Each record: id_len u16 + id, host_len u16 + host, port u16,
+     * region_len u16 + region, locality_len u16 + locality.
+     */
+    pthread_mutex_lock(&env->nodes_mutex);
+    size_t rneed = 12; /* magic + ver + count */
+    for (uint32_t i = 0; i < env->node_count; i++) {
+        rneed += 2 + strnlen(env->nodes[i].node_id, 63);
+        rneed += 2 + strnlen(env->nodes[i].hostname, 255);
+        rneed += 2; /* port */
+        rneed += 2 + strnlen(env->nodes[i].region, 63);
+        rneed += 2 + strnlen(env->nodes[i].locality, 63);
+    }
+    uint8_t *rbuf = calloc(1, rneed ? rneed : 12);
     if (!rbuf) {
+        pthread_mutex_unlock(&env->nodes_mutex);
         mdb_txn_abort(txn);
         return DISLMDB_ERR_MEMORY_ERROR;
     }
-    dislmdb_write_u32(rbuf, env->node_count);
-    pthread_mutex_lock(&env->nodes_mutex);
+    size_t ro = 0;
+    dislmdb_write_u32(rbuf + ro, DISLMDB_REPL_MAGIC); ro += 4;
+    dislmdb_write_u32(rbuf + ro, 2); ro += 4;
+    dislmdb_write_u32(rbuf + ro, env->node_count); ro += 4;
     for (uint32_t i = 0; i < env->node_count; i++) {
-        memcpy(rbuf + 4 + i * 64, env->nodes[i].node_id, 64);
+        size_t idl = strnlen(env->nodes[i].node_id, 63);
+        size_t hl = strnlen(env->nodes[i].hostname, 255);
+        size_t rl = strnlen(env->nodes[i].region, 63);
+        size_t ll = strnlen(env->nodes[i].locality, 63);
+        dislmdb_write_u16(rbuf + ro, (uint16_t)idl); ro += 2;
+        memcpy(rbuf + ro, env->nodes[i].node_id, idl); ro += idl;
+        dislmdb_write_u16(rbuf + ro, (uint16_t)hl); ro += 2;
+        memcpy(rbuf + ro, env->nodes[i].hostname, hl); ro += hl;
+        dislmdb_write_u16(rbuf + ro, env->nodes[i].port); ro += 2;
+        dislmdb_write_u16(rbuf + ro, (uint16_t)rl); ro += 2;
+        memcpy(rbuf + ro, env->nodes[i].region, rl); ro += rl;
+        dislmdb_write_u16(rbuf + ro, (uint16_t)ll); ro += 2;
+        memcpy(rbuf + ro, env->nodes[i].locality, ll); ro += ll;
     }
     pthread_mutex_unlock(&env->nodes_mutex);
     k.mv_size = strlen(META_KEY_REPLICAS);
     k.mv_data = (void *)META_KEY_REPLICAS;
-    v.mv_size = rsize;
+    v.mv_size = ro;
     v.mv_data = rbuf;
     rc = mdb_put(txn, dbi, &k, &v, 0);
     free(rbuf);
@@ -116,6 +147,7 @@ int dislmdb_persist_save(DISLMDB_env *env)
                DISLMDB_SHARD_PREFIX_LEN);
         memcpy(sbuf + o + DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN,
                env->shards[i].owner_node_id, 64);
+        dislmdb_write_u32(sbuf + o + SHARD_PACK_SIZE_V1, env->shards[i].flags);
     }
     pthread_mutex_unlock(&env->shard_mutex);
     k.mv_size = strlen(META_KEY_SHARDS);
@@ -159,6 +191,39 @@ int dislmdb_persist_save(DISLMDB_env *env)
         v.mv_size = 1;
         v.mv_data = &mode;
         rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+    }
+
+    /* Peer topology map: endpoints + region/locality for nearest dial on reboot. */
+    {
+        pthread_mutex_lock(&env->nodes_mutex);
+        uint32_t nc = env->node_count;
+        size_t tsize = 4 + (size_t)nc * PEER_TOPO_REC_SIZE;
+        uint8_t *tbuf = calloc(1, tsize ? tsize : 4);
+        if (!tbuf) {
+            pthread_mutex_unlock(&env->nodes_mutex);
+            mdb_txn_abort(txn);
+            return DISLMDB_ERR_MEMORY_ERROR;
+        }
+        dislmdb_write_u32(tbuf, nc);
+        for (uint32_t i = 0; i < nc; i++) {
+            size_t o = 4 + (size_t)i * PEER_TOPO_REC_SIZE;
+            memcpy(tbuf + o, env->nodes[i].node_id, 64);
+            memcpy(tbuf + o + 64, env->nodes[i].region, 64);
+            memcpy(tbuf + o + 128, env->nodes[i].locality, 64);
+            memcpy(tbuf + o + 192, env->nodes[i].hostname, 256);
+            dislmdb_write_u16(tbuf + o + 448, env->nodes[i].port);
+        }
+        pthread_mutex_unlock(&env->nodes_mutex);
+        k.mv_size = strlen(META_KEY_PEER_TOPO);
+        k.mv_data = (void *)META_KEY_PEER_TOPO;
+        v.mv_size = tsize;
+        v.mv_data = tbuf;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        free(tbuf);
         if (rc != 0) {
             mdb_txn_abort(txn);
             return rc;
@@ -209,17 +274,87 @@ int dislmdb_persist_load(DISLMDB_env *env)
         env->config.network.enable_message_auth = true;
         memcpy(env->config.network.cluster_key, env->cluster_key, 32);
     }
+    /* Replicas: prefer REPL v2; fall back to legacy count + N*64 ids. */
+    k.mv_size = strlen(META_KEY_REPLICAS);
+    k.mv_data = (void *)META_KEY_REPLICAS;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 4) {
+        const uint8_t *rp = v.mv_data;
+        if (v.mv_size >= 12 && dislmdb_read_u32(rp) == DISLMDB_REPL_MAGIC) {
+            uint32_t ver = dislmdb_read_u32(rp + 4);
+            uint32_t nc = dislmdb_read_u32(rp + 8);
+            size_t o = 12;
+            if (ver == 2) {
+                for (uint32_t i = 0; i < nc && o + 2 <= v.mv_size; i++) {
+                    DISLMDB_node_addr na;
+                    memset(&na, 0, sizeof(na));
+                    uint16_t idl = dislmdb_read_u16(rp + o); o += 2;
+                    if (o + idl + 2 > v.mv_size || idl >= sizeof(na.node_id)) {
+                        break;
+                    }
+                    memcpy(na.node_id, rp + o, idl); o += idl;
+                    uint16_t hl = dislmdb_read_u16(rp + o); o += 2;
+                    if (o + hl + 2 > v.mv_size || hl >= sizeof(na.hostname)) {
+                        break;
+                    }
+                    memcpy(na.hostname, rp + o, hl); o += hl;
+                    if (o + 2 > v.mv_size) {
+                        break;
+                    }
+                    na.port = dislmdb_read_u16(rp + o); o += 2;
+                    if (o + 2 > v.mv_size) {
+                        break;
+                    }
+                    uint16_t rl = dislmdb_read_u16(rp + o); o += 2;
+                    if (o + rl + 2 > v.mv_size || rl >= sizeof(na.region)) {
+                        break;
+                    }
+                    memcpy(na.region, rp + o, rl); o += rl;
+                    uint16_t ll = dislmdb_read_u16(rp + o); o += 2;
+                    if (o + ll > v.mv_size || ll >= sizeof(na.locality)) {
+                        break;
+                    }
+                    memcpy(na.locality, rp + o, ll); o += ll;
+                    if (na.node_id[0] == '\0' ||
+                        strncmp(na.node_id, env->local_node_id, 63) == 0) {
+                        continue;
+                    }
+                    (void)dislmdb_add_node_internal(env, &na);
+                }
+            }
+        } else {
+            /* Legacy: count u32 + N * 64 node ids (no endpoints). */
+            uint32_t nc = dislmdb_read_u32(rp);
+            if (v.mv_size >= 4 + (size_t)nc * 64) {
+                for (uint32_t i = 0; i < nc; i++) {
+                    DISLMDB_node_addr na;
+                    memset(&na, 0, sizeof(na));
+                    memcpy(na.node_id, rp + 4 + (size_t)i * 64, 64);
+                    na.node_id[63] = '\0';
+                    if (na.node_id[0] == '\0' ||
+                        strncmp(na.node_id, env->local_node_id, 63) == 0) {
+                        continue;
+                    }
+                    (void)dislmdb_add_node_internal(env, &na);
+                }
+            }
+        }
+    }
+
     k.mv_size = strlen(META_KEY_SHARDS);
     k.mv_data = (void *)META_KEY_SHARDS;
     if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 4) {
         uint32_t sc = dislmdb_read_u32(v.mv_data);
-        size_t need = 4 + (size_t)sc * SHARD_PACK_SIZE;
-        if (sc <= DISLMDB_MAX_SHARDS && v.mv_size >= need) {
+        size_t need_v2 = 4 + (size_t)sc * SHARD_PACK_SIZE;
+        size_t need_v1 = 4 + (size_t)sc * SHARD_PACK_SIZE_V1;
+        bool v2 = (sc <= DISLMDB_MAX_SHARDS && v.mv_size >= need_v2);
+        bool v1 = (!v2 && sc <= DISLMDB_MAX_SHARDS && v.mv_size >= need_v1);
+        if (v2 || v1) {
+            size_t pack = v2 ? SHARD_PACK_SIZE : SHARD_PACK_SIZE_V1;
             pthread_mutex_lock(&env->shard_mutex);
             memset(env->shards, 0, sizeof(env->shards));
             env->shard_count = sc;
             for (uint32_t i = 0; i < sc; i++) {
-                size_t o = 4 + (size_t)i * SHARD_PACK_SIZE;
+                size_t o = 4 + (size_t)i * pack;
                 memcpy(env->shards[i].shard_id, (uint8_t *)v.mv_data + o,
                        DISLMDB_SHARD_ID_LEN);
                 env->shards[i].shard_id[DISLMDB_SHARD_ID_LEN - 1] = '\0';
@@ -232,6 +367,11 @@ int dislmdb_persist_load(DISLMDB_env *env)
                            DISLMDB_SHARD_PREFIX_LEN,
                        64);
                 env->shards[i].owner_node_id[63] = '\0';
+                if (v2) {
+                    env->shards[i].flags =
+                        dislmdb_read_u32((uint8_t *)v.mv_data + o + SHARD_PACK_SIZE_V1) &
+                        DISLMDB_SHARD_FLAG_MIRRORED;
+                }
             }
             pthread_mutex_unlock(&env->shard_mutex);
         }
@@ -266,6 +406,36 @@ int dislmdb_persist_load(DISLMDB_env *env)
             const char *emode = getenv("DISLMDB_TOPOLOGY_MODE");
             if (!emode || emode[0] == '\0') {
                 env->config.topology_mode = (DISLMDB_TOPOLOGY_MODE)mode;
+            }
+        }
+    }
+    k.mv_size = strlen(META_KEY_PEER_TOPO);
+    k.mv_data = (void *)META_KEY_PEER_TOPO;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 4) {
+        uint32_t nc = dislmdb_read_u32(v.mv_data);
+        size_t need = 4 + (size_t)nc * PEER_TOPO_REC_SIZE;
+        if (v.mv_size >= need) {
+            for (uint32_t i = 0; i < nc; i++) {
+                const uint8_t *rec =
+                    (const uint8_t *)v.mv_data + 4 + (size_t)i * PEER_TOPO_REC_SIZE;
+                DISLMDB_node_addr na;
+                memset(&na, 0, sizeof(na));
+                memcpy(na.node_id, rec, 64);
+                na.node_id[63] = '\0';
+                memcpy(na.region, rec + 64, 64);
+                na.region[63] = '\0';
+                memcpy(na.locality, rec + 128, 64);
+                na.locality[63] = '\0';
+                memcpy(na.hostname, rec + 192, 256);
+                na.hostname[255] = '\0';
+                na.port = dislmdb_read_u16(rec + 448);
+                if (na.node_id[0] == '\0') {
+                    continue;
+                }
+                if (strncmp(na.node_id, env->local_node_id, 63) == 0) {
+                    continue;
+                }
+                (void)dislmdb_add_node_internal(env, &na);
             }
         }
     }

@@ -13,7 +13,7 @@ extern "C" {
 
 /** Arm Raft + network callback; does not start elections yet. */
 int dislmdb_raft_init(DISLMDB_env *env);
-/** Start elections after cluster HELLO/mesh engagement. */
+/** Start elections after cluster HELLO/mesh engagement (loads Raft WAL first). */
 int dislmdb_raft_start(DISLMDB_env *env);
 int dislmdb_raft_shutdown(DISLMDB_env *env);
 int dislmdb_raft_propose_transaction(DISLMDB_txn *txn);
