@@ -316,6 +316,12 @@ int dislmdb_topo_key_writable(DISLMDB_env *env,
 
     DISLMDB_TOPOLOGY_MODE mode = env->config.topology_mode;
     if (mode == DISLMDB_TOPO_MIRROR) {
+        if (env->config.mirror_conflict_policy == DISLMDB_MIRROR_REGION_PRIORITY &&
+            env->config.mirror_primary_region[0] != '\0') {
+            if (strncmp(env->config.region, env->config.mirror_primary_region, 63) != 0) {
+                return DISLMDB_ERR_OPERATION_REJECTED;
+            }
+        }
         return DISLMDB_SUCCESS;
     }
 
@@ -348,9 +354,6 @@ int dislmdb_topo_check_txn_writes(const DISLMDB_txn *txn)
 {
     if (!txn || txn->magic != DISLMDB_MAGIC || !txn->env) {
         return DISLMDB_ERR_INVALID_PARAMETER;
-    }
-    if (txn->env->config.topology_mode == DISLMDB_TOPO_MIRROR) {
-        return DISLMDB_SUCCESS;
     }
     for (const DISLMDB_pending_op *op = txn->pending_ops; op; op = op->next) {
         if (op->type != DISLMDB_OP_TYPE_PUT && op->type != DISLMDB_OP_TYPE_DEL) {

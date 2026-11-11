@@ -84,6 +84,83 @@ static const char *dbname_for_dbi(DISLMDB_txn *txn, MDB_dbi dbi)
     return "";
 }
 
+/** True when @p owner_id has a live CONNECTED network session. */
+static bool owner_peer_connected(DISLMDB_env *env, const char *owner_id)
+{
+    DISLMDB_connection_info ci;
+    memset(&ci, 0, sizeof(ci));
+    if (dislmdb_network_get_connection_info(env, owner_id, &ci) != DISLMDB_SUCCESS) {
+        return false;
+    }
+    return ci.state == DISLMDB_CONNECTION_CONNECTED;
+}
+
+/**
+ * On local write-gate reject: RPC to owner when auto-forward is enabled and
+ * the owner is connected. Returns gate_rc unchanged when forwarding is not
+ * attempted; otherwise the forward RPC status (SUCCESS = remote write done,
+ * no local LMDB mutation / pending-op record).
+ *
+ * The staging LMDB write txn is aborted around the RPC: if this node is the
+ * Raft leader, the owner may redirect the propose back here, and apply needs
+ * the write lock. Mixed local+forward ops in one txn are rejected.
+ */
+static int maybe_auto_forward(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key,
+                              MDB_val *data, bool is_put, int gate_rc)
+{
+    if (gate_rc != DISLMDB_ERR_OPERATION_REJECTED) {
+        return gate_rc;
+    }
+    if (!txn->env->config.enable_auto_forward) {
+        return gate_rc;
+    }
+    if (txn->pending_ops != NULL || txn->operation_count > 0) {
+        return gate_rc;
+    }
+    char owner[64] = {0};
+    if (dislmdb_topo_resolve_owner(txn->env, key->mv_data, key->mv_size, owner) !=
+        DISLMDB_SUCCESS) {
+        return gate_rc;
+    }
+    if (strncmp(owner, txn->env->local_node_id, sizeof(owner)) == 0) {
+        return gate_rc;
+    }
+    if (!owner_peer_connected(txn->env, owner)) {
+        return gate_rc;
+    }
+    const char *dbname = dbname_for_dbi(txn, dbi);
+    const char *name = (dbname && dbname[0] != '\0') ? dbname : "kv";
+    /* Owner may need to redirect the propose to the Raft leader — allow headroom. */
+    uint32_t to = txn->env->config.consensus.timeout_ms;
+    if (to < 10000u) {
+        to = 10000u;
+    }
+
+    if (txn->mdb_txn) {
+        mdb_txn_abort(txn->mdb_txn);
+        txn->mdb_txn = NULL;
+    }
+
+    int rc;
+    if (is_put) {
+        rc = dislmdb_topo_forward_put(txn->env, name, key->mv_data, key->mv_size,
+                                      data ? data->mv_data : NULL,
+                                      data ? data->mv_size : 0, to);
+    } else {
+        rc = dislmdb_topo_forward_del(txn->env, name, key->mv_data, key->mv_size, to);
+    }
+
+    /* Restore an empty write txn so a later commit/abort still has a handle. */
+    if (txn->is_write_txn && txn->env->mdb_env) {
+        MDB_txn *fresh = NULL;
+        int brc = mdb_txn_begin(txn->env->mdb_env, NULL, 0, &fresh);
+        if (brc == 0) {
+            txn->mdb_txn = fresh;
+        }
+    }
+    return rc;
+}
+
 int dislmdb_dbi_open(DISLMDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *dbi)
 {
     if (!txn || txn->magic != DISLMDB_MAGIC || !dbi) {
@@ -113,6 +190,10 @@ int dislmdb_put(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data, unsi
     if (txn->is_distributed && txn->is_write_txn && key->mv_data && key->mv_size > 0) {
         int trc = dislmdb_topo_key_writable(txn->env, key->mv_data, key->mv_size);
         if (trc != DISLMDB_SUCCESS) {
+            /* Auto-forward only for plain puts (no special LMDB flags). */
+            if (flags == 0) {
+                return maybe_auto_forward(txn, dbi, key, data, true, trc);
+            }
             return trc;
         }
     }
@@ -134,6 +215,10 @@ int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data)
     if (txn->is_distributed && txn->is_write_txn && key->mv_data && key->mv_size > 0) {
         int trc = dislmdb_topo_key_writable(txn->env, key->mv_data, key->mv_size);
         if (trc != DISLMDB_SUCCESS) {
+            /* Dupsort data-targeted deletes stay local-gate only. */
+            if (data == NULL) {
+                return maybe_auto_forward(txn, dbi, key, NULL, false, trc);
+            }
             return trc;
         }
     }

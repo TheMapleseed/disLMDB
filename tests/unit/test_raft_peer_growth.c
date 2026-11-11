@@ -33,12 +33,17 @@ int main(void)
     RaftNode *n = raft_create(&cfg, on_out, on_apply, NULL);
     EXPECT_TRUE(&ctx, "create", n != NULL);
 
-    const uint32_t N = 128; /* past historical DISLMDB_MAX_NODES=64 */
+    const uint32_t N = 512; /* soak past historical 64 and prior 128 unit cap */
     for (uint32_t i = 0; i < N; i++) {
         char id[RAFT_NODE_ID_LEN];
         snprintf(id, sizeof(id), "peer-%u", i);
         RaftError err = raft_add_peer(n, id);
-        EXPECT_EQ_INT(&ctx, "add", (int)err, (int)RAFT_OK);
+        if ((i & 63u) == 0u) {
+            EXPECT_EQ_INT(&ctx, "add", (int)err, (int)RAFT_OK);
+        } else if (err != RAFT_OK) {
+            EXPECT_EQ_INT(&ctx, "add_mid", (int)err, (int)RAFT_OK);
+            break;
+        }
     }
     EXPECT_EQ_INT(&ctx, "count", (int)raft_peer_count(n), (int)N);
 

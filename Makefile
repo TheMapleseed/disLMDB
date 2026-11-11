@@ -49,6 +49,9 @@ DISLMDB_SRCS := \
   src/utils/dislmdb_topo.c \
   src/network/dislmdb_network.c \
   src/network/dislmdb_mtls.c \
+  src/network/dislmdb_quic.c \
+  src/network/dislmdb_quic_tls.c \
+  src/network/dislmdb_iouring.c \
   src/consensus/dislmdb_consensus.c \
   src/consensus/pbft_adapter.c \
   src/consensus/raft_adapter.c \
@@ -71,7 +74,8 @@ UNIT_SANDBOX_TESTS := \
   $(BINDIR)/test_raft_peer_growth \
   $(BINDIR)/test_metrics_format \
   $(BINDIR)/test_mtls \
-  $(BINDIR)/test_transport_adapt
+  $(BINDIR)/test_transport_adapt \
+  $(BINDIR)/test_quic_substrate
 
 # Needs libdislmdb but no env mmap in the happy path
 UNIT_LIB_TESTS := \
@@ -208,6 +212,9 @@ $(BINDIR)/test_mtls: tests/unit/test_mtls.c src/network/dislmdb_mtls.c $(MBEDTLS
 $(BINDIR)/test_transport_adapt: tests/unit/test_transport_adapt.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
 
+$(BINDIR)/test_quic_substrate: tests/unit/test_quic_substrate.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
 $(BINDIR)/test_mtls_tcp_rig: tests/rig/test_mtls_tcp_rig.c src/network/dislmdb_mtls.c $(MBEDTLS_LIBS) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/rig/test_mtls_tcp_rig.c src/network/dislmdb_mtls.c -o $@ \
 	  $(MBEDTLS_LIBS) $(LIBS)
@@ -341,6 +348,7 @@ unit-sandbox: $(UNIT_SANDBOX_TESTS)
 	@cd $(BUILD) && ./bin/test_metrics_format
 	@cd $(BUILD) && ./bin/test_mtls
 	@cd $(BUILD) && ./bin/test_transport_adapt
+	@cd $(BUILD) && ./bin/test_quic_substrate
 
 rig: $(RIG_TESTS)
 	@echo ""

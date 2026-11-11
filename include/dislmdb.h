@@ -72,8 +72,8 @@ typedef enum DISLMDB_MESSAGE_TYPE {
     DISLMDB_MESSAGE_LEAVE,         /**< Notification that a node is leaving */
     DISLMDB_MESSAGE_HEARTBEAT,     /**< Heartbeat message to check node status */
     DISLMDB_MESSAGE_ELECTION,      /**< Leader election message */
-    DISLMDB_MESSAGE_FORWARD,       /**< Shard owner write forward (put/del) */
-    DISLMDB_MESSAGE_FORWARD_REPLY  /**< Owner ack/nack for FORWARD */
+    DISLMDB_MESSAGE_FORWARD,       /**< Shard owner forward (put/del/get) */
+    DISLMDB_MESSAGE_FORWARD_REPLY  /**< Owner ack/nack (+ value for get) */
 } DISLMDB_MESSAGE_TYPE;
 
 /** @brief Network address information for nodes */
@@ -83,7 +83,20 @@ typedef struct DISLMDB_node_addr {
     char node_id[64];              /**< Unique node identifier */
     char region[64];               /**< Optional region id (affinity / nearest dial) */
     char locality[64];             /**< Optional AZ / rack / zone */
+    uint32_t rtt_ewma_ms;          /**< Persisted RTT EWMA (0 = unknown) */
 } DISLMDB_node_addr;
+
+/** @brief Mirror-mode write conflict / authority policy */
+typedef enum DISLMDB_MIRROR_CONFLICT_POLICY {
+    /** Consensus log order wins (default). Any voting replica may write. */
+    DISLMDB_MIRROR_LAST_WRITE = 0,
+    /**
+     * Only the primary mirror region may write; others are rejected.
+     * Set @ref DISLMDB_env_config.mirror_primary_region (or env
+     * `DISLMDB_MIRROR_PRIMARY_REGION`). Empty primary ⇒ last-write behavior.
+     */
+    DISLMDB_MIRROR_REGION_PRIORITY = 1
+} DISLMDB_MIRROR_CONFLICT_POLICY;
 
 /** @brief Wire transport for cluster traffic */
 typedef enum DISLMDB_TRANSPORT {
@@ -94,7 +107,14 @@ typedef enum DISLMDB_TRANSPORT {
      * LEAVE) prefers UDP; bulk/consensus data prefers TCP. Each path falls
      * back to the other when the preferred medium is unavailable.
      */
-    DISLMDB_TRANSPORT_BOTH = 2
+    DISLMDB_TRANSPORT_BOTH = 2,
+    /**
+     * QUIC / WebTransport (TLS 1.3 over UDP) atop DQGM.
+     * Substrate ships (long-header parse + version negotiation on UDP).
+     * Full handshake gated — @ref dislmdb_env_open returns
+     * Requires @c dislmdb_quic_stack_ready() (UDP + QUIC HS/1-RTT).
+     */
+    DISLMDB_TRANSPORT_QUIC = 3
 } DISLMDB_TRANSPORT;
 
 /** @brief Network configuration for DisLMDB */
@@ -257,6 +277,20 @@ typedef struct DISLMDB_env_config {
     bool has_cross_region_key;
     /** Soft peer ceiling (0 = unlimited). No hard deny at 64. */
     uint32_t max_peers;
+    /**
+     * When true (default), @ref dislmdb_put / @ref dislmdb_del that fail the
+     * local shard write gate automatically RPC to the owner if that peer is
+     * connected (same path as @ref dislmdb_topo_forward_put / `_del`).
+     * Unreachable owners still return DISLMDB_ERR_OPERATION_REJECTED.
+     * Auto-forward runs only when the txn has no prior local pending ops
+     * (staging write lock is released around the RPC so a redirected Raft
+     * propose can apply if this node is leader).
+     */
+    bool enable_auto_forward;
+    /** Mirror write authority (ignored unless topology_mode is mirror). */
+    DISLMDB_MIRROR_CONFLICT_POLICY mirror_conflict_policy;
+    /** Region id allowed to write under REGION_PRIORITY (see policy enum). */
+    char mirror_primary_region[64];
 } DISLMDB_env_config;
 
 /**
@@ -492,13 +526,19 @@ int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32]);
 int dislmdb_get_cluster_key(DISLMDB_env *env, uint8_t out[32]);
 
 /**
- * @brief Distributed put — records the op for consensus replication
+ * @brief Distributed put — records the op for consensus replication.
+ *
+ * Under shard/hybrid, if this node is not the owner and
+ * @ref DISLMDB_env_config.enable_auto_forward is set, forwards to the owner
+ * when connected (no local mutation). Otherwise returns the write-gate error.
  */
 int dislmdb_put(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data,
                 unsigned int flags);
 
 /**
- * @brief Distributed delete — records the op for consensus replication
+ * @brief Distributed delete — records the op for consensus replication.
+ *
+ * See @ref dislmdb_put for shard auto-forward behavior.
  */
 int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data);
 
@@ -622,6 +662,35 @@ int dislmdb_topo_forward_del(DISLMDB_env *env,
                              const void *key,
                              size_t key_len,
                              uint32_t timeout_ms);
+
+/**
+ * @brief Forward a get to the shard owner (read proxy).
+ *
+ * On success, allocates *@p out_data (caller frees) with *@p out_len bytes.
+ * Returns MDB_NOTFOUND when the owner has no such key.
+ */
+int dislmdb_topo_forward_get(DISLMDB_env *env,
+                             const char *dbname,
+                             const void *key,
+                             size_t key_len,
+                             void **out_data,
+                             size_t *out_len,
+                             uint32_t timeout_ms);
+
+/**
+ * @brief Topology-aware get: local when this node may serve the key, else
+ * forward to the shard owner (see @ref dislmdb_topo_forward_get).
+ *
+ * Mirror / local owner / hybrid mirrored prefixes: LMDB read on this node.
+ * Otherwise RPC to the owner when connected.
+ */
+int dislmdb_topo_get(DISLMDB_env *env,
+                     const char *dbname,
+                     const void *key,
+                     size_t key_len,
+                     void **out_data,
+                     size_t *out_len,
+                     uint32_t timeout_ms);
 
 /**
  * @brief Publish the current peer topology map via consensus (TOPO blob).

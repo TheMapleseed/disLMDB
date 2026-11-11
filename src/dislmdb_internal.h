@@ -74,6 +74,7 @@ typedef struct DISLMDB_operation_log_entry {
 struct DISLMDB_env {
     uint32_t magic;                          /**< Magic number for validation */
     MDB_env *mdb_env;                        /**< The underlying LMDB environment */
+    bool lmdb_opened;                        /**< True after successful mdb_env_open */
     DISLMDB_env_config config;               /**< Configuration parameters */
     
     /* Network state */
@@ -162,6 +163,8 @@ struct DISLMDB_env {
         int status;
         bool active;
         bool done;
+        uint8_t *reply_val; /**< owned; GET replies only */
+        size_t reply_vlen;
     } forward_waiters[16];
 };
 

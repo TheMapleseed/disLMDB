@@ -10,11 +10,11 @@ Proprietary software — The Mapleseed Inc. Commercial license required.
 | --- | --- |
 | **Consensus** | Enhanced-PBFT and Raft (`DISLMDB_CONSENSUS_*`), joint-consensus membership, graceful leave |
 | **Voting** | First-class; `DISLMDB_VOTING=off` / `enable_voting=false` → learner (no campaign / no vote grant) |
-| **Transports** | TCP, UDP (DQGM v3: pkt_num, cumulative ACK, CID rebind, peer-restart), **BOTH** (UDP signalling + TCP data) |
+| **Transports** | TCP, UDP (DQGM v3), **BOTH**, **QUIC** (TLS 1.3 HS + 1-RTT DQGM; X.509 CertificateVerify) |
 | **Crypto (transport)** | Cluster key HMAC + AEAD payload encryption; portable mTLS 1.3 via vendored Mbed TLS |
 | **Crypto (PBFT)** | Time-Variant BLAKE3 digests + keyed MACs bound to `(view, sequence)` — not used for connections or Raft |
 | **Topology** | Env: `DISLMDB_REGION` / `LOCALITY` / `TOPOLOGY_MODE` / secrets / `MAX_PEERS`; persisted region + peer_topo; same-region dial preference |
-| **Topo modes** | `mirror` (full replicate / learners), `shard` (owner write-gate; cross-region out of Raft), `hybrid` (`DISLMDB_SHARD_FLAG_MIRRORED`) |
+| **Topo modes** | `mirror` / `shard` / `hybrid`; auto-forward puts/dels (`enable_auto_forward`); read proxy `dislmdb_topo_get` / `forward_get` |
 | **Scale** | Heap-growable peer + connection tables; soft `max_peers` (0 = unlimited). Regional voters; voter HB vs learner AE lanes |
 | **Shard map** | `dislmdb_shard_map_*` + SMAP v2 (flags); longest-prefix owner lookup; `dislmdb_topo_key_writable` |
 | **Bytecode** | Consensus-replicated (or SOLO) store/get; `DISLMDB_BYTECODE_VERIFY` (SHA-256 on disk). Compress flag reserved (`NOT_IMPLEMENTED`) |
@@ -36,11 +36,10 @@ Local ACID properties of LMDB still apply per node. Cross-node linearizability d
 
 ## Not done / not claimed
 
-- FSM InstallSnapshot beyond the `kv` DBI (hooks ship `kv` dump/restore today)
-- Shard owner read proxy; auto-forward inside `dislmdb_put` (explicit `dislmdb_topo_forward_put`/`_del` shipped)
 - `DISLMDB_BYTECODE_COMPRESS`
-- Access-control layer / language bindings / full QUIC stack
+- Access-control layer / language bindings
 - Built-in Prometheus HTTP scrape port (format text yourself and expose)
+- QUIC multi-node integration smoke (unit substrate + `stack_ready` shipped)
 
 ## Requirements
 
@@ -207,7 +206,7 @@ See [TRIBUTE_HOWARD_CHU.md](TRIBUTE_HOWARD_CHU.md).
 
 ## Roadmap
 
-Tracked in [TODO.md](TODO.md): multi-DBI FSM snapshots, put auto-forward, parallel send (net-safe), QUIC / io_uring.
+Tracked in [TODO.md](TODO.md): Phase H — bytecode compress, ACL, bindings, scrape, QUIC IT.
 
 ## License
 

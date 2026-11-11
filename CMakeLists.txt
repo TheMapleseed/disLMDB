@@ -93,6 +93,9 @@ set(DISLMDB_SRCS
     src/utils/dislmdb_topo.c
     src/network/dislmdb_network.c
     src/network/dislmdb_mtls.c
+    src/network/dislmdb_quic.c
+    src/network/dislmdb_quic_tls.c
+    src/network/dislmdb_iouring.c
     src/consensus/dislmdb_consensus.c
     src/consensus/pbft_adapter.c
     src/consensus/raft_adapter.c
@@ -223,6 +226,10 @@ add_executable(test_transport_adapt tests/unit/test_transport_adapt.c)
 target_link_libraries(test_transport_adapt dislmdb)
 add_test(NAME unit_transport_adapt COMMAND test_transport_adapt)
 
+add_executable(test_quic_substrate tests/unit/test_quic_substrate.c)
+target_link_libraries(test_quic_substrate dislmdb)
+add_test(NAME unit_quic_substrate COMMAND test_quic_substrate)
+
 add_executable(test_mtls_cluster tests/integration/test_mtls_cluster.c)
 target_link_libraries(test_mtls_cluster dislmdb)
 add_test(NAME integration_mtls_cluster COMMAND test_mtls_cluster WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -299,7 +306,7 @@ add_test(
 add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     DEPENDS dislmdb_test test_crypto test_tvb3 test_raft test_raft_membership
-            test_mtls test_transport_adapt
+            test_mtls test_transport_adapt test_quic_substrate
             test_ops_persist test_op_status test_membership test_shard_map test_topo_modes
             test_topo_forward test_topo_plane test_raft_wal test_raft_wal_chaos
             test_multinode test_udp test_mixed

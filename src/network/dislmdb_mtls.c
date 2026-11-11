@@ -5,6 +5,7 @@
 #include "dislmdb_mtls.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +13,7 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -84,14 +85,14 @@ static int mtls_wait_fd(int fd, int want_write, uint64_t deadline_ms)
         return -1;
     }
     uint64_t left = deadline_ms - now;
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(fd, &fds);
-    struct timeval tv = {
-        .tv_sec = (time_t)(left / 1000ull),
-        .tv_usec = (suseconds_t)((left % 1000ull) * 1000ull)};
-    int rc = want_write ? select(fd + 1, NULL, &fds, NULL, &tv)
-                        : select(fd + 1, &fds, NULL, NULL, &tv);
+    if (left > (uint64_t)INT_MAX) {
+        left = (uint64_t)INT_MAX;
+    }
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = want_write ? (short)POLLOUT : (short)POLLIN,
+    };
+    int rc = poll(&pfd, 1, (int)left);
     return rc > 0 ? 0 : -1;
 }
 

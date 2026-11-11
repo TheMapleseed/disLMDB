@@ -15,15 +15,22 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+    defined(__NetBSD__) || defined(__DragonFly__)
+#include <sys/event.h>
+#define DISLMDB_NET_HAS_KQUEUE 1
+#endif
 
 #include "dislmdb_internal.h"
 #include "dislmdb_errors.h"
 #include "dislmdb_crypto.h"
 #include "dislmdb_mtls.h"
+#include "dislmdb_quic.h"
+#include "dislmdb_iouring.h"
 
 #define NET_CONN_INITIAL DISLMDB_MAX_NODES /* growable; not a hard cluster cap */
 #define NET_HEADER_WIRE_SIZE 160
@@ -70,6 +77,27 @@ typedef struct net_connection {
 #define NET_HS_QUEUE_MAX 64u
 #define NET_HS_WORKERS_DEFAULT 2u
 #define NET_HS_WORKERS_MAX 8u
+#define NET_QUIC_SESSIONS_MAX 16u
+
+typedef struct net_quic_session {
+    bool active;
+    dislmdb_quic_conn conn;
+    struct sockaddr_in peer;
+} net_quic_session;
+
+typedef struct net_quic_pending {
+    bool active;
+    bool have_sh;
+    dislmdb_quic_conn conn;
+    uint8_t xpriv[32];
+    uint8_t ch[512];
+    size_t ch_len;
+    uint8_t sh[512];
+    size_t sh_len;
+    uint8_t server_initial[2048];
+    size_t server_initial_len;
+    struct sockaddr_in peer;
+} net_quic_pending;
 
 typedef enum {
     NET_HS_CLIENT = 1,
@@ -89,8 +117,10 @@ typedef struct network_context {
     DISLMDB_env *env;
     int listen_fd;
     int udp_fd;                 /* datagram socket when transport includes UDP */
-    int wake_r;                 /* self-pipe read — wakes select on shutdown */
+    int wake_r;                 /* self-pipe read — wakes poll/kqueue on shutdown */
     int wake_w;                 /* self-pipe write */
+    int kq;                     /* BSD/Darwin kqueue; -1 → poll/io_uring */
+    dislmdb_iouring *uring;     /* Linux io_uring; NULL → poll/kqueue */
     DISLMDB_TRANSPORT transport;
     pthread_t thread;
     bool running;
@@ -122,7 +152,92 @@ typedef struct network_context {
     net_hs_job *hs_head;
     net_hs_job *hs_tail;
     uint32_t hs_depth;
+    /* QUIC substrate sessions (Initial → 1-RTT). */
+    net_quic_session quic_sessions[NET_QUIC_SESSIONS_MAX];
+    net_quic_pending quic_pending[NET_QUIC_SESSIONS_MAX];
+    dislmdb_quic_tls_identity *quic_identity; /* leaf+key for CertificateVerify */
+    bool quic_pki_strict; /* true when PEM CA configured — chain verify required */
 } network_context;
+
+static int quic_session_store(network_context *ctx, const dislmdb_quic_conn *conn,
+                              const struct sockaddr_in *peer)
+{
+    if (!ctx || !conn || !peer || !conn->has_app_keys || conn->scid_len == 0) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < NET_QUIC_SESSIONS_MAX; i++) {
+        if (ctx->quic_sessions[i].active &&
+            ctx->quic_sessions[i].conn.scid_len == conn->scid_len &&
+            memcmp(ctx->quic_sessions[i].conn.scid, conn->scid, conn->scid_len) ==
+                0) {
+            ctx->quic_sessions[i].conn = *conn;
+            ctx->quic_sessions[i].peer = *peer;
+            return 0;
+        }
+    }
+    for (uint32_t i = 0; i < NET_QUIC_SESSIONS_MAX; i++) {
+        if (!ctx->quic_sessions[i].active) {
+            ctx->quic_sessions[i].active = true;
+            ctx->quic_sessions[i].conn = *conn;
+            ctx->quic_sessions[i].peer = *peer;
+            return 0;
+        }
+    }
+    /* Evict slot 0 when full (substrate). */
+    ctx->quic_sessions[0].active = true;
+    ctx->quic_sessions[0].conn = *conn;
+    ctx->quic_sessions[0].peer = *peer;
+    return 0;
+}
+
+static net_quic_session *quic_session_find(network_context *ctx,
+                                           const uint8_t *dcid, size_t dcid_len)
+{
+    if (!ctx || !dcid || dcid_len == 0) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < NET_QUIC_SESSIONS_MAX; i++) {
+        if (ctx->quic_sessions[i].active &&
+            ctx->quic_sessions[i].conn.scid_len == dcid_len &&
+            memcmp(ctx->quic_sessions[i].conn.scid, dcid, dcid_len) == 0) {
+            return &ctx->quic_sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static net_quic_pending *quic_pending_find_peer(network_context *ctx,
+                                                const struct sockaddr_in *peer)
+{
+    if (!ctx || !peer) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < NET_QUIC_SESSIONS_MAX; i++) {
+        if (ctx->quic_pending[i].active &&
+            ctx->quic_pending[i].peer.sin_addr.s_addr == peer->sin_addr.s_addr &&
+            ctx->quic_pending[i].peer.sin_port == peer->sin_port) {
+            return &ctx->quic_pending[i];
+        }
+    }
+    return NULL;
+}
+
+static int quic_pending_store(network_context *ctx, const net_quic_pending *p)
+{
+    if (!ctx || !p) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < NET_QUIC_SESSIONS_MAX; i++) {
+        if (!ctx->quic_pending[i].active) {
+            ctx->quic_pending[i] = *p;
+            ctx->quic_pending[i].active = true;
+            return 0;
+        }
+    }
+    ctx->quic_pending[0] = *p;
+    ctx->quic_pending[0].active = true;
+    return 0;
+}
 
 static int find_conn_by_id(network_context *ctx, const char *node_id);
 
@@ -241,9 +356,29 @@ static void free_network_context(network_context *ctx)
     if (!ctx) {
         return;
     }
+    if (ctx->kq >= 0) {
+        close(ctx->kq);
+        ctx->kq = -1;
+    }
+    if (ctx->uring) {
+        dislmdb_iouring_destroy(ctx->uring);
+        ctx->uring = NULL;
+    }
     free(ctx->connections);
     ctx->connections = NULL;
     ctx->conn_cap = 0;
+    for (uint32_t i = 0; i < NET_QUIC_SESSIONS_MAX; i++) {
+        if (ctx->quic_sessions[i].active) {
+            dislmdb_quic_conn_reset(&ctx->quic_sessions[i].conn);
+            ctx->quic_sessions[i].active = false;
+        }
+        if (ctx->quic_pending[i].active) {
+            dislmdb_quic_conn_reset(&ctx->quic_pending[i].conn);
+            ctx->quic_pending[i].active = false;
+        }
+    }
+    dislmdb_quic_tls_identity_destroy(ctx->quic_identity);
+    ctx->quic_identity = NULL;
     free(ctx);
 }
 
@@ -296,13 +431,8 @@ static int send_all_raw(int fd, const void *buf, size_t len)
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
                 /* Short wait then fail — do not burn seconds on a dead peer */
-                fd_set wfds;
-                FD_ZERO(&wfds);
-                FD_SET(fd, &wfds);
-                struct timeval tv = {
-                    .tv_sec = NET_IO_TIMEOUT_MS / 1000,
-                    .tv_usec = (NET_IO_TIMEOUT_MS % 1000) * 1000};
-                if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+                if (poll(&pfd, 1, NET_IO_TIMEOUT_MS) <= 0) {
                     return -1;
                 }
                 continue;
@@ -328,13 +458,8 @@ static int recv_all_raw(int fd, void *buf, size_t len)
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
-                fd_set rfds;
-                FD_ZERO(&rfds);
-                FD_SET(fd, &rfds);
-                struct timeval tv = {
-                    .tv_sec = NET_IO_TIMEOUT_MS / 1000,
-                    .tv_usec = (NET_IO_TIMEOUT_MS % 1000) * 1000};
-                if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+                struct pollfd pfd = {.fd = fd, .events = POLLIN};
+                if (poll(&pfd, 1, NET_IO_TIMEOUT_MS) <= 0) {
                     return -1;
                 }
                 continue;
@@ -704,33 +829,56 @@ static int outbox_enqueue_locked(network_context *ctx, int idx,
 }
 
 /**
- * Drain as many buffered frames as the wire will take.
+ * Drain buffered frames for one peer.
  * Must NOT be called with ctx->lock held (write_framed_adapt may lock).
+ * @param max_frames 0 = unlimited; otherwise stop after this many successful
+ *        sends so the net thread can return to RX (fairness / no RX starve).
+ * @return true if the peer may still have outbox frames after returning.
  */
-static void outbox_drain(network_context *ctx, int idx);
+static bool outbox_drain(network_context *ctx, int idx, uint32_t max_frames);
 
-/** Serial drain — kept on the caller thread (net thread after HB is fine;
- *  short framed writes). Async join-parallelism starved RX and flaked RPC. */
+/**
+ * Fair multi-peer drain on the net thread: round-robin one frame per peer
+ * per pass (no worker-join). Caps total frames so poll/RX stays responsive.
+ * Prior async join-parallelism starved RX and flaked FORWARD RPC.
+ */
 static void outbox_drain_many(network_context *ctx, const int *idxs, int n)
 {
     if (!ctx || !idxs || n <= 0) {
         return;
     }
-    for (int i = 0; i < n; i++) {
-        outbox_drain(ctx, idxs[i]);
-    }
+    const uint32_t kMaxTotal = 64;
+    uint32_t sent = 0;
+    bool progress;
+    do {
+        progress = false;
+        for (int i = 0; i < n && sent < kMaxTotal; i++) {
+            if (outbox_drain(ctx, idxs[i], 1)) {
+                progress = true;
+            }
+            sent++;
+        }
+    } while (progress && sent < kMaxTotal);
 }
 
-static void outbox_drain(network_context *ctx, int idx)
+static bool outbox_drain(network_context *ctx, int idx, uint32_t max_frames)
 {
+    uint32_t frames = 0;
+    bool more = false;
     for (;;) {
+        if (max_frames > 0 && frames >= max_frames) {
+            pthread_mutex_lock(&ctx->lock);
+            more = (idx >= 0 && idx < ctx->conn_cap && ctx->connections[idx].in_use &&
+                    ctx->connections[idx].outbox_count > 0);
+            pthread_mutex_unlock(&ctx->lock);
+            return more;
+        }
         DISLMDB_network_message msg;
-        bool have = false;
         pthread_mutex_lock(&ctx->lock);
         if (idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use ||
             ctx->connections[idx].outbox_count == 0) {
             pthread_mutex_unlock(&ctx->lock);
-            return;
+            return false;
         }
         net_connection *c = &ctx->connections[idx];
         uint32_t head = c->outbox_head;
@@ -747,11 +895,7 @@ static void outbox_drain(network_context *ctx, int idx)
         memset(&c->outbox[head].msg, 0, sizeof(c->outbox[head].msg));
         c->outbox_head = (head + 1u) % NET_OUTBOX_CAP;
         c->outbox_count--;
-        have = true;
         pthread_mutex_unlock(&ctx->lock);
-        if (!have) {
-            return;
-        }
         int used_fd = -1;
         int rc = write_framed_adapt(ctx, idx, &msg, &used_fd);
         if (rc != DISLMDB_SUCCESS) {
@@ -763,6 +907,7 @@ static void outbox_drain(network_context *ctx, int idx)
                 ctx->stats.outbox_dropped++;
                 pthread_mutex_unlock(&ctx->lock);
                 dislmdb_network_free_message(&msg);
+                frames++;
                 continue;
             }
             /* Put it back at the front and stop — path still not ready. */
@@ -777,13 +922,14 @@ static void outbox_drain(network_context *ctx, int idx)
                     c2->outbox_head = new_head;
                     c2->outbox_count++;
                     msg.payload = NULL; /* ownership moved back */
+                    more = true;
                 } else {
                     ctx->stats.outbox_dropped++;
                 }
             }
             pthread_mutex_unlock(&ctx->lock);
             dislmdb_network_free_message(&msg);
-            return;
+            return more;
         }
         pthread_mutex_lock(&ctx->lock);
         ctx->stats.outbox_drained++;
@@ -796,6 +942,7 @@ static void outbox_drain(network_context *ctx, int idx)
         }
         pthread_mutex_unlock(&ctx->lock);
         dislmdb_network_free_message(&msg);
+        frames++;
     }
 }
 
@@ -1057,11 +1204,8 @@ static int try_reconnect(network_context *ctx, int idx)
  */
 static int poll_connect_ready(int fd)
 {
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 0};
-    int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+    struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+    int sel = poll(&pfd, 1, 0);
     if (sel < 0) {
         return -1;
     }
@@ -1074,6 +1218,21 @@ static int poll_connect_ready(int fd)
         return -1;
     }
     return 0;
+}
+
+/** True if @p fd appears in @p pfds with a readable revent. */
+static bool poll_readable(const struct pollfd *pfds, int np, int fd)
+{
+    if (!pfds || fd < 0) {
+        return false;
+    }
+    for (int i = 0; i < np; i++) {
+        if (pfds[i].fd == fd &&
+            (pfds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void conn_fail_connecting(network_context *ctx, int idx)
@@ -1143,7 +1302,7 @@ static int attach_client_tls(network_context *ctx, int idx, int fd,
     bool drain = (ctx->connections[idx].outbox_count > 0);
     pthread_mutex_unlock(&ctx->lock);
     if (drain) {
-        outbox_drain(ctx, idx);
+        outbox_drain(ctx, idx, 0);
     }
     return 0;
 }
@@ -1789,6 +1948,50 @@ static int write_framed(network_context *ctx, int fd,
             free(dgram);
             return DISLMDB_ERR_NODE_NOT_FOUND;
         }
+
+        /* Prefer 1-RTT wrap when a QUIC session exists for this peer. */
+        if (ctx->transport == DISLMDB_TRANSPORT_QUIC ||
+            ctx->transport == DISLMDB_TRANSPORT_BOTH) {
+            pthread_mutex_lock(&ctx->lock);
+            net_quic_session *qs = NULL;
+            for (uint32_t qi = 0; qi < NET_QUIC_SESSIONS_MAX; qi++) {
+                if (!ctx->quic_sessions[qi].active ||
+                    !ctx->quic_sessions[qi].conn.has_app_keys) {
+                    continue;
+                }
+                if (ctx->quic_sessions[qi].peer.sin_addr.s_addr ==
+                        to.sin_addr.s_addr &&
+                    ctx->quic_sessions[qi].peer.sin_port == to.sin_port) {
+                    qs = &ctx->quic_sessions[qi];
+                    break;
+                }
+            }
+            if (qs) {
+                uint8_t qpkt[4096];
+                size_t qpkt_len = 0;
+                uint64_t qpn = qs->conn.next_pn_out++;
+                bool from_client = !qs->conn.is_server;
+                int qrc = dislmdb_quic_build_one_rtt_packet(
+                    &qs->conn, from_client, qpn & 0xffu, dgram, total, qpkt,
+                    sizeof(qpkt), &qpkt_len);
+                pthread_mutex_unlock(&ctx->lock);
+                free(dgram);
+                if (qrc != 0) {
+                    return DISLMDB_ERR_NETWORK;
+                }
+                ssize_t sn =
+                    sendto(fd, qpkt, qpkt_len, 0, (struct sockaddr *)&to,
+                           sizeof(to));
+                return sn == (ssize_t)qpkt_len ? DISLMDB_SUCCESS
+                                               : DISLMDB_ERR_NETWORK;
+            }
+            pthread_mutex_unlock(&ctx->lock);
+            if (ctx->transport == DISLMDB_TRANSPORT_QUIC) {
+                free(dgram);
+                return DISLMDB_ERR_NODE_UNREACHABLE;
+            }
+        }
+
         ssize_t sn = sendto(fd, dgram, total, 0, (struct sockaddr *)&to, sizeof(to));
         free(dgram);
         return sn == (ssize_t)total ? DISLMDB_SUCCESS : DISLMDB_ERR_NETWORK;
@@ -2074,57 +2277,161 @@ static void *network_thread(void *arg)
     DISLMDB_env *env = ctx->env;
 
     while (ctx->running) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        int maxfd = -1;
+        /*
+         * Wait backend: Darwin/BSD kqueue (EV_ONESHOT, rebuild each tick) or
+         * portable poll(). Both scale past FD_SETSIZE; rebuild keeps growable
+         * conn tables correct without sticky registration state.
+         */
+        pthread_mutex_lock(&ctx->lock);
+        int nslot = 3 + ctx->conn_cap;
+        int conn_cap_snap = ctx->conn_cap;
+        pthread_mutex_unlock(&ctx->lock);
+        struct pollfd *pfds = calloc((size_t)nslot, sizeof(*pfds));
+        if (!pfds) {
+            dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "pollfd alloc failed");
+            break;
+        }
+        int np = 0;
         if (ctx->listen_fd >= 0) {
-            FD_SET(ctx->listen_fd, &rfds);
-            maxfd = ctx->listen_fd;
+            pfds[np].fd = ctx->listen_fd;
+            pfds[np].events = POLLIN;
+            np++;
         }
         if (ctx->wake_r >= 0) {
-            FD_SET(ctx->wake_r, &rfds);
-            if (ctx->wake_r > maxfd) {
-                maxfd = ctx->wake_r;
-            }
+            pfds[np].fd = ctx->wake_r;
+            pfds[np].events = POLLIN;
+            np++;
         }
-
         pthread_mutex_lock(&ctx->lock);
         if (ctx->udp_fd >= 0) {
-            FD_SET(ctx->udp_fd, &rfds);
-            if (ctx->udp_fd > maxfd) {
-                maxfd = ctx->udp_fd;
-            }
+            pfds[np].fd = ctx->udp_fd;
+            pfds[np].events = POLLIN;
+            np++;
         }
-        for (int i = 0; i < ctx->conn_cap; i++) {
+        for (int i = 0; i < conn_cap_snap && i < ctx->conn_cap && np < nslot; i++) {
             /* Shared UDP socket is polled once above; skip per-conn UDP fds */
             if (ctx->connections[i].in_use && ctx->connections[i].fd >= 0 &&
                 ctx->connections[i].fd != ctx->udp_fd) {
-                FD_SET(ctx->connections[i].fd, &rfds);
-                if (ctx->connections[i].fd > maxfd) {
-                    maxfd = ctx->connections[i].fd;
-                }
+                pfds[np].fd = ctx->connections[i].fd;
+                pfds[np].events = POLLIN;
+                np++;
             }
         }
         pthread_mutex_unlock(&ctx->lock);
 
-        /* Short poll so shutdown cannot sit in select for a full second */
-        struct timeval tv = {.tv_sec = 0, .tv_usec = 250000};
-        int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
+        /* Short timeout so shutdown cannot sit in the wait for a full second */
+        int ready = 0;
+#if defined(__linux__)
+        if (ctx->uring && np > 0) {
+            int *fdlist = calloc((size_t)np, sizeof(int));
+            int *ready_fds = calloc((size_t)np, sizeof(int));
+            if (!fdlist || !ready_fds) {
+                free(fdlist);
+                free(ready_fds);
+                free(pfds);
+                dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "io_uring fdlist alloc failed");
+                break;
             }
-            dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "select failed: %s", strerror(errno));
-            break;
+            for (int i = 0; i < np; i++) {
+                fdlist[i] = pfds[i].fd;
+            }
+            int nready = 0;
+            ready = dislmdb_iouring_wait_readable(ctx->uring, fdlist, np, ready_fds,
+                                                  np, &nready, 250);
+            if (ready < 0) {
+                free(fdlist);
+                free(ready_fds);
+                free(pfds);
+                if (errno == EINTR) {
+                    continue;
+                }
+                dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "io_uring wait failed: %s",
+                            strerror(errno));
+                break;
+            }
+            for (int i = 0; i < nready; i++) {
+                int efd = ready_fds[i];
+                for (int j = 0; j < np; j++) {
+                    if (pfds[j].fd == efd) {
+                        pfds[j].revents = POLLIN;
+                        break;
+                    }
+                }
+            }
+            free(fdlist);
+            free(ready_fds);
+        } else
+#endif
+#if defined(DISLMDB_NET_HAS_KQUEUE)
+        if (ctx->kq >= 0 && np > 0) {
+            struct kevent *ch = calloc((size_t)np, sizeof(*ch));
+            struct kevent *ev = calloc((size_t)np, sizeof(*ev));
+            if (!ch || !ev) {
+                free(ch);
+                free(ev);
+                free(pfds);
+                dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "kevent alloc failed");
+                break;
+            }
+            for (int i = 0; i < np; i++) {
+                EV_SET(&ch[i], (uintptr_t)pfds[i].fd, EVFILT_READ,
+                       EV_ADD | EV_ENABLE | EV_ONESHOT, 0, 0, NULL);
+            }
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 250L * 1000L * 1000L};
+            ready = kevent(ctx->kq, ch, np, ev, np, &ts);
+            if (ready > 0) {
+                for (int i = 0; i < ready; i++) {
+                    int efd = (int)ev[i].ident;
+                    short rev = POLLIN;
+                    if (ev[i].flags & EV_ERROR) {
+                        rev = (short)(rev | POLLERR);
+                    }
+                    if (ev[i].flags & EV_EOF) {
+                        rev = (short)(rev | POLLHUP);
+                    }
+                    for (int j = 0; j < np; j++) {
+                        if (pfds[j].fd == efd) {
+                            pfds[j].revents = rev;
+                            break;
+                        }
+                    }
+                }
+            }
+            free(ch);
+            free(ev);
+            if (ready < 0) {
+                free(pfds);
+                if (errno == EINTR) {
+                    continue;
+                }
+                dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "kevent failed: %s",
+                            strerror(errno));
+                break;
+            }
+        } else
+#endif
+        {
+            ready = poll(pfds, (nfds_t)np, 250);
+            if (ready < 0) {
+                free(pfds);
+                if (errno == EINTR) {
+                    continue;
+                }
+                dislmdb_log(env, DISLMDB_LOG_ERROR, "NET", "poll failed: %s",
+                            strerror(errno));
+                break;
+            }
         }
         if (!ctx->running) {
+            free(pfds);
             break;
         }
-        if (ctx->wake_r >= 0 && FD_ISSET(ctx->wake_r, &rfds)) {
+        if (ctx->wake_r >= 0 && poll_readable(pfds, np, ctx->wake_r)) {
             uint8_t drain[64];
             while (read(ctx->wake_r, drain, sizeof(drain)) > 0) {
             }
             if (!ctx->running) {
+                free(pfds);
                 break;
             }
         }
@@ -2134,16 +2441,206 @@ static void *network_thread(void *arg)
          * block the net thread; processing UDP first keeps Raft elections
          * and AppendEntries flowing under BOTH+mTLS.
          */
-        if (ready > 0 && ctx->udp_fd >= 0 && FD_ISSET(ctx->udp_fd, &rfds)) {
+        if (ready > 0 && ctx->udp_fd >= 0 && poll_readable(pfds, np, ctx->udp_fd)) {
             uint8_t dgram[65536];
             struct sockaddr_in peer;
             socklen_t plen = sizeof(peer);
             ssize_t n = recvfrom(ctx->udp_fd, dgram, sizeof(dgram), 0,
                                  (struct sockaddr *)&peer, &plen);
-            if (n > (ssize_t)(NET_HEADER_WIRE_SIZE + NET_HMAC_SIZE)) {
+            bool skip_framed = false;
+            uint8_t quic_dqgm[2048];
+            size_t quic_dqgm_len = 0;
+            bool have_quic_dqgm = false;
+            if (n > 0) {
+                /*
+                 * QUIC long-header (not DQGM): Version Negotiation for foreign
+                 * versions; DISLMDB_QUIC_VERSION Initial → substrate handshake
+                 * reply (SH Initial + EE/Cert/CV/Fin Handshake). 1-RTT CRYPTO
+                 * may carry a DQGM envelope for the framed path below.
+                 */
+                dislmdb_quic_dgram_kind qk =
+                    dislmdb_quic_classify(dgram, (size_t)n);
+                if (qk == DISLMDB_QUIC_DGRAM_QUIC_LONG ||
+                    qk == DISLMDB_QUIC_DGRAM_VERSION_NEG ||
+                    qk == DISLMDB_QUIC_DGRAM_QUIC_SHORT) {
+                    if (qk == DISLMDB_QUIC_DGRAM_QUIC_LONG) {
+                        dislmdb_quic_long_header qh;
+                        if (dislmdb_quic_parse_long_header(dgram, (size_t)n,
+                                                           &qh) == 0) {
+                            if (qh.version != DISLMDB_QUIC_VERSION &&
+                                qh.version != DISLMDB_QUIC_VERSION_NEGOTIATION) {
+                                uint8_t vn[256];
+                                size_t vn_len = 0;
+                                if (dislmdb_quic_encode_version_negotiation(
+                                        &qh, vn, sizeof(vn), &vn_len) == 0 &&
+                                    vn_len > 0) {
+                                    (void)sendto(ctx->udp_fd, vn, vn_len, 0,
+                                                 (struct sockaddr *)&peer, plen);
+                                    pthread_mutex_lock(&ctx->lock);
+                                    ctx->stats.total_messages_sent++;
+                                    pthread_mutex_unlock(&ctx->lock);
+                                }
+                            } else if (qh.version == DISLMDB_QUIC_VERSION &&
+                                       qh.type == DISLMDB_QUIC_LONG_INITIAL) {
+                                pthread_mutex_lock(&ctx->lock);
+                                net_quic_pending *pend =
+                                    quic_pending_find_peer(ctx, &peer);
+                                if (pend && !pend->have_sh &&
+                                    (size_t)n <= sizeof(pend->server_initial)) {
+                                    memcpy(pend->server_initial, dgram, (size_t)n);
+                                    pend->server_initial_len = (size_t)n;
+                                    uint64_t spn = 0;
+                                    if (dislmdb_quic_open_initial_packet(
+                                            &pend->conn, false, dgram, (size_t)n,
+                                            &spn, pend->sh, sizeof(pend->sh),
+                                            &pend->sh_len) == 0 &&
+                                        pend->sh_len > 0) {
+                                        pend->have_sh = true;
+                                    }
+                                    pthread_mutex_unlock(&ctx->lock);
+                                } else {
+                                    pthread_mutex_unlock(&ctx->lock);
+                                    uint8_t ini[2048], hsp[8192];
+                                    size_t ini_len = 0, hsp_len = 0;
+                                    dislmdb_quic_conn qconn;
+                                    memset(&qconn, 0, sizeof(qconn));
+                                    if (dislmdb_quic_server_handle_initial(
+                                            dgram, (size_t)n, ini, sizeof(ini),
+                                            &ini_len, hsp, sizeof(hsp), &hsp_len,
+                                            &qconn, ctx->quic_identity) == 0) {
+                                        if (ini_len > 0) {
+                                            (void)sendto(ctx->udp_fd, ini, ini_len,
+                                                         0,
+                                                         (struct sockaddr *)&peer,
+                                                         plen);
+                                        }
+                                        if (hsp_len > 0) {
+                                            (void)sendto(ctx->udp_fd, hsp, hsp_len,
+                                                         0,
+                                                         (struct sockaddr *)&peer,
+                                                         plen);
+                                        }
+                                        pthread_mutex_lock(&ctx->lock);
+                                        (void)quic_session_store(ctx, &qconn,
+                                                                 &peer);
+                                        ctx->stats.total_messages_sent +=
+                                            (ini_len > 0 ? 1u : 0u) +
+                                            (hsp_len > 0 ? 1u : 0u);
+                                        pthread_mutex_unlock(&ctx->lock);
+                                    }
+                                }
+                            } else if (qh.version == DISLMDB_QUIC_VERSION &&
+                                       qh.type == DISLMDB_QUIC_LONG_HANDSHAKE) {
+                                pthread_mutex_lock(&ctx->lock);
+                                net_quic_pending *pend =
+                                    quic_pending_find_peer(ctx, &peer);
+                                if (pend && pend->have_sh) {
+                                    uint8_t cfin[512];
+                                    size_t cfin_len = 0;
+                                    const dislmdb_quic_tls_identity *trust =
+                                        ctx->quic_pki_strict ? ctx->quic_identity
+                                                            : NULL;
+                                    if (dislmdb_quic_client_complete_handshake(
+                                            &pend->conn, pend->ch, pend->ch_len,
+                                            pend->xpriv, pend->server_initial,
+                                            pend->server_initial_len, dgram,
+                                            (size_t)n, trust, cfin, sizeof(cfin),
+                                            &cfin_len) == 0) {
+                                        (void)quic_session_store(ctx, &pend->conn,
+                                                                 &peer);
+                                        char hello_id[64] = {0};
+                                        for (int ci = 0; ci < ctx->conn_cap;
+                                             ci++) {
+                                            if (!ctx->connections[ci].in_use) {
+                                                continue;
+                                            }
+                                            uint16_t lp =
+                                                ctx->connections[ci].listen_port
+                                                    ? ctx->connections[ci]
+                                                          .listen_port
+                                                    : ctx->connections[ci]
+                                                          .info.port;
+                                            if (lp == ntohs(peer.sin_port)) {
+                                                strncpy(
+                                                    hello_id,
+                                                    ctx->connections[ci]
+                                                        .info.node_id,
+                                                    sizeof(hello_id) - 1);
+                                                break;
+                                            }
+                                        }
+                                        pend->active = false;
+                                        dislmdb_quic_conn_reset(&pend->conn);
+                                        pthread_mutex_unlock(&ctx->lock);
+                                        if (cfin_len > 0) {
+                                            (void)sendto(ctx->udp_fd, cfin,
+                                                         cfin_len, 0,
+                                                         (struct sockaddr *)&peer,
+                                                         plen);
+                                        }
+                                        if (hello_id[0] != '\0') {
+                                            extern int dislmdb_pbft_send_hello(
+                                                DISLMDB_env *e, const char *t);
+                                            (void)dislmdb_pbft_send_hello(
+                                                ctx->env, hello_id);
+                                        }
+                                    } else {
+                                        pthread_mutex_unlock(&ctx->lock);
+                                    }
+                                } else {
+                                    pthread_mutex_unlock(&ctx->lock);
+                                }
+                            }
+                        }
+                    } else if (qk == DISLMDB_QUIC_DGRAM_QUIC_SHORT &&
+                               (size_t)n >= 1 + 8) {
+                        /* Try 8-byte DCID first (our server CIDs are 8 bytes). */
+                        size_t try_lens[] = {8, 4, 16, 20};
+                        net_quic_session *qs = NULL;
+                        pthread_mutex_lock(&ctx->lock);
+                        for (size_t ti = 0;
+                             ti < sizeof(try_lens) / sizeof(try_lens[0]); ti++) {
+                            if ((size_t)n < 1 + try_lens[ti] + 1 + 16) {
+                                continue;
+                            }
+                            qs = quic_session_find(ctx, dgram + 1, try_lens[ti]);
+                            if (qs) {
+                                break;
+                            }
+                        }
+                        if (qs) {
+                            uint64_t qpn = 0;
+                            uint8_t plain[2048];
+                            size_t plain_len = 0;
+                            bool from_client = qs->conn.is_server;
+                            if (dislmdb_quic_open_one_rtt_packet(
+                                    &qs->conn, from_client, dgram, (size_t)n, &qpn,
+                                    plain, sizeof(plain), &plain_len) == 0 &&
+                                plain_len > 0 && plain_len <= sizeof(quic_dqgm)) {
+                                qs->peer = peer;
+                                ctx->stats.total_messages_received++;
+                                memcpy(quic_dqgm, plain, plain_len);
+                                quic_dqgm_len = plain_len;
+                                have_quic_dqgm = true;
+                            }
+                        }
+                        pthread_mutex_unlock(&ctx->lock);
+                    }
+                    if (!have_quic_dqgm) {
+                        skip_framed = true;
+                    }
+                }
+            }
+            if (have_quic_dqgm ||
+                (!skip_framed &&
+                 n > (ssize_t)(NET_HEADER_WIRE_SIZE + NET_HMAC_SIZE))) {
                 /* Strip DQGM session envelope (v1/v2/v3 — ack on v3). */
-                const uint8_t *frame = dgram;
-                size_t frame_len = (size_t)n;
+                const uint8_t *dgram_body =
+                    have_quic_dqgm ? quic_dqgm : dgram;
+                size_t dgram_body_len =
+                    have_quic_dqgm ? quic_dqgm_len : (size_t)n;
+                const uint8_t *frame = dgram_body;
+                size_t frame_len = dgram_body_len;
                 bool has_dqgm = false;
                 bool has_pkt = false;
                 bool has_ack = false;
@@ -2152,35 +2649,34 @@ static void *network_thread(void *arg)
                 uint64_t dqgm_pkt = 0;
                 uint64_t dqgm_ack = 0;
                 if (frame_len >= DISLMDB_DGRAM_ENVELOPE_V1_SIZE &&
-                    dislmdb_read_u32(dgram) == DISLMDB_DQGM_MAGIC) {
-                    uint8_t ver = dgram[4];
-                    dqgm_flags = dgram[5];
+                    dislmdb_read_u32(dgram_body) == DISLMDB_DQGM_MAGIC) {
+                    uint8_t ver = dgram_body[4];
+                    dqgm_flags = dgram_body[5];
                     if (ver == 3 && frame_len >= DISLMDB_DGRAM_ENVELOPE_V3_SIZE) {
                         has_dqgm = true;
                         has_pkt = true;
                         has_ack = true;
-                        dqgm_cid = dislmdb_read_u64(dgram + 8);
-                        dqgm_pkt = dislmdb_read_u64(dgram + 16);
-                        dqgm_ack = dislmdb_read_u64(dgram + 24);
-                        frame = dgram + DISLMDB_DGRAM_ENVELOPE_V3_SIZE;
+                        dqgm_cid = dislmdb_read_u64(dgram_body + 8);
+                        dqgm_pkt = dislmdb_read_u64(dgram_body + 16);
+                        dqgm_ack = dislmdb_read_u64(dgram_body + 24);
+                        frame = dgram_body + DISLMDB_DGRAM_ENVELOPE_V3_SIZE;
                         frame_len -= DISLMDB_DGRAM_ENVELOPE_V3_SIZE;
-                    } else if (ver == 2 && frame_len >= DISLMDB_DGRAM_ENVELOPE_V2_SIZE) {
+                    } else if (ver == 2 &&
+                               frame_len >= DISLMDB_DGRAM_ENVELOPE_V2_SIZE) {
                         has_dqgm = true;
                         has_pkt = true;
-                        dqgm_cid = dislmdb_read_u64(dgram + 8);
-                        dqgm_pkt = dislmdb_read_u64(dgram + 16);
-                        frame = dgram + DISLMDB_DGRAM_ENVELOPE_V2_SIZE;
+                        dqgm_cid = dislmdb_read_u64(dgram_body + 8);
+                        dqgm_pkt = dislmdb_read_u64(dgram_body + 16);
+                        frame = dgram_body + DISLMDB_DGRAM_ENVELOPE_V2_SIZE;
                         frame_len -= DISLMDB_DGRAM_ENVELOPE_V2_SIZE;
                     } else if (ver == 1) {
                         has_dqgm = true;
-                        dqgm_cid = dislmdb_read_u64(dgram + 8);
-                        frame = dgram + DISLMDB_DGRAM_ENVELOPE_V1_SIZE;
+                        dqgm_cid = dislmdb_read_u64(dgram_body + 8);
+                        frame = dgram_body + DISLMDB_DGRAM_ENVELOPE_V1_SIZE;
                         frame_len -= DISLMDB_DGRAM_ENVELOPE_V1_SIZE;
                     }
                 }
-                if (frame_len <= (size_t)(NET_HEADER_WIRE_SIZE + NET_HMAC_SIZE)) {
-                    continue;
-                }
+                if (frame_len > (size_t)(NET_HEADER_WIRE_SIZE + NET_HMAC_SIZE)) {
                 /* In-memory framed parse from datagram */
                 DISLMDB_network_message msg;
                 memset(&msg, 0, sizeof(msg));
@@ -2384,10 +2880,11 @@ static void *network_thread(void *arg)
                     }
                     free(msg.payload);
                 }
+                } /* frame_len large enough */
             }
         }
 
-        if (ready > 0 && ctx->listen_fd >= 0 && FD_ISSET(ctx->listen_fd, &rfds)) {
+        if (ready > 0 && ctx->listen_fd >= 0 && poll_readable(pfds, np, ctx->listen_fd)) {
             struct sockaddr_in peer;
             socklen_t plen = sizeof(peer);
             int cfd = accept(ctx->listen_fd, (struct sockaddr *)&peer, &plen);
@@ -2445,8 +2942,8 @@ static void *network_thread(void *arg)
             if (fd < 0 || fd == ctx->udp_fd) {
                 continue;
             }
-            /* TLS may have app data buffered after TCP is drained — select alone misses it. */
-            bool sock_ready = (fd <= maxfd) && FD_ISSET(fd, &rfds);
+            /* TLS may have app data buffered after TCP is drained — poll alone misses it. */
+            bool sock_ready = poll_readable(pfds, np, fd);
             bool tls_ready = tls && dislmdb_mtls_pending(tls);
             if (!sock_ready && !tls_ready) {
                 continue;
@@ -2487,7 +2984,7 @@ static void *network_thread(void *arg)
             }
             free(msg.payload);
 
-            /* Drain remaining TLS app-data without waiting for select */
+            /* Drain remaining TLS app-data without waiting for poll */
             while (ctx->mtls_enabled) {
                 pthread_mutex_lock(&ctx->lock);
                 if (!ctx->connections[i].in_use) {
@@ -2532,6 +3029,7 @@ static void *network_thread(void *arg)
 
         /* After I/O so mTLS reconnect cannot starve datagram Raft. */
         send_heartbeats(ctx);
+        free(pfds);
     }
 
     return NULL;
@@ -2555,6 +3053,21 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
     ctx->udp_fd = -1;
     ctx->wake_r = -1;
     ctx->wake_w = -1;
+    ctx->kq = -1;
+    ctx->uring = NULL;
+#if defined(__linux__)
+    if (dislmdb_iouring_available()) {
+        ctx->uring = dislmdb_iouring_create(64);
+    }
+#endif
+#if defined(DISLMDB_NET_HAS_KQUEUE)
+    if (!ctx->uring) {
+        ctx->kq = kqueue();
+        if (ctx->kq < 0) {
+            ctx->kq = -1;
+        }
+    }
+#endif
     ctx->transport = config->transport;
     ctx->connections = calloc(NET_CONN_INITIAL, sizeof(net_connection));
     if (!ctx->connections) {
@@ -2646,6 +3159,24 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         ctx->mtls_enabled = true;
     }
 
+    ctx->quic_identity = NULL;
+    ctx->quic_pki_strict = false;
+    if (config->tls_cert_path[0] != '\0' && config->tls_key_path[0] != '\0') {
+        const char *ca = config->tls_ca_path[0] ? config->tls_ca_path
+                                                : config->tls_cert_path;
+        ctx->quic_identity = dislmdb_quic_tls_identity_load(
+            config->tls_cert_path, config->tls_key_path, ca);
+        ctx->quic_pki_strict = (ctx->quic_identity != NULL);
+    }
+    if (!ctx->quic_identity &&
+        (ctx->transport == DISLMDB_TRANSPORT_QUIC ||
+         ctx->transport == DISLMDB_TRANSPORT_BOTH ||
+         ctx->transport == DISLMDB_TRANSPORT_UDP)) {
+        /* Ephemeral self-signed when PEM not configured (peer TOFU). */
+        ctx->quic_identity =
+            dislmdb_quic_tls_identity_self_signed("dislmdb-quic");
+    }
+
     if (pthread_mutex_init(&ctx->lock, NULL) != 0) {
         if (ctx->mtls) {
             dislmdb_mtls_destroy(ctx->mtls);
@@ -2674,7 +3205,8 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
     bool want_tcp = (ctx->transport == DISLMDB_TRANSPORT_TCP ||
                      ctx->transport == DISLMDB_TRANSPORT_BOTH);
     bool want_udp = (ctx->transport == DISLMDB_TRANSPORT_UDP ||
-                     ctx->transport == DISLMDB_TRANSPORT_BOTH);
+                     ctx->transport == DISLMDB_TRANSPORT_BOTH ||
+                     ctx->transport == DISLMDB_TRANSPORT_QUIC);
 
 #define NET_INIT_FAIL(code)                                                       \
     do {                                                                          \
@@ -2787,7 +3319,7 @@ int dislmdb_network_shutdown(DISLMDB_env *env)
     network_context *ctx = env->network_context;
     ctx->running = false;
     env->network_running = false;
-    /* Kick select so join does not wait for the poll timeout */
+    /* Kick poll so join does not wait for the poll timeout */
     if (ctx->wake_w >= 0) {
         uint8_t b = 1;
         (void)write(ctx->wake_w, &b, 1);
@@ -2815,6 +3347,14 @@ int dislmdb_network_shutdown(DISLMDB_env *env)
     if (ctx->wake_w >= 0) {
         close(ctx->wake_w);
         ctx->wake_w = -1;
+    }
+    if (ctx->kq >= 0) {
+        close(ctx->kq);
+        ctx->kq = -1;
+    }
+    if (ctx->uring) {
+        dislmdb_iouring_destroy(ctx->uring);
+        ctx->uring = NULL;
     }
     pthread_mutex_unlock(&ctx->lock);
 
@@ -2869,7 +3409,7 @@ int dislmdb_network_send(DISLMDB_env *env,
             ctx->connections[idx].info.last_activity_time = dislmdb_get_time_ms();
         }
         pthread_mutex_unlock(&ctx->lock);
-        outbox_drain(ctx, idx);
+        outbox_drain(ctx, idx, 0);
         return rc;
     }
     /* Policy rejects must not be buffered — surface immediately. */
@@ -3031,7 +3571,7 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
         }
         pthread_mutex_unlock(&ctx->lock);
         if (rc == DISLMDB_SUCCESS) {
-            outbox_drain(ctx, idxs[i]);
+            outbox_drain(ctx, idxs[i], 0);
         }
     }
     return overall;
@@ -3178,7 +3718,8 @@ int dislmdb_network_connect(DISLMDB_env *env,
      *   TCP  → stream dial
      *   BOTH → dial TCP for reliable data; UDP listen already up for signalling
      */
-    bool udp = (ctx->transport == DISLMDB_TRANSPORT_UDP);
+    bool udp = (ctx->transport == DISLMDB_TRANSPORT_UDP ||
+                ctx->transport == DISLMDB_TRANSPORT_QUIC);
 
     /* Already connected / pending to this peer? */
     pthread_mutex_lock(&ctx->lock);
@@ -3342,8 +3883,38 @@ int dislmdb_network_connect(DISLMDB_env *env,
     peer_label[sizeof(peer_label) - 1] = '\0';
     pthread_mutex_unlock(&ctx->lock);
 
+    if (ctx->transport == DISLMDB_TRANSPORT_QUIC && ctx->udp_fd >= 0 &&
+        node_addr->port != 0) {
+        net_quic_pending pend;
+        memset(&pend, 0, sizeof(pend));
+        uint8_t dcid[8], scid[8], ipkt[512];
+        size_t ipkt_len = 0;
+        if (dislmdb_quic_client_start(&pend.conn, dcid, scid, pend.xpriv, pend.ch,
+                                      sizeof(pend.ch), &pend.ch_len, ipkt,
+                                      sizeof(ipkt), &ipkt_len) == 0) {
+            struct sockaddr_in to;
+            memset(&to, 0, sizeof(to));
+            to.sin_family = AF_INET;
+            to.sin_port = htons(node_addr->port);
+            if (inet_pton(AF_INET, node_addr->hostname, &to.sin_addr) == 1) {
+                pend.peer = to;
+                pend.active = true;
+                pthread_mutex_lock(&ctx->lock);
+                (void)quic_pending_store(ctx, &pend);
+                pthread_mutex_unlock(&ctx->lock);
+                (void)sendto(ctx->udp_fd, ipkt, ipkt_len, 0,
+                             (struct sockaddr *)&to, sizeof(to));
+            } else {
+                dislmdb_quic_conn_reset(&pend.conn);
+            }
+        }
+    }
+
     extern int dislmdb_pbft_send_hello(DISLMDB_env *env, const char *target_node_id);
-    (void)dislmdb_pbft_send_hello(env, peer_label);
+    /* QUIC: HELLO waits until 1-RTT session exists (see Handshake RX path). */
+    if (ctx->transport != DISLMDB_TRANSPORT_QUIC) {
+        (void)dislmdb_pbft_send_hello(env, peer_label);
+    }
     return DISLMDB_SUCCESS;
 }
 

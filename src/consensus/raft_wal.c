@@ -178,9 +178,144 @@ static void wal_on_log_truncate(uint64_t from_index, void *ud)
 
 #define RFSM_MAGIC 0x5246534du /* 'RFSM' */
 #define RFSM_VERSION 1u
+#define RFSM_MAX_DBIS 64u
 
-static int fsm_snapshot_kv(uint64_t last_included, uint8_t **out, size_t *out_len,
-                           void *ud)
+static bool fsm_is_internal_name(const char *name, size_t nlen)
+{
+    return nlen >= 2 && name[0] == '_' && name[1] == '_';
+}
+
+/** True if main-DB key is a named sub-DB root (must not dump as user KV). */
+static bool fsm_main_key_is_subdb(MDB_txn *txn, const MDB_val *k)
+{
+    if (!k || k->mv_size == 0 || k->mv_size >= 64 || !k->mv_data) {
+        return false;
+    }
+    char name[64];
+    memcpy(name, k->mv_data, k->mv_size);
+    name[k->mv_size] = '\0';
+    MDB_dbi sub;
+    return mdb_dbi_open(txn, name, 0, &sub) == 0;
+}
+
+/** Measure KV payload size for an open DBI (cursor walk). */
+static int fsm_measure_dbi(MDB_txn *txn, MDB_dbi dbi, bool skip_subdb_roots,
+                           size_t *need, uint32_t *count)
+{
+    MDB_cursor *cur = NULL;
+    if (mdb_cursor_open(txn, dbi, &cur) != 0) {
+        return -1;
+    }
+    uint32_t n = 0;
+    size_t bytes = 0;
+    MDB_val k, v;
+    int rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+    while (rc == 0) {
+        if (!(skip_subdb_roots && fsm_main_key_is_subdb(txn, &k))) {
+            bytes += 4 + k.mv_size + 4 + v.mv_size;
+            n++;
+        }
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+    mdb_cursor_close(cur);
+    *need += bytes;
+    *count = n;
+    return 0;
+}
+
+static int fsm_write_dbi(MDB_txn *txn, MDB_dbi dbi, bool skip_subdb_roots,
+                         uint8_t *buf, size_t *o, uint32_t kv_count)
+{
+    dislmdb_write_u32(buf + *o, kv_count);
+    *o += 4;
+    if (kv_count == 0) {
+        return 0;
+    }
+    MDB_cursor *cur = NULL;
+    if (mdb_cursor_open(txn, dbi, &cur) != 0) {
+        return -1;
+    }
+    MDB_val k, v;
+    int rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+    uint32_t written = 0;
+    while (rc == 0 && written < kv_count) {
+        if (!(skip_subdb_roots && fsm_main_key_is_subdb(txn, &k))) {
+            dislmdb_write_u32(buf + *o, (uint32_t)k.mv_size);
+            *o += 4;
+            memcpy(buf + *o, k.mv_data, k.mv_size);
+            *o += k.mv_size;
+            dislmdb_write_u32(buf + *o, (uint32_t)v.mv_size);
+            *o += 4;
+            memcpy(buf + *o, v.mv_data, v.mv_size);
+            *o += v.mv_size;
+            written++;
+        }
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+    mdb_cursor_close(cur);
+    return 0;
+}
+
+/**
+ * Collect unnamed + all named user DBIs (skip __* internal namespaces).
+ * names[i] empty string = unnamed main DB.
+ */
+static uint32_t fsm_collect_db_names(MDB_txn *txn, char names[][64], uint32_t cap)
+{
+    uint32_t n = 0;
+    if (n < cap) {
+        names[n][0] = '\0'; /* unnamed */
+        n++;
+    }
+    /* Prefer known app DBI. */
+    {
+        MDB_dbi dbi;
+        if (mdb_dbi_open(txn, "kv", 0, &dbi) == 0 && n < cap) {
+            strncpy(names[n], "kv", 63);
+            names[n][63] = '\0';
+            n++;
+        }
+    }
+    MDB_dbi main_dbi;
+    if (mdb_dbi_open(txn, NULL, 0, &main_dbi) != 0) {
+        return n;
+    }
+    MDB_cursor *cur = NULL;
+    if (mdb_cursor_open(txn, main_dbi, &cur) != 0) {
+        return n;
+    }
+    MDB_val k, v;
+    int rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+    while (rc == 0 && n < cap) {
+        if (k.mv_size > 0 && k.mv_size < 64 && k.mv_data) {
+            char name[64];
+            memcpy(name, k.mv_data, k.mv_size);
+            name[k.mv_size] = '\0';
+            if (!fsm_is_internal_name(name, k.mv_size)) {
+                MDB_dbi sub;
+                if (mdb_dbi_open(txn, name, 0, &sub) == 0) {
+                    bool dup = false;
+                    for (uint32_t i = 0; i < n; i++) {
+                        if (strcmp(names[i], name) == 0) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        memcpy(names[n], name, k.mv_size + 1);
+                        n++;
+                    }
+                }
+            }
+        }
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+    mdb_cursor_close(cur);
+    return n;
+}
+
+static int fsm_snapshot_all(uint64_t last_included, uint8_t **out, size_t *out_len,
+                            void *ud)
 {
     (void)last_included;
     DISLMDB_env *env = ud;
@@ -193,43 +328,31 @@ static int fsm_snapshot_kv(uint64_t last_included, uint8_t **out, size_t *out_le
     if (mdb_txn_begin(env->mdb_env, NULL, MDB_RDONLY, &txn) != 0) {
         return -1;
     }
-    MDB_dbi dbi;
-    int rc = mdb_dbi_open(txn, "kv", 0, &dbi);
-    if (rc == MDB_NOTFOUND) {
-        mdb_txn_abort(txn);
-        /* Empty FSM is still a valid snapshot. */
-        uint8_t *buf = malloc(12);
-        if (!buf) {
+    char names[RFSM_MAX_DBIS][64];
+    uint32_t db_count = fsm_collect_db_names(txn, names, RFSM_MAX_DBIS);
+    uint32_t counts[RFSM_MAX_DBIS];
+    memset(counts, 0, sizeof(counts));
+    size_t need = 12;
+    for (uint32_t i = 0; i < db_count; i++) {
+        size_t nlen = strnlen(names[i], 63);
+        need += 4 + nlen + 4; /* name_len + name + kv_count */
+        MDB_dbi dbi;
+        int orc = mdb_dbi_open(txn, nlen ? names[i] : NULL, 0, &dbi);
+        if (orc == MDB_NOTFOUND) {
+            counts[i] = 0;
+            continue;
+        }
+        if (orc != 0) {
+            mdb_txn_abort(txn);
             return -1;
         }
-        dislmdb_write_u32(buf, RFSM_MAGIC);
-        dislmdb_write_u32(buf + 4, RFSM_VERSION);
-        dislmdb_write_u32(buf + 8, 0);
-        *out = buf;
-        *out_len = 12;
-        return 0;
+        bool skip_roots = (nlen == 0);
+        if (fsm_measure_dbi(txn, dbi, skip_roots, &need, &counts[i]) != 0) {
+            mdb_txn_abort(txn);
+            return -1;
+        }
     }
-    if (rc != 0) {
-        mdb_txn_abort(txn);
-        return -1;
-    }
-    /* First pass: measure. */
-    size_t need = 12 + 4 + 2; /* hdr + name_len + "kv" + kv_count */
-    uint32_t kv_count = 0;
-    MDB_cursor *cur = NULL;
-    if (mdb_cursor_open(txn, dbi, &cur) != 0) {
-        mdb_txn_abort(txn);
-        return -1;
-    }
-    MDB_val k, v;
-    rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
-    while (rc == 0) {
-        need += 4 + k.mv_size + 4 + v.mv_size;
-        kv_count++;
-        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
-    }
-    mdb_cursor_close(cur);
-    uint8_t *buf = malloc(need);
+    uint8_t *buf = malloc(need ? need : 12);
     if (!buf) {
         mdb_txn_abort(txn);
         return -1;
@@ -237,32 +360,36 @@ static int fsm_snapshot_kv(uint64_t last_included, uint8_t **out, size_t *out_le
     size_t o = 0;
     dislmdb_write_u32(buf + o, RFSM_MAGIC); o += 4;
     dislmdb_write_u32(buf + o, RFSM_VERSION); o += 4;
-    dislmdb_write_u32(buf + o, 1); o += 4; /* one named DBI: kv */
-    dislmdb_write_u32(buf + o, 2); o += 4;
-    memcpy(buf + o, "kv", 2); o += 2;
-    dislmdb_write_u32(buf + o, kv_count); o += 4;
-    if (mdb_cursor_open(txn, dbi, &cur) != 0) {
-        free(buf);
-        mdb_txn_abort(txn);
-        return -1;
+    dislmdb_write_u32(buf + o, db_count); o += 4;
+    for (uint32_t i = 0; i < db_count; i++) {
+        size_t nlen = strnlen(names[i], 63);
+        dislmdb_write_u32(buf + o, (uint32_t)nlen); o += 4;
+        if (nlen) {
+            memcpy(buf + o, names[i], nlen);
+            o += nlen;
+        }
+        MDB_dbi dbi;
+        int orc = mdb_dbi_open(txn, nlen ? names[i] : NULL, 0, &dbi);
+        if (orc == MDB_NOTFOUND) {
+            dislmdb_write_u32(buf + o, 0); o += 4;
+            continue;
+        }
+        bool skip_roots = (nlen == 0);
+        if (orc != 0 ||
+            fsm_write_dbi(txn, dbi, skip_roots, buf, &o, counts[i]) != 0) {
+            free(buf);
+            mdb_txn_abort(txn);
+            return -1;
+        }
     }
-    rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
-    while (rc == 0) {
-        dislmdb_write_u32(buf + o, (uint32_t)k.mv_size); o += 4;
-        memcpy(buf + o, k.mv_data, k.mv_size); o += k.mv_size;
-        dislmdb_write_u32(buf + o, (uint32_t)v.mv_size); o += 4;
-        memcpy(buf + o, v.mv_data, v.mv_size); o += v.mv_size;
-        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
-    }
-    mdb_cursor_close(cur);
     mdb_txn_abort(txn);
     *out = buf;
     *out_len = o;
     return 0;
 }
 
-static int fsm_restore_kv(uint64_t last_included, uint64_t last_included_term,
-                          const uint8_t *data, size_t len, void *ud)
+static int fsm_restore_all(uint64_t last_included, uint64_t last_included_term,
+                           const uint8_t *data, size_t len, void *ud)
 {
     (void)last_included;
     (void)last_included_term;
@@ -295,7 +422,7 @@ static int fsm_restore_kv(uint64_t last_included, uint64_t last_included_term,
         name[nlen] = '\0';
         o += nlen;
         /* Skip internal / raft meta namespaces. */
-        if (nlen >= 2 && name[0] == '_' && name[1] == '_') {
+        if (fsm_is_internal_name(name, nlen)) {
             uint32_t kc = dislmdb_read_u32(data + o); o += 4;
             for (uint32_t i = 0; i < kc; i++) {
                 if (o + 4 > len) {
@@ -318,7 +445,7 @@ static int fsm_restore_kv(uint64_t last_included, uint64_t last_included_term,
             continue;
         }
         MDB_dbi dbi;
-        if (mdb_dbi_open(txn, name, MDB_CREATE, &dbi) != 0) {
+        if (mdb_dbi_open(txn, nlen ? name : NULL, MDB_CREATE, &dbi) != 0) {
             mdb_txn_abort(txn);
             return -1;
         }
@@ -372,7 +499,7 @@ int dislmdb_raft_wal_attach(DISLMDB_env *env, RaftNode *node)
     if (!env || !node) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    raft_set_fsm_hooks(node, fsm_snapshot_kv, fsm_restore_kv, env);
+    raft_set_fsm_hooks(node, fsm_snapshot_all, fsm_restore_all, env);
     if (!env->config.consensus.persist_state) {
         return DISLMDB_SUCCESS;
     }

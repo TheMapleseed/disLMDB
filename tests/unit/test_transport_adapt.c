@@ -5,6 +5,7 @@
 #include "../harness/test_harness.h"
 #include "dislmdb.h"
 #include "dislmdb_network.h"
+#include "dislmdb_quic.h"
 #include "dislmdb_internal.h"
 #include "dislmdb_crypto.h"
 
@@ -39,6 +40,16 @@ int main(void)
     EXPECT_EQ_INT(&ctx, "both_enum", (int)DISLMDB_TRANSPORT_BOTH, 2);
     EXPECT_EQ_INT(&ctx, "tcp_enum", (int)DISLMDB_TRANSPORT_TCP, 0);
     EXPECT_EQ_INT(&ctx, "udp_enum", (int)DISLMDB_TRANSPORT_UDP, 1);
+    EXPECT_EQ_INT(&ctx, "quic_enum", (int)DISLMDB_TRANSPORT_QUIC, 3);
+
+    /* QUIC stack_ready: open is no longer rejected at the transport gate.
+     * Full cluster dial still needs a writable path (skip mmap-heavy open here). */
+    {
+        EXPECT_TRUE(&ctx, "quic_ready", dislmdb_quic_stack_ready());
+        EXPECT_TRUE(&ctx, "quic_status",
+                    dislmdb_quic_status() != NULL &&
+                        dislmdb_quic_status()[0] != '\0');
+    }
 
     /* DQGM v1 layout (still accepted on receive) */
     uint8_t v1[DISLMDB_DGRAM_ENVELOPE_V1_SIZE];

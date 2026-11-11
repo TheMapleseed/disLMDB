@@ -1,6 +1,6 @@
 # DisLMDB TODO
 
-Last updated: 2026-11-10
+Last updated: 2026-11-11
 
 ## Status
 
@@ -33,13 +33,13 @@ scale still bounded by **latency / full-mesh fan-out** until Phase B hierarchy l
 | User KV / LMDB pages | `mdb.c` mmap (`data.mdb` / lockfile) | **Yes** — mmap’d B+tree; commit syncs meta (not a Postgres-style WAL) |
 | Meta: view, seq, replica list, shard_map | `dislmdb_persist.c` → meta DBI | **Yes** when `persist_state` |
 | Optional cluster key | meta DBI | Only if `persist_cluster_key` |
-| Raft log / matchIndex | `Enhanced-Raft-mechanism/raft.c` | **RAM only today** — restart rebuilds via catch-up / HELLO |
+| Raft hard state + log + snap meta | `__dislmdb_raft__` via `raft_wal.c` | **Yes** when Raft + `persist_state` (`raft_wal_sync_every`) |
+| matchIndex / volatile Raft | `Enhanced-Raft-mechanism/raft.c` | RAM — rebuilt from WAL + catch-up |
 | Network outbox / DQGM counters | `dislmdb_network.c` | RAM |
-| Checkpoint / `dislmdb_force_sync` | LMDB `mdb_env_sync` + persist_save | Explicit flush to disk |
+| Checkpoint / `dislmdb_force_sync` | LMDB `mdb_env_sync` + persist_save + WAL compact | Explicit flush to disk |
 
-So: **data is not “all RAM”** — LMDB is disk-backed mmap with sync/checkpoint.
-Consensus **log** still needs a durable Raft WAL for crash-safe leadership at scale.
-“Cooldown to disk” ≈ sync interval + checkpoint + (future) Raft snapshot/WAL.
+So: **data is not “all RAM”** — LMDB is disk-backed mmap; Raft durable state lives in
+`__dislmdb_raft__`. “Cooldown to disk” ≈ sync interval + checkpoint + WAL sync policy.
 
 ---
 
@@ -53,7 +53,7 @@ Goal: membership/network grow with topology; only latency/RTT budgets constrain 
 - [x] Cap policy becomes **soft**: `max_peers` / `DISLMDB_MAX_PEERS` (0 = unlimited)
 - [x] Persist replica set without fixed N packing limits (REPL v2 length-prefixed stream)
 - [x] Unit: `test_raft_peer_growth` past 64; IT: `test_topo_env`
-- [ ] Rig soak spawn to N≫64 / hash map peer id → slot
+- [x] Rig soak spawn to N≫64 (`test_raft_peer_growth` 512 peers)
 
 ### Phase B — Hierarchical consensus (latency-bound, not N² mesh)
 
@@ -115,9 +115,10 @@ Membership and crypto scoped by deployment env (never commit secrets).
 - [x] IT: `test_topo_modes` (mirror/shard/hybrid + flag persist)
 - [x] Owner resolve API (`dislmdb_topo_resolve_owner`) for app-level redirect
 - [x] Forward writes to owner: `dislmdb_topo_forward_put` / `_del` + FORWARD RPC (IT: `test_topo_forward`)
-- [ ] Proxy/redirect reads; auto-forward inside `dislmdb_put` when rejected (explicit API shipped)
-- [ ] Orb scenarios for mirror vs shard across “fake regions” (containers + env)
-- [ ] Explicit conflict policy for mirror (last-write / region priority)
+- [x] Auto-forward inside `dislmdb_put`/`dislmdb_del` when write-gated (`enable_auto_forward`, default on; requires connected owner)
+- [x] Proxy/redirect reads: `dislmdb_topo_forward_get` / `dislmdb_topo_get` (FWD_OP_GET)
+- [x] Orb scenarios for mirror vs shard across “fake regions” (`region_mirror` + `DISLMDB_REGION` in `run_orb.sh`)
+- [x] Explicit conflict policy for mirror (`DISLMDB_MIRROR_LAST_WRITE` / `REGION_PRIORITY` + primary region)
 
 ### Phase E — Dedicated DB namespace for regional metadata
 
@@ -127,7 +128,7 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 - [x] Replicate topo updates via consensus (`dislmdb_topo_map_publish` / TOPO blob)
 - [x] Stored under meta DBI key `peer_topo` (apps use named DBI / avoid collision)
 - [x] On boot: restore peer_topo + REPL stream into node table
-- [ ] Persist RTT EWMA samples in peer_topo (optional next)
+- [x] Persist RTT EWMA samples in peer_topo (v2 records + restore via `set_rtt_ewma`)
 
 ### Phase F — Durability for large / crashy clusters
 
@@ -138,15 +139,37 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 - [x] InstallSnapshot RPC (metadata): align `log_base` when follower `last_applied >= included`; reject if FSM dump still needed
 - [x] Chaos IT: `test_raft_wal_chaos` (checkpoint → kill leader → reelect → revive → catch-up)
 - [x] Full FSM blob on InstallSnapshot: `kv` DBI dump/restore hooks (`raft_set_fsm_hooks`)
-- [ ] Expand FSM snapshot beyond `kv` (multi-DBI / unnamed)
+- [x] Expand FSM snapshot beyond `kv` (unnamed + all non-`__*` named DBIs)
 
 ### Phase G — Concurrency (supports Phases A–B)
 
 - [x] Raft inbound queue: ELECTION + SYNC_REQUEST handled off the net thread
 - [x] mTLS handshake worker pool (`handshake_workers`, default 2; inline fallback)
-- [ ] Parallel per-peer send without starving net-thread RX
-- [ ] io_uring / kqueue path where available
-- [ ] Full QUIC / WebTransport (TLS 1.3 over UDP) atop DQGM
+- [x] Fair multi-peer outbox drain (round-robin, capped) — net-safe; no RX-starving worker join
+- [x] Net thread uses `poll()` (past `FD_SETSIZE`); per-fd wait helpers on `poll` too
+- [x] Darwin/BSD `kqueue` wait path (EV_ONESHOT rebuild; poll fallback)
+- [x] Linux `io_uring` POLL_ADD wait backend (`dislmdb_iouring_*`); net thread prefers it on Linux
+- [x] QUIC substrate: long-header parse/encode, CID map, version-negotiation on UDP probes
+- [x] `dislmdb_quic_stack_ready()` gates `TRANSPORT_QUIC` open (fail closed); unit `test_quic_substrate`
+- [x] QUIC Initial: HKDF secrets, AES-128-GCM AEAD, AES-ECB header protection, CRYPTO frames
+- [x] QUIC TLS 1.3 ClientHello/ServerHello + X25519 + Handshake/1-RTT key schedule
+- [x] QUIC Certificate/Finished verify + Handshake-plane AEAD packet path (open still gated)
+- [x] QUIC CertificateVerify (ECDSA P-256) encode/sign/verify
+- [x] QUIC server Initial driver on UDP path (SH + Handshake crypto flight)
+- [x] QUIC client handshake complete + 1-RTT short-header CRYPTO AEAD
+- [x] QUIC server session table on net thread (Initial store + 1-RTT open)
+- [x] 1-RTT CRYPTO → DQGM framed receive path + `client_start` dial helper
+- [x] QUIC 1-RTT send path (DQGM wrap when session exists)
+- [x] Client dial on net connect path + flip `stack_ready`
+- [x] QUIC CA/PKI CertificateVerify (X.509 PEM / self-signed; TOFU without CA)
+
+### Phase H — Product surface (post scale/QUIC)
+
+- [ ] `DISLMDB_BYTECODE_COMPRESS` (store/get path; flag already reserved)
+- [ ] Access-control layer (authz on put/get/admin; independent of transport crypto)
+- [ ] Language bindings (C ABI stable first; then one high-level binding)
+- [ ] Optional Prometheus HTTP scrape listener (or document sidecar-only forever)
+- [ ] QUIC IT: multi-node `TRANSPORT_QUIC` cluster smoke (beyond unit substrate)
 
 ---
 
@@ -159,12 +182,21 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 5. **B** regional Raft groups (drop global full mesh)  
 6. **F** Raft WAL/snapshots  
 7. **G** I/O parallelism + QUIC  
+8. **H** bytecode compress → ACL → bindings → scrape  
 
 ## Smaller follow-ups
 
-- [ ] Migrate remaining `raft_*` ITs onto `it_cluster.h`
-- [ ] Commit / push session work
-- [ ] Full QUIC stack (also under Phase G)
+- [x] Migrate integration `raft_*` ITs onto `it_cluster.h` (tcp/udp/both/mtls/fault/stage/membership/leave)
+- [x] Commit / push session work (Phase G QUIC + I/O)
+- [x] QUIC cert/Finished + Handshake packet AEAD (CH/SH + key schedule shipped)
+- [x] QUIC CertificateVerify (ECDSA P-256)
+- [x] Wire QUIC server Initial reply into net UDP path
+- [x] Client complete handshake + 1-RTT short-header packets
+- [x] Net-thread QUIC session table (server)
+- [x] DQGM-over-1-RTT receive + client_start
+- [x] QUIC 1-RTT send (DQGM wrap when session exists)
+- [x] Wire client dial into connect + flip `stack_ready`
+- [x] QUIC X.509 CertificateVerify (PEM load + self-signed + RSA/ECDSA)
 
 ## Done this pass (reference)
 
@@ -176,6 +208,23 @@ Store topology in LMDB (not only env), so peers learn maps after join:
 - Raft WAL + safe compact + InstallSnapshot (meta) + `test_raft_wal_chaos`
 - Heartbeat catch-up fix; voter vs learner AE lanes (`learner_ae_ms`)
 - Shard owner forward RPC (`dislmdb_topo_forward_put`/`_del`, `test_topo_forward`)
+- Auto-forward in `dislmdb_put`/`del` (`enable_auto_forward`, connected owner)
+- Shard read proxy (`dislmdb_topo_get` / `forward_get`, FWD_OP_GET)
+- Multi-DBI FSM snapshot; fair outbox drain; peer_topo RTT v2; mirror region_priority
+- Orb fake-region scenario; Raft peer soak 512; QUIC transport reserved
+- Net thread `poll()` (no `select`/`FD_SETSIZE`); mTLS wait on `poll` too
+- Darwin/BSD `kqueue` net wait (ONESHOT); integration `raft_*` ITs on `it_cluster.h`
+- QUIC open fail-closed + `lmdb_opened` so failed `env_open` is safely closeable
+- QUIC substrate module + UDP version-negotiation responder; `test_quic_substrate`
+- QUIC Initial AEAD/HP/CRYPTO + TLS1.3 CH/SH + HS/1-RTT keys; Linux io_uring wait
+- QUIC EE/Certificate/Finished verify + Handshake long-header AEAD/HP packet path
+- QUIC CertificateVerify (ECDSA-P256-SHA256) sign/verify + content builder
+- QUIC `server_handle_initial` + UDP hook; TRANSPORT_QUIC opens UDP when ready
+- QUIC client_complete_handshake + 1-RTT short-header build/open
+- QUIC server session table on UDP path (store after Initial, open 1-RTT)
+- 1-RTT CRYPTO → DQGM framed RX; `dislmdb_quic_client_start`
+- QUIC client dial on connect; `stack_ready` true (ephemeral ECDSA CV)
+- QUIC X.509 CertificateVerify (PEM / self-signed; strict CA when configured)
 - InstallSnapshot FSM dump/restore for `kv` (`raft_set_fsm_hooks`)
 - Phase G: Raft inbound queue (ELECTION/SYNC off net thread)
 - Phase G: mTLS handshake worker pool (`network.handshake_workers`)

@@ -80,6 +80,8 @@ rm_node() {
 
 start_node() {
   local id="$1" seed_flag="$2" join="${3:-}"
+  local region="${4:-}"
+  local topo="${5:-}"
   local hap
   hap="$(host_admin_port "$id")"
   rm_node "$id"
@@ -90,6 +92,8 @@ start_node() {
     --hostname "$id"
     -p "${hap}:19876"
     -v "${PREFIX}-${id}-data:/data"
+    -e "DISLMDB_REGION=${region:-orb-default}"
+    -e "DISLMDB_TOPOLOGY_MODE=${topo:-mirror}"
     "$IMAGE"
     --id "$id" --data /data --peer-port 9876 --admin-port 19876
     --transport "$transport"
@@ -102,7 +106,7 @@ start_node() {
   fi
   docker "${args[@]}" >/dev/null
   wait_ping "$id"
-  log "started $id (admin localhost:${hap})"
+  log "started $id (admin localhost:${hap} region=${region:-orb-default} topo=${topo:-mirror})"
 }
 
 cleanup() {
@@ -150,6 +154,14 @@ scenario_shard_affinity() {
   echo "  PASS  shard_affinity"
 }
 
+scenario_region_mirror() {
+  log "scenario region_mirror (fake regions via DISLMDB_REGION)"
+  ctl n0 PUT "region/mirror" ok | grep -q '^OK' || die "region put"
+  wait_get n1 "region/mirror" ok 8000
+  wait_get n2 "region/mirror" ok 8000
+  echo "  PASS  region_mirror"
+}
+
 DO_CLEAN=1
 
 main() {
@@ -171,9 +183,9 @@ main() {
     CTL="$ROOT/build/bin/orb_ctl"
   fi
 
-  start_node n0 1
-  start_node n1 0 "n0:9876"
-  start_node n2 0 "n0:9876"
+  start_node n0 1 "" "us-east" "mirror"
+  start_node n1 0 "n0:9876" "us-east" "mirror"
+  start_node n2 0 "n0:9876" "us-west" "mirror"
   # Mutual membership from seed
   ctl n0 JOIN n1 9876 n1 | grep -q '^OK' || die "join n1"
   ctl n0 JOIN n2 9876 n2 | grep -q '^OK' || die "join n2"
@@ -182,6 +194,7 @@ main() {
   scenario_replicate
   scenario_join_spawn
   scenario_shard_affinity
+  scenario_region_mirror
 
   log "Orb cluster scenarios PASSED"
 }

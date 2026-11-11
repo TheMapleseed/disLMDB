@@ -73,3 +73,11 @@ scenario shard_affinity {
     wait_get node="n1" key="shardA/item1" value="a1" timeout_ms=8000
     wait_get node="n2" key="shardB/item1" value="b1" timeout_ms=8000
 }
+
+// Fake-region soak: env overlays set by run_orb.sh (mirror vs shard labels).
+// Nodes still form one Raft/PBFT mesh; regions exercise dial affinity + topo env.
+scenario region_mirror {
+    put node="n0" key="region/mirror" value="ok"
+    wait_get node="n1" key="region/mirror" value="ok" timeout_ms=8000
+    wait_get node="n2" key="region/mirror" value="ok" timeout_ms=8000
+}

@@ -20,6 +20,7 @@
 #include "dislmdb_errors.h"
 #include "dislmdb_crypto.h"
 #include "dislmdb_network.h"
+#include "dislmdb_quic.h"
 #include "consensus/pbft_adapter.h"
 #include "consensus/raft_adapter.h"
 #include "../Enhanced-PBFT-mechanism/epdft.h"
@@ -154,7 +155,10 @@ static const DISLMDB_env_config default_env_config = {
     .has_region_key = false,
     .cross_region_key = {0},
     .has_cross_region_key = false,
-    .max_peers = 0 /* unlimited */
+    .max_peers = 0, /* unlimited */
+    .enable_auto_forward = true,
+    .mirror_conflict_policy = DISLMDB_MIRROR_LAST_WRITE,
+    .mirror_primary_region = {0}
 };
 
 const char *dislmdb_version(int *major, int *minor, int *patch)
@@ -389,6 +393,7 @@ static void env_open_cleanup(DISLMDB_env *env, bool close_mdb, bool stop_net, bo
     if (close_mdb && env->mdb_env) {
         mdb_env_close(env->mdb_env);
         env->mdb_env = NULL;
+        env->lmdb_opened = false;
     }
 }
 
@@ -469,6 +474,23 @@ static void apply_environ_overrides(DISLMDB_env *env)
         }
     }
 
+    const char *mcp = getenv("DISLMDB_MIRROR_CONFLICT");
+    if (mcp && mcp[0] != '\0') {
+        if (strcasecmp(mcp, "last_write") == 0 || strcasecmp(mcp, "last-write") == 0) {
+            env->config.mirror_conflict_policy = DISLMDB_MIRROR_LAST_WRITE;
+        } else if (strcasecmp(mcp, "region_priority") == 0 ||
+                   strcasecmp(mcp, "region-priority") == 0) {
+            env->config.mirror_conflict_policy = DISLMDB_MIRROR_REGION_PRIORITY;
+        }
+    }
+    const char *mpr = getenv("DISLMDB_MIRROR_PRIMARY_REGION");
+    if (mpr && mpr[0] != '\0') {
+        strncpy(env->config.mirror_primary_region, mpr,
+                sizeof(env->config.mirror_primary_region) - 1);
+        env->config.mirror_primary_region[sizeof(env->config.mirror_primary_region) - 1] =
+            '\0';
+    }
+
     const char *rtt = getenv("DISLMDB_RTT_BUDGET_MS");
     if (rtt && rtt[0] != '\0') {
         char *end = NULL;
@@ -541,6 +563,15 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
     }
     apply_environ_overrides(env);
 
+    if (env->config.network.transport == DISLMDB_TRANSPORT_QUIC) {
+        if (!dislmdb_quic_stack_ready()) {
+            dislmdb_set_error(env, DISLMDB_ERR_NOT_IMPLEMENTED,
+                              "DISLMDB_TRANSPORT_QUIC: %s", dislmdb_quic_status());
+            free_config_nodes(env);
+            return DISLMDB_ERR_NOT_IMPLEMENTED;
+        }
+    }
+
     /* Multi-node / BFT deployments must have a shared cluster key (fail closed). */
     bool multi = (env->config.network.node_count > 0) ||
                  (env->config.network.seed_node_count > 0) ||
@@ -579,6 +610,7 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
         free_config_nodes(env);
         return rc;
     }
+    env->lmdb_opened = true;
 
     /* Stable cluster identity BEFORE network/HELLO so peers learn the real id */
     if (env->config.node_name[0] != '\0' &&
@@ -710,7 +742,9 @@ void dislmdb_env_close(DISLMDB_env *env)
 
     dislmdb_log(env, DISLMDB_LOG_INFO, "ENV", "Closing environment");
 
-    (void)dislmdb_persist_save(env);
+    if (env->lmdb_opened) {
+        (void)dislmdb_persist_save(env);
+    }
 
     if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         if (env->consensus_context) {
@@ -732,6 +766,7 @@ void dislmdb_env_close(DISLMDB_env *env)
         mdb_env_close(env->mdb_env);
         env->mdb_env = NULL;
     }
+    env->lmdb_opened = false;
 
     destroy_mutexes(env);
     free(env->log_messages);
@@ -840,21 +875,23 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
 
     int rc = DISLMDB_SUCCESS;
     bool applied_via_consensus = false;
-    if (txn->is_write_txn && txn->is_distributed) {
+    /* Auto-forwarded puts/dels leave no local pending ops — skip consensus. */
+    bool has_local_ops = (txn->pending_ops != NULL && txn->operation_count > 0);
+    if (txn->is_write_txn && txn->is_distributed && has_local_ops) {
         if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
             rc = dislmdb_pbft_propose_transaction(txn);
             if (rc != DISLMDB_SUCCESS) {
                 dislmdb_set_error(env, rc, "Failed to achieve consensus for transaction");
                 return rc;
             }
-            applied_via_consensus = (txn->pending_ops != NULL && txn->operation_count > 0);
+            applied_via_consensus = true;
         } else if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
             rc = dislmdb_raft_propose_transaction(txn);
             if (rc != DISLMDB_SUCCESS) {
                 dislmdb_set_error(env, rc, "Failed to achieve Raft consensus for transaction");
                 return rc;
             }
-            applied_via_consensus = (txn->pending_ops != NULL && txn->operation_count > 0);
+            applied_via_consensus = true;
         } else {
             DISLMDB_operation op;
             memset(&op, 0, sizeof(op));

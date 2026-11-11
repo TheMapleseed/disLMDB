@@ -95,6 +95,34 @@ int main(void)
         dislmdb_env_close(env);
     }
 
+    /* --- mirror region_priority: non-primary region rejected --- */
+    {
+        reset_db();
+        DISLMDB_env *env = NULL;
+        int rc = dislmdb_env_create(&env);
+        EXPECT_EQ_INT(&ctx, "mrp_create", rc, 0);
+        DISLMDB_env_config cfg;
+        dislmdb_env_config_init(&cfg);
+        cfg.path = DBPATH;
+        cfg.mapsize = 4 * 1024 * 1024;
+        cfg.maxdbs = 8;
+        strncpy(cfg.node_name, "edge-west", sizeof(cfg.node_name) - 1);
+        cfg.network.local_port = 30915;
+        cfg.consensus.mechanism = DISLMDB_CONSENSUS_SOLO;
+        cfg.topology_mode = DISLMDB_TOPO_MIRROR;
+        cfg.mirror_conflict_policy = DISLMDB_MIRROR_REGION_PRIORITY;
+        strncpy(cfg.region, "us-west", sizeof(cfg.region) - 1);
+        strncpy(cfg.mirror_primary_region, "us-east",
+                sizeof(cfg.mirror_primary_region) - 1);
+        EXPECT_EQ_INT(&ctx, "mrp_open", dislmdb_env_open(env, &cfg), 0);
+        EXPECT_EQ_INT(&ctx, "mrp_rej", put_key(env, "prio/k", "v"),
+                      DISLMDB_ERR_OPERATION_REJECTED);
+        EXPECT_EQ_INT(&ctx, "mrp_writable",
+                      dislmdb_topo_key_writable(env, "prio/k", 6),
+                      DISLMDB_ERR_OPERATION_REJECTED);
+        dislmdb_env_close(env);
+    }
+
     /* --- shard: only owner may write matching keys --- */
     {
         reset_db();

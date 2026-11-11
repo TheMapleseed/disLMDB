@@ -91,8 +91,52 @@ int main(void)
                   0);
     EXPECT_EQ_INT(&ctx, "a_sees", it_wait_val(a, "owned/k", "via-fwd", 5000), 0);
 
+    {
+        void *got = NULL;
+        size_t glen = 0;
+        EXPECT_EQ_INT(&ctx, "fwd_get",
+                      dislmdb_topo_forward_get(b, "kv", "owned/k", 7, &got, &glen, 10000),
+                      0);
+        EXPECT_EQ_INT(&ctx, "fwd_get_len", (int)glen, 7);
+        EXPECT_TRUE(&ctx, "fwd_get_val",
+                    got && glen == 7 && memcmp(got, "via-fwd", 7) == 0);
+        free(got);
+        got = NULL;
+        glen = 0;
+        EXPECT_EQ_INT(&ctx, "topo_get",
+                      dislmdb_topo_get(b, "kv", "owned/k", 7, &got, &glen, 10000), 0);
+        EXPECT_TRUE(&ctx, "topo_get_val",
+                    got && glen == 7 && memcmp(got, "via-fwd", 7) == 0);
+        free(got);
+    }
+
     EXPECT_EQ_INT(&ctx, "fwd_del",
                   dislmdb_topo_forward_del(b, "kv", "owned/k", 7, 10000), 0);
+
+    /* Auto-forward: non-owner dislmdb_put/del reaches owner when peer is up.
+     * Owner apply may redirect to the current Raft leader — warm mesh first. */
+    it_mesh_warmup(envs, 2, 30);
+    int auto_rc = -1;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        auto_rc = it_put_kv(b, "owned/auto", "auto-v");
+        if (auto_rc == 0) {
+            break;
+        }
+        usleep(100 * 1000);
+        it_mesh_warmup(envs, 2, 10);
+    }
+    EXPECT_EQ_INT(&ctx, "auto_put", auto_rc, 0);
+    EXPECT_EQ_INT(&ctx, "a_sees_auto", it_wait_val(a, "owned/auto", "auto-v", 8000), 0);
+    {
+        DISLMDB_txn *txn = NULL;
+        EXPECT_EQ_INT(&ctx, "auto_del_begin", dislmdb_txn_begin(b, NULL, 0, &txn), 0);
+        MDB_dbi dbi;
+        EXPECT_EQ_INT(&ctx, "auto_del_dbi", dislmdb_dbi_open(txn, "kv", MDB_CREATE, &dbi),
+                      0);
+        MDB_val key = {.mv_size = 10, .mv_data = (void *)"owned/auto"};
+        EXPECT_EQ_INT(&ctx, "auto_del", dislmdb_del(txn, dbi, &key, NULL), 0);
+        EXPECT_EQ_INT(&ctx, "auto_del_commit", dislmdb_txn_commit(txn), 0);
+    }
 
     dislmdb_env_close(b);
     dislmdb_env_close(a);
