@@ -98,6 +98,10 @@ typedef struct DISLMDB_network_stats {
     uint64_t dqgm_session_rebind;    /**< Peer CID rebound (pkt_num==1 session restart) */
     uint64_t dqgm_ack_rx;            /**< Cumulative ACK fields observed (v3+) */
     uint64_t dqgm_ack_advance;       /**< Times peer ACK advanced our in-flight watermark */
+    /** Outbound reliability queue (TCP + UDP) */
+    uint64_t outbox_enqueued;        /**< Messages buffered for later send */
+    uint64_t outbox_drained;         /**< Buffered messages successfully sent */
+    uint64_t outbox_dropped;         /**< Dropped when per-peer queue was full */
 } DISLMDB_network_stats;
 
 /** @brief Callback for handling received messages */

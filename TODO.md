@@ -19,6 +19,8 @@ _None._
 | PBFT view-change IT | Pass |
 | Makefile `-MMD` header deps | Pass |
 | UDP peer-restart catch-up | Pass |
+| Per-peer outbox + sock buffers (TCP+UDP) | Pass |
+| raft_mtls BOTH+mTLS (50× stress) | Pass |
 
 ## Done this pass
 
@@ -31,11 +33,12 @@ _None._
 - [x] **`make check-orb`** — replicate + join_spawn + shard_affinity
 - [x] **DQGM v3 cumulative ACK** — `ack_num` in envelope; `dqgm_ack_rx` / `dqgm_ack_advance`
 - [x] Header `-Wnewline-eof` fixes (`dislmdb_network.h`, `dislmdb_internal.h`, `dislmdb_consensus.h`)
+- [x] **Per-peer outbox** (cap 32) + `SO_SNDBUF`/`SO_RCVBUF` on TCP and UDP
+- [x] **raft_mtls flake** — drain UDP before mTLS heartbeat; BOTH demotes TCP→UDP; TCP dial backoff
 
 ## Still unfinished — product / deferred
 
 - [ ] **Full QUIC / WebTransport stack** — TLS 1.3 over UDP (ngtcp2/quiche); DQGM is framing + CID + pkt_num + ACK + rebind + peer-restart
-- [ ] **raft_mtls occasional CONSENSUS_FAILED (1008)** — intermittent under sequential suite load; usually green on retry
 
 ## Hygiene
 

@@ -28,6 +28,15 @@
 #define NET_MAX_CONNECTIONS DISLMDB_MAX_NODES
 #define NET_HEADER_WIRE_SIZE 160
 #define NET_HMAC_SIZE DISLMDB_HMAC_SHA256_LENGTH
+/** Per-peer outbound queue — survives TCP CONNECTING / brief UDP misses. */
+#define NET_OUTBOX_CAP 32
+/** Kernel socket buffer for TCP and UDP (send + recv). */
+#define NET_SOCK_BUF_BYTES (256 * 1024)
+
+typedef struct net_outbox_slot {
+    bool in_use;
+    DISLMDB_network_message msg; /* owns payload copy */
+} net_outbox_slot;
 
 typedef struct net_connection {
     bool in_use;
@@ -43,8 +52,15 @@ typedef struct net_connection {
     bool peer_pkt_seen;      /* true once a v2+ pkt_num was accepted */
     uint64_t local_acked_pkt; /* highest cumulative ACK from peer (our pkts) */
     bool hello_reengage;     /* revived from CLOSED — HELLO should reply once */
+    uint64_t last_tcp_attempt_ms; /* rate-limit BOTH TCP dials while UDP lives */
+    net_outbox_slot outbox[NET_OUTBOX_CAP];
+    uint32_t outbox_head;    /* next to drain */
+    uint32_t outbox_count;
     DISLMDB_connection_info info;
 } net_connection;
+
+/** BOTH: avoid handshake thrash that stalls the net thread (starves UDP Raft). */
+#define NET_BOTH_TCP_RETRY_MS 2000u
 
 typedef struct network_context {
     DISLMDB_env *env;
@@ -81,12 +97,20 @@ static int set_nonblocking(int fd)
 /* Bound peer I/O so a half-open/dead TCP peer cannot stall the net thread. */
 #define NET_IO_TIMEOUT_MS 200
 
+static void prepare_sock_buffers(int fd)
+{
+    int buf = NET_SOCK_BUF_BYTES;
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+}
+
 static void prepare_tcp_fd(int fd)
 {
 #if defined(SO_NOSIGPIPE)
     int on = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 #endif
+    prepare_sock_buffers(fd);
     struct timeval tv;
     tv.tv_sec = NET_IO_TIMEOUT_MS / 1000;
     tv.tv_usec = (NET_IO_TIMEOUT_MS % 1000) * 1000;
@@ -284,10 +308,14 @@ static int find_conn_by_id(network_context *ctx, const char *node_id)
         /*
          * Rank by proven traffic, not outbound bit — a silent dialed socket
          * must not beat a busy accepted stream for the same peer.
+         * Prefer listen_port-bearing slots so BOTH signalling can use UDP.
          */
         uint64_t score = ctx->connections[i].info.last_activity_time;
         score += (uint64_t)ctx->connections[i].info.messages_sent * 10000ull;
         score += (uint64_t)ctx->connections[i].info.messages_received * 100ull;
+        if (ctx->connections[i].listen_port != 0) {
+            score += 500000ull;
+        }
         if (ctx->connections[i].outbound) {
             score += 1ull; /* weak tie-break only */
         }
@@ -347,6 +375,11 @@ static int pick_send_fd(network_context *ctx, int idx, DISLMDB_MESSAGE_TYPE type
         return -1;
     }
     int tcp = conn_tcp_fd(ctx, idx);
+    /* Never write on a half-open dial — fall through to UDP under BOTH. */
+    if (tcp >= 0 &&
+        ctx->connections[idx].info.state != DISLMDB_CONNECTION_CONNECTED) {
+        tcp = -1;
+    }
     int udp = conn_can_udp(ctx, idx) ? ctx->udp_fd : -1;
     int raw = ctx->connections[idx].fd;
 
@@ -449,12 +482,143 @@ static void ensure_io_lock(net_connection *c)
     }
 }
 
+static void outbox_clear(net_connection *c)
+{
+    for (uint32_t i = 0; i < NET_OUTBOX_CAP; i++) {
+        if (c->outbox[i].in_use) {
+            dislmdb_network_free_message(&c->outbox[i].msg);
+            c->outbox[i].in_use = false;
+        }
+    }
+    c->outbox_head = 0;
+    c->outbox_count = 0;
+}
+
+/** Deep-copy message into the peer outbox. Caller holds ctx->lock. */
+static int outbox_enqueue_locked(network_context *ctx, int idx,
+                                 const DISLMDB_network_message *message)
+{
+    if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use ||
+        !message) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    net_connection *c = &ctx->connections[idx];
+    if (c->outbox_count >= NET_OUTBOX_CAP) {
+        /* Drop oldest to make room — prefer fresher consensus/replication. */
+        uint32_t drop = c->outbox_head;
+        if (c->outbox[drop].in_use) {
+            dislmdb_network_free_message(&c->outbox[drop].msg);
+            c->outbox[drop].in_use = false;
+        }
+        c->outbox_head = (c->outbox_head + 1u) % NET_OUTBOX_CAP;
+        c->outbox_count--;
+        ctx->stats.outbox_dropped++;
+        ctx->stats.total_errors++;
+    }
+    uint32_t slot = (c->outbox_head + c->outbox_count) % NET_OUTBOX_CAP;
+    DISLMDB_network_message copy;
+    int rc = dislmdb_network_create_message(&copy, message->header.type,
+                                            message->payload,
+                                            message->header.payload_size,
+                                            message->header.target_id[0]
+                                                ? message->header.target_id
+                                                : NULL);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    copy.header = message->header;
+    copy.header.payload_size = message->header.payload_size;
+    /* create_message may clear sender; restore after */
+    strncpy(copy.header.sender_id, message->header.sender_id,
+            sizeof(copy.header.sender_id) - 1);
+    strncpy(copy.header.target_id, message->header.target_id,
+            sizeof(copy.header.target_id) - 1);
+    c->outbox[slot].msg = copy;
+    c->outbox[slot].in_use = true;
+    c->outbox_count++;
+    ctx->stats.outbox_enqueued++;
+    return DISLMDB_SUCCESS;
+}
+
+/**
+ * Drain as many buffered frames as the wire will take.
+ * Must NOT be called with ctx->lock held (write_framed_adapt may lock).
+ */
+static void outbox_drain(network_context *ctx, int idx)
+{
+    for (;;) {
+        DISLMDB_network_message msg;
+        bool have = false;
+        pthread_mutex_lock(&ctx->lock);
+        if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use ||
+            ctx->connections[idx].outbox_count == 0) {
+            pthread_mutex_unlock(&ctx->lock);
+            return;
+        }
+        net_connection *c = &ctx->connections[idx];
+        uint32_t head = c->outbox_head;
+        if (!c->outbox[head].in_use) {
+            c->outbox_head = (head + 1u) % NET_OUTBOX_CAP;
+            if (c->outbox_count > 0) {
+                c->outbox_count--;
+            }
+            pthread_mutex_unlock(&ctx->lock);
+            continue;
+        }
+        msg = c->outbox[head].msg;
+        c->outbox[head].in_use = false;
+        memset(&c->outbox[head].msg, 0, sizeof(c->outbox[head].msg));
+        c->outbox_head = (head + 1u) % NET_OUTBOX_CAP;
+        c->outbox_count--;
+        have = true;
+        pthread_mutex_unlock(&ctx->lock);
+        if (!have) {
+            return;
+        }
+        int used_fd = -1;
+        int rc = write_framed_adapt(ctx, idx, &msg, &used_fd);
+        if (rc != DISLMDB_SUCCESS) {
+            /* Put it back at the front and stop — path still not ready. */
+            pthread_mutex_lock(&ctx->lock);
+            if (ctx->connections[idx].in_use) {
+                net_connection *c2 = &ctx->connections[idx];
+                if (c2->outbox_count < NET_OUTBOX_CAP) {
+                    uint32_t new_head =
+                        (c2->outbox_head + NET_OUTBOX_CAP - 1u) % NET_OUTBOX_CAP;
+                    c2->outbox[new_head].msg = msg;
+                    c2->outbox[new_head].in_use = true;
+                    c2->outbox_head = new_head;
+                    c2->outbox_count++;
+                    msg.payload = NULL; /* ownership moved back */
+                } else {
+                    ctx->stats.outbox_dropped++;
+                }
+            }
+            pthread_mutex_unlock(&ctx->lock);
+            dislmdb_network_free_message(&msg);
+            return;
+        }
+        pthread_mutex_lock(&ctx->lock);
+        ctx->stats.outbox_drained++;
+        ctx->stats.total_messages_sent++;
+        ctx->stats.total_bytes_sent +=
+            NET_HEADER_WIRE_SIZE + msg.header.payload_size + NET_HMAC_SIZE;
+        if (ctx->connections[idx].in_use) {
+            ctx->connections[idx].info.messages_sent++;
+            ctx->connections[idx].info.last_activity_time = dislmdb_get_time_ms();
+        }
+        pthread_mutex_unlock(&ctx->lock);
+        dislmdb_network_free_message(&msg);
+    }
+}
+
 static int alloc_conn(network_context *ctx)
 {
     for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
         if (!ctx->connections[i].in_use) {
             bool had_lock = ctx->connections[i].io_lock_ready;
             pthread_mutex_t saved = ctx->connections[i].io_lock;
+            outbox_clear(&ctx->connections[i]);
             memset(&ctx->connections[i], 0, sizeof(ctx->connections[i]));
             if (had_lock) {
                 ctx->connections[i].io_lock = saved;
@@ -485,6 +649,36 @@ static uint32_t recount_active_connections_locked(const network_context *ctx)
     return n;
 }
 
+/**
+ * Drop TCP/TLS on a slot. Under BOTH, fall back to the shared UDP fd so
+ * Raft/election signalling keeps a CONNECTED path (outbox can drain).
+ * Returns true if the slot remained usable (UDP placeholder or kept).
+ */
+static bool demote_tcp_to_udp_locked(network_context *ctx, int idx)
+{
+    if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use) {
+        return false;
+    }
+    if (ctx->connections[idx].tls) {
+        dislmdb_mtls_session_close(ctx->connections[idx].tls);
+        ctx->connections[idx].tls = NULL;
+    } else if (ctx->connections[idx].fd >= 0 &&
+               ctx->connections[idx].fd != ctx->udp_fd) {
+        close(ctx->connections[idx].fd);
+    }
+    if (ctx->transport == DISLMDB_TRANSPORT_BOTH && ctx->udp_fd >= 0 &&
+        ctx->connections[idx].listen_port != 0 &&
+        ctx->connections[idx].info.hostname[0] != '\0') {
+        ctx->connections[idx].fd = ctx->udp_fd;
+        ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+        ctx->connections[idx].info.last_activity_time = dislmdb_get_time_ms();
+        ctx->stats.active_connections = recount_active_connections_locked(ctx);
+        return true;
+    }
+    ctx->connections[idx].fd = -1;
+    return false;
+}
+
 static void close_conn(network_context *ctx, int idx)
 {
     if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use) {
@@ -492,18 +686,11 @@ static void close_conn(network_context *ctx, int idx)
     }
     bool was_connected =
         (ctx->connections[idx].info.state == DISLMDB_CONNECTION_CONNECTED);
-    if (ctx->connections[idx].tls) {
-        dislmdb_mtls_session_close(ctx->connections[idx].tls);
-        ctx->connections[idx].tls = NULL;
-        ctx->connections[idx].fd = -1;
-    } else if (ctx->connections[idx].fd >= 0 &&
-               ctx->connections[idx].fd != ctx->udp_fd) {
-        close(ctx->connections[idx].fd);
-        ctx->connections[idx].fd = -1;
-    } else {
-        ctx->connections[idx].fd = -1;
+    if (demote_tcp_to_udp_locked(ctx, idx)) {
+        /* BOTH: UDP signalling stays up; TCP will re-dial on a backoff. */
+        return;
     }
-    /* Keep outbound slots for heartbeat-driven reconnect */
+    /* Keep outbound slots for heartbeat-driven reconnect (outbox survives). */
     if (ctx->connections[idx].outbound &&
         ctx->connections[idx].info.hostname[0] != '\0' &&
         ctx->connections[idx].listen_port != 0) {
@@ -515,6 +702,7 @@ static void close_conn(network_context *ctx, int idx)
         }
         return;
     }
+    outbox_clear(&ctx->connections[idx]);
     ctx->connections[idx].in_use = false;
     ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
     if (was_connected && ctx->stats.active_connections > 0) {
@@ -537,7 +725,8 @@ static int find_other_live_peer(network_context *ctx, int self_idx,
             ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTING) {
             continue;
         }
-        if (ctx->connections[i].fd < 0) {
+        /* UDP-only placeholders must not suppress a TCP dial under BOTH. */
+        if (conn_tcp_fd(ctx, i) < 0) {
             continue;
         }
         if (node_id && node_id[0] != '\0' &&
@@ -563,7 +752,14 @@ static int try_reconnect(network_context *ctx, int idx)
     /* Caller may hold ctx->lock — use nonblocking connect so a dead peer
      * cannot stall the network thread / serialize broadcasts. */
     net_connection *c = &ctx->connections[idx];
-    if (!c->in_use || !c->outbound || c->fd >= 0) {
+    if (!c->in_use || !c->outbound) {
+        return -1;
+    }
+    /* BOTH may already hold the shared udp_fd for signalling — still dial TCP. */
+    bool udp_placeholder =
+        (ctx->transport == DISLMDB_TRANSPORT_BOTH && ctx->udp_fd >= 0 &&
+         c->fd == ctx->udp_fd);
+    if (c->fd >= 0 && !udp_placeholder) {
         return -1;
     }
     if (c->info.hostname[0] == '\0' || c->listen_port == 0) {
@@ -574,6 +770,18 @@ static int try_reconnect(network_context *ctx, int idx)
     if (find_other_live_peer(ctx, idx, c->info.node_id, c->info.hostname,
                              c->listen_port) >= 0) {
         return -1;
+    }
+    /*
+     * BOTH + live UDP: rate-limit TCP/mTLS dials. Handshakes run on the net
+     * thread and otherwise starve datagram Raft for up to several seconds.
+     */
+    if (udp_placeholder) {
+        uint64_t now = dislmdb_get_time_ms();
+        if (c->last_tcp_attempt_ms != 0 &&
+            now - c->last_tcp_attempt_ms < NET_BOTH_TCP_RETRY_MS) {
+            return -1;
+        }
+        c->last_tcp_attempt_ms = now;
     }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -662,8 +870,15 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
         close(fd);
         pthread_mutex_lock(&ctx->lock);
         if (ctx->connections[idx].in_use) {
-            ctx->connections[idx].fd = -1;
-            ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            /* BOTH: fall back to UDP signalling rather than hard-close */
+            if (ctx->transport == DISLMDB_TRANSPORT_BOTH &&
+                ctx->connections[idx].listen_port != 0 && ctx->udp_fd >= 0) {
+                ctx->connections[idx].fd = ctx->udp_fd;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+            } else {
+                ctx->connections[idx].fd = -1;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            }
             ctx->stats.connection_failures++;
         }
         pthread_mutex_unlock(&ctx->lock);
@@ -682,8 +897,14 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
         if (find_other_live_peer(ctx, idx, ctx->connections[idx].info.node_id,
                                  ctx->connections[idx].info.hostname,
                                  ctx->connections[idx].listen_port) >= 0) {
-            ctx->connections[idx].fd = -1;
-            ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            if (ctx->transport == DISLMDB_TRANSPORT_BOTH &&
+                ctx->connections[idx].listen_port != 0 && ctx->udp_fd >= 0) {
+                ctx->connections[idx].fd = ctx->udp_fd;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+            } else {
+                ctx->connections[idx].fd = -1;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            }
             pthread_mutex_unlock(&ctx->lock);
             close(fd);
             return 0;
@@ -714,8 +935,14 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
         close(fd);
         pthread_mutex_lock(&ctx->lock);
         if (ctx->connections[idx].in_use) {
-            ctx->connections[idx].fd = -1;
-            ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            if (ctx->transport == DISLMDB_TRANSPORT_BOTH &&
+                ctx->connections[idx].listen_port != 0 && ctx->udp_fd >= 0) {
+                ctx->connections[idx].fd = ctx->udp_fd;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+            } else {
+                ctx->connections[idx].fd = -1;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            }
             ctx->stats.connection_failures++;
         }
         pthread_mutex_unlock(&ctx->lock);
@@ -738,9 +965,15 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
         close(fd);
         pthread_mutex_lock(&ctx->lock);
         if (ctx->connections[idx].in_use) {
-            ctx->connections[idx].fd = -1;
             ctx->connections[idx].tls = NULL;
-            ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            if (ctx->transport == DISLMDB_TRANSPORT_BOTH &&
+                ctx->connections[idx].listen_port != 0 && ctx->udp_fd >= 0) {
+                ctx->connections[idx].fd = ctx->udp_fd;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+            } else {
+                ctx->connections[idx].fd = -1;
+                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+            }
         }
         pthread_mutex_unlock(&ctx->lock);
         return 0;
@@ -752,7 +985,11 @@ static int finish_reconnect_mtls(network_context *ctx, int idx)
     ctx->connections[idx].info.connect_time = dislmdb_get_time_ms();
     ctx->connections[idx].info.last_activity_time = ctx->connections[idx].info.connect_time;
     ctx->stats.active_connections++;
+    bool drain = (ctx->connections[idx].outbox_count > 0);
     pthread_mutex_unlock(&ctx->lock);
+    if (drain) {
+        outbox_drain(ctx, idx);
+    }
     return 0;
 }
 
@@ -793,7 +1030,10 @@ static void send_heartbeats(network_context *ctx)
             (ctx->connections[i].fd < 0 ||
              (ctx->transport == DISLMDB_TRANSPORT_UDP &&
               ctx->connections[i].info.state == DISLMDB_CONNECTION_CLOSED &&
-              conn_can_udp(ctx, i)))) {
+              conn_can_udp(ctx, i)) ||
+             (ctx->transport == DISLMDB_TRANSPORT_BOTH &&
+              ctx->connections[i].fd == ctx->udp_fd &&
+              conn_tcp_fd(ctx, i) < 0 && conn_can_udp(ctx, i)))) {
             if (ctx->transport == DISLMDB_TRANSPORT_UDP && conn_can_udp(ctx, i)) {
                 if (ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTED ||
                     ctx->connections[i].fd < 0) {
@@ -818,7 +1058,24 @@ static void send_heartbeats(network_context *ctx)
                 }
                 continue;
             }
-            if (ctx->connections[i].fd < 0) {
+            /* BOTH UDP placeholder or fd<0: keep signalling, optionally dial TCP. */
+            if (ctx->transport == DISLMDB_TRANSPORT_BOTH && conn_can_udp(ctx, i) &&
+                (ctx->connections[i].fd < 0 ||
+                 ctx->connections[i].fd == ctx->udp_fd)) {
+                if (ctx->connections[i].info.state != DISLMDB_CONNECTION_CONNECTED) {
+                    ctx->connections[i].info.state = DISLMDB_CONNECTION_CONNECTED;
+                    ctx->connections[i].fd = ctx->udp_fd;
+                    ctx->connections[i].hello_reengage = true;
+                    ctx->stats.active_connections =
+                        recount_active_connections_locked(ctx);
+                }
+                if (n_send < NET_MAX_CONNECTIONS) {
+                    send_idx[n_send++] = i;
+                }
+            }
+            if (ctx->connections[i].fd < 0 ||
+                (ctx->transport == DISLMDB_TRANSPORT_BOTH &&
+                 ctx->connections[i].fd == ctx->udp_fd)) {
                 int tr = try_reconnect(ctx, i);
                 if (tr == 1 && n_pending < NET_MAX_CONNECTIONS) {
                     pending_mtls[n_pending++] = i;
@@ -835,9 +1092,10 @@ static void send_heartbeats(network_context *ctx)
         if (ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTING) {
             continue; /* finish_reconnect_mtls handles these */
         }
-        /* Stale-close TCP/BOTH streams only — pure UDP stays connectionless. */
+        /* Stale-close TCP streams only — BOTH demotes to UDP (see close_conn). */
         if (ctx->connections[i].outbound &&
             ctx->transport != DISLMDB_TRANSPORT_UDP &&
+            conn_tcp_fd(ctx, i) >= 0 &&
             ctx->connections[i].info.last_activity_time > 0 &&
             now - ctx->connections[i].info.last_activity_time > stale_limit) {
             close_conn(ctx, i);
@@ -878,7 +1136,14 @@ static void send_heartbeats(network_context *ctx)
                 } else {
                     hb.header.target_id[0] = '\0';
                 }
-                (void)write_framed_adapt(ctx, send_idx[i], &hb, NULL);
+                if (write_framed_adapt(ctx, send_idx[i], &hb, NULL) == DISLMDB_SUCCESS) {
+                    pthread_mutex_lock(&ctx->lock);
+                    if (ctx->connections[send_idx[i]].in_use) {
+                        ctx->connections[send_idx[i]].info.last_activity_time =
+                            dislmdb_get_time_ms();
+                    }
+                    pthread_mutex_unlock(&ctx->lock);
+                }
             }
             dislmdb_network_free_message(&hb);
         }
@@ -887,6 +1152,21 @@ static void send_heartbeats(network_context *ctx)
     extern int dislmdb_pbft_send_hello(DISLMDB_env *e, const char *t);
     for (int i = 0; i < n_hello; i++) {
         (void)dislmdb_pbft_send_hello(env, reconnect_labels[i]);
+    }
+
+    /* Drain per-peer outboxes now that reconnect / heartbeats ran. */
+    int drain_idx[NET_MAX_CONNECTIONS];
+    int n_drain = 0;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        if (ctx->connections[i].in_use && ctx->connections[i].outbox_count > 0 &&
+            n_drain < NET_MAX_CONNECTIONS) {
+            drain_idx[n_drain++] = i;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    for (int i = 0; i < n_drain; i++) {
+        outbox_drain(ctx, drain_idx[i]);
     }
 }
 
@@ -1216,15 +1496,13 @@ static void *network_thread(void *arg)
                 break;
             }
         }
-        if (ready == 0) {
-            send_heartbeats(ctx);
-            continue;
-        }
 
-        /* Opportunistic heartbeat even when traffic is present */
-        send_heartbeats(ctx);
-
-        if (ctx->udp_fd >= 0 && FD_ISSET(ctx->udp_fd, &rfds)) {
+        /*
+         * Drain ready sockets BEFORE heartbeats / mTLS reconnect. Handshakes
+         * block the net thread; processing UDP first keeps Raft elections
+         * and AppendEntries flowing under BOTH+mTLS.
+         */
+        if (ready > 0 && ctx->udp_fd >= 0 && FD_ISSET(ctx->udp_fd, &rfds)) {
             uint8_t dgram[65536];
             struct sockaddr_in peer;
             socklen_t plen = sizeof(peer);
@@ -1457,7 +1735,7 @@ static void *network_thread(void *arg)
             }
         }
 
-        if (ctx->listen_fd >= 0 && FD_ISSET(ctx->listen_fd, &rfds)) {
+        if (ready > 0 && ctx->listen_fd >= 0 && FD_ISSET(ctx->listen_fd, &rfds)) {
             struct sockaddr_in peer;
             socklen_t plen = sizeof(peer);
             int cfd = accept(ctx->listen_fd, (struct sockaddr *)&peer, &plen);
@@ -1619,6 +1897,9 @@ static void *network_thread(void *arg)
                 free(msg.payload);
             }
         }
+
+        /* After I/O so mTLS reconnect cannot starve datagram Raft. */
+        send_heartbeats(ctx);
     }
 
     return NULL;
@@ -1769,6 +2050,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         }
         int on = 1;
         setsockopt(ufd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        prepare_sock_buffers(ufd);
         /* UDP may share the same port as TCP on most stacks */
         if (bind(ufd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             close(ufd);
@@ -1947,18 +2229,31 @@ int dislmdb_network_send(DISLMDB_env *env,
             ctx->connections[idx].info.messages_sent++;
             ctx->connections[idx].info.bytes_sent +=
                 NET_HEADER_WIRE_SIZE + msg.header.payload_size + NET_HMAC_SIZE;
+            ctx->connections[idx].info.last_activity_time = dislmdb_get_time_ms();
         }
         pthread_mutex_unlock(&ctx->lock);
-    } else {
-        /* Only tear down a failed TCP stream — UDP misses must not drop the peer. */
-        pthread_mutex_lock(&ctx->lock);
-        if (idx >= 0 && ctx->connections[idx].in_use &&
-            used_fd >= 0 && used_fd != ctx->udp_fd &&
+        outbox_drain(ctx, idx);
+        return rc;
+    }
+    /* Buffer for later drain (TCP CONNECTING / transient UDP miss). */
+    pthread_mutex_lock(&ctx->lock);
+    int eq = outbox_enqueue_locked(ctx, idx, &msg);
+    if (eq == DISLMDB_SUCCESS) {
+        /* Keep a broken TCP stream for reconnect, but do not drop the peer. */
+        if (used_fd >= 0 && used_fd != ctx->udp_fd &&
+            ctx->connections[idx].in_use &&
             ctx->connections[idx].fd == used_fd) {
             close_conn(ctx, idx);
         }
         pthread_mutex_unlock(&ctx->lock);
+        return DISLMDB_SUCCESS;
     }
+    if (idx >= 0 && ctx->connections[idx].in_use &&
+        used_fd >= 0 && used_fd != ctx->udp_fd &&
+        ctx->connections[idx].fd == used_fd) {
+        close_conn(ctx, idx);
+    }
+    pthread_mutex_unlock(&ctx->lock);
     return rc;
 }
 
@@ -2019,12 +2314,18 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
         if (idx < 0) {
             continue;
         }
-        if (ctx->connections[idx].info.state == DISLMDB_CONNECTION_CLOSED ||
-            ctx->connections[idx].info.state == DISLMDB_CONNECTION_CONNECTING ||
-            ctx->connections[idx].info.state == DISLMDB_CONNECTION_DISCONNECTING) {
+        /* CONNECTING/CLOSED outbound still get outbox entries for later drain. */
+        if (ctx->connections[idx].info.state == DISLMDB_CONNECTION_DISCONNECTING) {
             continue;
         }
-        if (ctx->connections[idx].fd < 0 && !conn_can_udp(ctx, idx)) {
+        bool wire_ready =
+            (ctx->connections[idx].info.state == DISLMDB_CONNECTION_CONNECTED) &&
+            (ctx->connections[idx].fd >= 0 || conn_can_udp(ctx, idx));
+        bool can_buffer =
+            ctx->connections[idx].outbound ||
+            ctx->connections[idx].info.state == DISLMDB_CONNECTION_CONNECTED ||
+            conn_can_udp(ctx, idx);
+        if (!wire_ready && !can_buffer) {
             continue;
         }
         idxs[n] = idx;
@@ -2042,16 +2343,41 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
         if (ids[i][0] != '\0') {
             strncpy(msg.header.target_id, ids[i], sizeof(msg.header.target_id) - 1);
         }
+        bool defer = false;
+        pthread_mutex_lock(&ctx->lock);
+        if (idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+            ctx->connections[idxs[i]].in_use &&
+            ctx->connections[idxs[i]].info.state != DISLMDB_CONNECTION_CONNECTED) {
+            defer = true;
+        }
+        pthread_mutex_unlock(&ctx->lock);
+        if (defer) {
+            pthread_mutex_lock(&ctx->lock);
+            if (outbox_enqueue_locked(ctx, idxs[i], &msg) != DISLMDB_SUCCESS) {
+                overall = DISLMDB_ERR_NETWORK;
+            }
+            pthread_mutex_unlock(&ctx->lock);
+            continue;
+        }
         int used_fd = -1;
         int rc = write_framed_adapt(ctx, idxs[i], &msg, &used_fd);
         pthread_mutex_lock(&ctx->lock);
         if (rc != DISLMDB_SUCCESS) {
-            overall = rc;
-            if (used_fd >= 0 && used_fd != ctx->udp_fd &&
-                idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
-                ctx->connections[idxs[i]].in_use &&
-                ctx->connections[idxs[i]].fd == used_fd) {
-                close_conn(ctx, idxs[i]);
+            if (outbox_enqueue_locked(ctx, idxs[i], &msg) == DISLMDB_SUCCESS) {
+                if (used_fd >= 0 && used_fd != ctx->udp_fd &&
+                    idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+                    ctx->connections[idxs[i]].in_use &&
+                    ctx->connections[idxs[i]].fd == used_fd) {
+                    close_conn(ctx, idxs[i]);
+                }
+            } else {
+                overall = rc;
+                if (used_fd >= 0 && used_fd != ctx->udp_fd &&
+                    idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+                    ctx->connections[idxs[i]].in_use &&
+                    ctx->connections[idxs[i]].fd == used_fd) {
+                    close_conn(ctx, idxs[i]);
+                }
             }
         } else {
             ctx->stats.total_messages_sent++;
@@ -2062,6 +2388,9 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
             }
         }
         pthread_mutex_unlock(&ctx->lock);
+        if (rc == DISLMDB_SUCCESS) {
+            outbox_drain(ctx, idxs[i]);
+        }
     }
     return overall;
 }
@@ -2212,10 +2541,19 @@ int dislmdb_network_connect(DISLMDB_env *env,
     /* Already connected / pending to this peer? */
     pthread_mutex_lock(&ctx->lock);
     int existing = find_conn_by_id(ctx, node_addr->node_id);
-    if (existing >= 0 && ctx->connections[existing].fd >= 0 &&
+    if (existing >= 0 &&
         ctx->connections[existing].info.state == DISLMDB_CONNECTION_CONNECTED) {
-        pthread_mutex_unlock(&ctx->lock);
-        return DISLMDB_SUCCESS;
+        bool have_tcp = conn_tcp_fd(ctx, existing) >= 0;
+        /*
+         * BOTH needs a real TCP stream for the data lane. A UDP-only
+         * CONNECTED slot (fd == udp_fd) must not suppress the TCP dial.
+         */
+        if (udp || have_tcp ||
+            (ctx->transport == DISLMDB_TRANSPORT_TCP &&
+             ctx->connections[existing].fd >= 0)) {
+            pthread_mutex_unlock(&ctx->lock);
+            return DISLMDB_SUCCESS;
+        }
     }
     pthread_mutex_unlock(&ctx->lock);
 
@@ -2260,15 +2598,26 @@ int dislmdb_network_connect(DISLMDB_env *env,
             if (idx >= 0) {
                 ctx->connections[idx].in_use = true;
                 ctx->connections[idx].outbound = true;
-                ctx->connections[idx].fd = -1;
                 ctx->connections[idx].tls = NULL;
                 ctx->connections[idx].listen_port = node_addr->port;
-                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
                 strncpy(ctx->connections[idx].info.node_id, node_addr->node_id,
                         sizeof(ctx->connections[idx].info.node_id) - 1);
                 strncpy(ctx->connections[idx].info.hostname, node_addr->hostname,
                         sizeof(ctx->connections[idx].info.hostname) - 1);
                 ctx->connections[idx].info.port = node_addr->port;
+                /* BOTH: keep UDP signalling CONNECTED so Raft never waits on TCP. */
+                if (ctx->transport == DISLMDB_TRANSPORT_BOTH && ctx->udp_fd >= 0 &&
+                    node_addr->port != 0) {
+                    ctx->connections[idx].fd = ctx->udp_fd;
+                    ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+                    ctx->connections[idx].info.last_activity_time =
+                        dislmdb_get_time_ms();
+                    ctx->stats.active_connections =
+                        recount_active_connections_locked(ctx);
+                } else {
+                    ctx->connections[idx].fd = -1;
+                    ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+                }
             }
             pthread_mutex_unlock(&ctx->lock);
             return DISLMDB_SUCCESS; /* deferred reconnect */
@@ -2289,15 +2638,25 @@ int dislmdb_network_connect(DISLMDB_env *env,
             if (idx >= 0) {
                 ctx->connections[idx].in_use = true;
                 ctx->connections[idx].outbound = true;
-                ctx->connections[idx].fd = -1;
                 ctx->connections[idx].tls = NULL;
                 ctx->connections[idx].listen_port = node_addr->port;
-                ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
                 strncpy(ctx->connections[idx].info.node_id, node_addr->node_id,
                         sizeof(ctx->connections[idx].info.node_id) - 1);
                 strncpy(ctx->connections[idx].info.hostname, node_addr->hostname,
                         sizeof(ctx->connections[idx].info.hostname) - 1);
                 ctx->connections[idx].info.port = node_addr->port;
+                if (ctx->transport == DISLMDB_TRANSPORT_BOTH && ctx->udp_fd >= 0 &&
+                    node_addr->port != 0) {
+                    ctx->connections[idx].fd = ctx->udp_fd;
+                    ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
+                    ctx->connections[idx].info.last_activity_time =
+                        dislmdb_get_time_ms();
+                    ctx->stats.active_connections =
+                        recount_active_connections_locked(ctx);
+                } else {
+                    ctx->connections[idx].fd = -1;
+                    ctx->connections[idx].info.state = DISLMDB_CONNECTION_CLOSED;
+                }
             }
             pthread_mutex_unlock(&ctx->lock);
             return DISLMDB_SUCCESS; /* deferred reconnect */

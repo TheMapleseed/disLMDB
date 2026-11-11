@@ -34,7 +34,13 @@ static void raft_outbound(const RaftMessage *msg, void *user_data)
         return;
     }
     DISLMDB_network_message nm;
-    if (dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_ELECTION, wire, (uint32_t)wire_len,
+    /*
+     * All Raft frames use ELECTION (UDP under BOTH) until TCP upgrade under
+     * mTLS is proven not to strand CONNECTING slots. Commit visibility is
+     * ensured by advance_commit() → immediate empty AppendEntries.
+     */
+    if (dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_ELECTION, wire,
+                                       (uint32_t)wire_len,
                                        msg->to[0] ? msg->to : NULL) == DISLMDB_SUCCESS) {
         strncpy(nm.header.sender_id, msg->from, sizeof(nm.header.sender_id) - 1);
         if (msg->to[0] != '\0') {

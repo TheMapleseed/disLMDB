@@ -114,6 +114,7 @@ static int wait_val(DISLMDB_env *env, const char *k, const char *expect, int ms)
 {
     int w = 0;
     while (w < ms) {
+        (void)dislmdb_force_sync(env);
         DISLMDB_txn *txn = NULL;
         if (dislmdb_txn_begin(env, NULL, MDB_RDONLY, &txn) == 0) {
             MDB_dbi dbi;

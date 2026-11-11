@@ -408,6 +408,8 @@ static void apply_committed(RaftNode *n)
     }
 }
 
+static void broadcast_append(RaftNode *n, bool heartbeat_only);
+
 static void advance_commit(RaftNode *n)
 {
     if (n->role != RAFT_LEADER) {
@@ -420,6 +422,13 @@ static void advance_commit(RaftNode *n)
         if (entry_committed_by_quorum(n, N)) {
             n->commit_index = N;
             apply_committed(n);
+            /*
+             * Push the new leader_commit immediately. Followers only apply
+             * up to the commit index carried on AppendEntries; waiting for
+             * the next heartbeat window leaves a visible lag (and flakes
+             * under BOTH/mTLS when heartbeats contend with TCP upgrade).
+             */
+            broadcast_append(n, true);
             break;
         }
     }
