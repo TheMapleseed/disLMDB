@@ -1,6 +1,6 @@
 # DisLMDB: Distributed Lightning Memory-Mapped Database
 
-DisLMDB extends [LMDB](https://symas.com/lmdb/) with multi-node replication: Raft or Enhanced-PBFT consensus, TCP/UDP/BOTH transports, mTLS 1.3, and HMAC/AEAD cluster crypto. Storage remains LMDB’s mmap’d B+tree; consensus logs are in-memory today (see durability notes below).
+DisLMDB extends [LMDB](https://symas.com/lmdb/) with multi-node replication: Raft or Enhanced-PBFT consensus, TCP/UDP/BOTH transports, mTLS 1.3, and layered crypto (transport HMAC/AEAD + optional mTLS; PBFT digests/MACs via Time-Variant BLAKE3). Storage remains LMDB’s mmap’d B+tree; see durability notes below.
 
 Proprietary software — The Mapleseed Inc. Commercial license required.
 
@@ -11,7 +11,8 @@ Proprietary software — The Mapleseed Inc. Commercial license required.
 | **Consensus** | Enhanced-PBFT and Raft (`DISLMDB_CONSENSUS_*`), joint-consensus membership, graceful leave |
 | **Voting** | First-class; `DISLMDB_VOTING=off` / `enable_voting=false` → learner (no campaign / no vote grant) |
 | **Transports** | TCP, UDP (DQGM v3: pkt_num, cumulative ACK, CID rebind, peer-restart), **BOTH** (UDP signalling + TCP data) |
-| **Crypto** | Cluster key HMAC + AEAD payload encryption; portable mTLS 1.3 via vendored Mbed TLS |
+| **Crypto (transport)** | Cluster key HMAC + AEAD payload encryption; portable mTLS 1.3 via vendored Mbed TLS |
+| **Crypto (PBFT)** | Time-Variant BLAKE3 digests + keyed MACs bound to `(view, sequence)` — not used for connections or Raft |
 | **Topology** | Env: `DISLMDB_REGION` / `LOCALITY` / `TOPOLOGY_MODE` / secrets / `MAX_PEERS`; persisted region + peer_topo; same-region dial preference |
 | **Topo modes** | `mirror` (full replicate / learners), `shard` (owner write-gate; cross-region out of Raft), `hybrid` (`DISLMDB_SHARD_FLAG_MIRRORED`) |
 | **Scale** | Heap-growable peer + connection tables; soft `max_peers` (0 = unlimited). Regional voters; voter HB vs learner AE lanes |
@@ -144,6 +145,47 @@ Mismatched cross-region keys fail closed (`plane_auth_fail`); intra-region traff
 2. **Consensus** — `Enhanced-Raft-mechanism/` or `Enhanced-PBFT-mechanism/` via adapters
 3. **Network** — framed messages, DQGM UDP, outbox, mTLS (`src/network/`)
 4. **Storage** — LMDB mmap + meta DBI persist (`src/utils/dislmdb_persist.c`)
+
+## Crypto layers (what each piece owns)
+
+DisLMDB uses **two separate crypto planes**. Mixing them up is a common misread of this repo. Together they are the intended resistance to **temporal / timing attack vectors**: TVB3 removes fixed-time digest domains; transport HMAC + AEAD (and optional mTLS) encrypt and authenticate the wire so plaintext and stable MAC material are not exposed for remote timing aggregation.
+
+| Layer | Mechanism | Owns | Does **not** own |
+| --- | --- | --- | --- |
+| **Transport** | Cluster-key HMAC + AEAD; optional mTLS 1.3 | Peer dial/admit, framed packets, RTT/HELLO path authenticity; ciphertext + tag verify (`dislmdb_crypto_secure_eq`) | PBFT digests, Raft log hashes |
+| **Enhanced-PBFT** | Time-Variant BLAKE3 (TVB3) | Request digests + PBFT wire `auth` MACs (slot-bound; MAC verify is fixed-length XOR fold) | Sockets, mTLS, Raft AppendEntries / RequestVote |
+
+Prefer Raft for crashy LANs; PBFT when Byzantine tolerance matters. TVB3 only applies on the PBFT path.
+
+### Time-Variant BLAKE3 (Enhanced-PBFT)
+
+TVB3 is the Enhanced-PBFT digest/MAC primitive (C port under `Enhanced-PBFT-mechanism/`, aligned with [Time-VariantBlake3](https://github.com/TheMapleseed/Time-VariantBlake3)). The paper’s compression binding is \(G'(h,m,t)=G(h\oplus IV(t), m, t)\): digests are **not** a fixed, time-invariant fingerprint of the payload alone.
+
+**Consensus profile (what DisLMDB runs).** For replica agreement, “time” is **not** wall-clock: every replica derives a deterministic IV from the consensus step `(view, sequence)`. Honest nodes with the same `(view, seq)` produce the same digest and MAC; safety does not require NTP. Each new slot still gets a distinct IV (paper invariant: distinct \(t\) ⇒ distinct \(IV\) with overwhelming probability).
+
+**Purpose 1 — Resist temporal / timing attack vectors (with transport encryption).** Classic `H(m)` is stable across time and slots, which enables precomputation against a single IV, cross-time digest reuse, and aggregation of repeated identical hash domains (including remote timing measurements over a fixed computation). TVB3’s time-differential IV is intended to break that stability per consensus step. On the wire, cluster-key **AEAD + HMAC** (and optional **mTLS 1.3**) add encryption and authenticated framing so observers do not get cleartext payloads or naked digest bytes to time against; tag checks use constant-time-style compares (`secure_eq` / TVB3 MAC verify). **Layered posture:** TVB3 for time-variant digests/MACs; transport crypto for encrypted, authenticated channels. Deploy multi-node with a cluster key (required) and prefer mTLS when the threat model includes network adversaries.
+
+**Purpose 2 — Step-bound request digests.** On Pre-prepare (and inbound checks):
+
+`digest = TVB3_hash(view, sequence, payload)`
+
+Implementation: BLAKE3 chaining value starts as `BLAKE3_IV ⊕ IV(view,seq)`, then the payload is hashed (`tvb3_hash_payload` / `security_manager`). Effects:
+
+- The same payload at `(v, n)` hashes differently than at `(v′, n′)`.
+- Quorum certificates cannot be slid across sequence slots without failing digest checks.
+- All honest replicas still agree, because the IV is a pure function of `(view, seq)`.
+
+`epdft.c` drops a Pre-prepare when the recomputed TVB3 digest does not match the message.
+
+**Purpose 3 — Step-bound wire MACs (cluster key).** When a cluster key is installed, every PBFT message carries an `auth` tag: keyed BLAKE3 whose key-schedule/CV is XOR’d with the same TV-IV, over a canonical encoding of `(type, view, seq, digest, from, last_stable, data)`. Verify rejects missing/wrong MACs once a key is present. A valid MAC for one PBFT phase/slot does not authorize another.
+
+**Purpose 4 — Spec alignment.** Digests and `auth` follow the Enhanced-PBFT / TV-BLAKE3 construction, not ad-hoc SHA-256 of the payload. Raft intentionally skips this path and uses ordinary Raft framing plus the **transport** crypto layer.
+
+**Out of scope for TVB3 alone:** dialing peers, connection admit, RTT budgets, mTLS handshakes, encrypting the LMDB store, or Raft AE/RV — those sit in the transport / storage planes (encryption and mTLS are what close the remote timing/observation gap on the wire).
+
+In one line: TVB3 + transport HMAC/AEAD (and optional mTLS) make PBFT digests/MACs **slot-bound and time-variant**, and keep the wire **encrypted and authenticated**, so fixed-time digest and remote timing/aggregation vectors are out of the intended threat surface—while digests stay deterministic across the cluster.
+
+Details and file map: [`Enhanced-PBFT-mechanism/README.md`](Enhanced-PBFT-mechanism/README.md). Spec: [Time-VariantBlake3](https://github.com/TheMapleseed/Time-VariantBlake3).
 
 ## Metrics
 
