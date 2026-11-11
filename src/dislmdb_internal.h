@@ -221,6 +221,26 @@ int dislmdb_network_set_auth_key(DISLMDB_env *env, const uint8_t key[32]);
 int dislmdb_network_set_encryption(DISLMDB_env *env, bool enable);
 
 /**
+ * Pack bytecode for durable storage: [u32 options][optional sha256][payload].
+ * Rejects DISLMDB_BYTECODE_COMPRESS. Owns *out on success.
+ */
+int dislmdb_bytecode_pack(unsigned int options,
+                          const uint8_t *src,
+                          size_t src_len,
+                          uint8_t **out,
+                          size_t *out_len);
+
+/**
+ * Unpack durable bytecode. When VERIFY is set, checks SHA-256.
+ * *data_out points into @p stored (not owned).
+ */
+int dislmdb_bytecode_unpack(const uint8_t *stored,
+                            size_t stored_len,
+                            unsigned int *options_out,
+                            const uint8_t **data_out,
+                            size_t *data_len_out);
+
+/**
  * @brief Log a message to the environment's log
  * 
  * @param env The environment

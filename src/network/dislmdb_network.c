@@ -25,7 +25,7 @@
 #include "dislmdb_crypto.h"
 #include "dislmdb_mtls.h"
 
-#define NET_MAX_CONNECTIONS DISLMDB_MAX_NODES
+#define NET_CONN_INITIAL DISLMDB_MAX_NODES /* growable; not a hard cluster cap */
 #define NET_HEADER_WIRE_SIZE 160
 #define NET_HMAC_SIZE DISLMDB_HMAC_SHA256_LENGTH
 /** Per-peer outbound queue — survives TCP CONNECTING / brief UDP misses. */
@@ -53,6 +53,8 @@ typedef struct net_connection {
     uint64_t local_acked_pkt; /* highest cumulative ACK from peer (our pkts) */
     bool hello_reengage;     /* revived from CLOSED — HELLO should reply once */
     uint64_t last_tcp_attempt_ms; /* rate-limit BOTH TCP dials while UDP lives */
+    char peer_region[64];    /* optional; nearest-dial affinity */
+    char peer_locality[64];
     net_outbox_slot outbox[NET_OUTBOX_CAP];
     uint32_t outbox_head;    /* next to drain */
     uint32_t outbox_count;
@@ -72,7 +74,8 @@ typedef struct network_context {
     pthread_t thread;
     bool running;
     pthread_mutex_t lock;
-    net_connection connections[NET_MAX_CONNECTIONS];
+    net_connection *connections; /* heap; grows past NET_CONN_INITIAL */
+    int conn_cap;
     DISLMDB_network_stats stats;
     uint8_t auth_key[32];
     bool auth_enabled;
@@ -84,6 +87,52 @@ typedef struct network_context {
     uint64_t start_ms;
     uint64_t last_heartbeat_ms;
 } network_context;
+
+/** Higher = closer. Unknown peer topo ranks as neutral (1). */
+static int topo_affinity_rank(const network_context *ctx, const net_connection *c)
+{
+    if (!ctx || !c || !ctx->env) {
+        return 1;
+    }
+    const char *lr = ctx->env->config.region;
+    const char *ll = ctx->env->config.locality;
+    if (lr[0] == '\0') {
+        return 1;
+    }
+    if (c->peer_region[0] == '\0') {
+        return 1;
+    }
+    if (strncmp(c->peer_region, lr, sizeof(c->peer_region)) != 0) {
+        return 0; /* cross-region — dial later / softer */
+    }
+    if (ll[0] != '\0' && c->peer_locality[0] != '\0' &&
+        strncmp(c->peer_locality, ll, sizeof(c->peer_locality)) == 0) {
+        return 3;
+    }
+    return 2; /* same region */
+}
+
+static void conn_set_topo(net_connection *c, const DISLMDB_node_addr *na)
+{
+    if (!c || !na) {
+        return;
+    }
+    strncpy(c->peer_region, na->region, sizeof(c->peer_region) - 1);
+    c->peer_region[sizeof(c->peer_region) - 1] = '\0';
+    strncpy(c->peer_locality, na->locality, sizeof(c->peer_locality) - 1);
+    c->peer_locality[sizeof(c->peer_locality) - 1] = '\0';
+}
+
+static void free_network_context(network_context *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    free(ctx->connections);
+    ctx->connections = NULL;
+    ctx->conn_cap = 0;
+    free(ctx);
+}
 
 static int set_nonblocking(int fd)
 {
@@ -192,7 +241,7 @@ static dislmdb_mtls_session *tls_for_fd(network_context *ctx, int fd)
     if (!ctx || !ctx->mtls_enabled || fd < 0) {
         return NULL;
     }
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (ctx->connections[i].in_use && ctx->connections[i].fd == fd) {
             return ctx->connections[i].tls;
         }
@@ -293,7 +342,7 @@ static int find_conn_by_id(network_context *ctx, const char *node_id)
     int best = -1;
     int fallback = -1;
     uint64_t best_score = 0;
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (!ctx->connections[i].in_use ||
             strcmp(ctx->connections[i].info.node_id, node_id) != 0) {
             continue;
@@ -316,6 +365,7 @@ static int find_conn_by_id(network_context *ctx, const char *node_id)
         if (ctx->connections[i].listen_port != 0) {
             score += 500000ull;
         }
+        score += (uint64_t)topo_affinity_rank(ctx, &ctx->connections[i]) * 250000ull;
         if (ctx->connections[i].outbound) {
             score += 1ull; /* weak tie-break only */
         }
@@ -371,7 +421,7 @@ static bool conn_can_udp(network_context *ctx, int idx)
  */
 static int pick_send_fd(network_context *ctx, int idx, DISLMDB_MESSAGE_TYPE type)
 {
-    if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use) {
+    if (idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use) {
         return -1;
     }
     int tcp = conn_tcp_fd(ctx, idx);
@@ -498,7 +548,7 @@ static void outbox_clear(net_connection *c)
 static int outbox_enqueue_locked(network_context *ctx, int idx,
                                  const DISLMDB_network_message *message)
 {
-    if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use ||
+    if (idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use ||
         !message) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
@@ -550,7 +600,7 @@ static void outbox_drain(network_context *ctx, int idx)
         DISLMDB_network_message msg;
         bool have = false;
         pthread_mutex_lock(&ctx->lock);
-        if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use ||
+        if (idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use ||
             ctx->connections[idx].outbox_count == 0) {
             pthread_mutex_unlock(&ctx->lock);
             return;
@@ -612,9 +662,34 @@ static void outbox_drain(network_context *ctx, int idx)
     }
 }
 
+static int grow_connections(network_context *ctx)
+{
+    int ncap = ctx->conn_cap > 0 ? ctx->conn_cap * 2 : NET_CONN_INITIAL;
+    if (ncap < NET_CONN_INITIAL) {
+        ncap = NET_CONN_INITIAL;
+    }
+    net_connection *n =
+        realloc(ctx->connections, (size_t)ncap * sizeof(net_connection));
+    if (!n) {
+        return -1;
+    }
+    for (int i = ctx->conn_cap; i < ncap; i++) {
+        memset(&n[i], 0, sizeof(n[i]));
+        n[i].fd = -1;
+    }
+    ctx->connections = n;
+    ctx->conn_cap = ncap;
+    return 0;
+}
+
 static int alloc_conn(network_context *ctx)
 {
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    if (!ctx->connections || ctx->conn_cap <= 0) {
+        if (grow_connections(ctx) != 0) {
+            return -1;
+        }
+    }
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (!ctx->connections[i].in_use) {
             bool had_lock = ctx->connections[i].io_lock_ready;
             pthread_mutex_t saved = ctx->connections[i].io_lock;
@@ -633,14 +708,24 @@ static int alloc_conn(network_context *ctx)
             return i;
         }
     }
-    return -1;
+    int old = ctx->conn_cap;
+    if (grow_connections(ctx) != 0) {
+        return -1;
+    }
+    int i = old;
+    ensure_io_lock(&ctx->connections[i]);
+    ctx->connections[i].in_use = true;
+    ctx->connections[i].outbound = false;
+    ctx->connections[i].listen_port = 0;
+    ctx->connections[i].fd = -1;
+    return i;
 }
 
 /** Authoritative count — avoids drift when CONNECTING slots close or peers dedupe. */
 static uint32_t recount_active_connections_locked(const network_context *ctx)
 {
     uint32_t n = 0;
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (ctx->connections[i].in_use &&
             ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTED) {
             n++;
@@ -656,7 +741,7 @@ static uint32_t recount_active_connections_locked(const network_context *ctx)
  */
 static bool demote_tcp_to_udp_locked(network_context *ctx, int idx)
 {
-    if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use) {
+    if (idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use) {
         return false;
     }
     if (ctx->connections[idx].tls) {
@@ -681,7 +766,7 @@ static bool demote_tcp_to_udp_locked(network_context *ctx, int idx)
 
 static void close_conn(network_context *ctx, int idx)
 {
-    if (idx < 0 || idx >= NET_MAX_CONNECTIONS || !ctx->connections[idx].in_use) {
+    if (idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use) {
         return;
     }
     bool was_connected =
@@ -717,7 +802,7 @@ static int find_other_live_peer(network_context *ctx, int self_idx,
                                const char *node_id, const char *hostname,
                                uint16_t port)
 {
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (i == self_idx || !ctx->connections[i].in_use) {
             continue;
         }
@@ -777,8 +862,13 @@ static int try_reconnect(network_context *ctx, int idx)
      */
     if (udp_placeholder) {
         uint64_t now = dislmdb_get_time_ms();
+        /* Cross-region peers wait longer so same-region TCP dials win the net thread. */
+        uint64_t retry_ms = NET_BOTH_TCP_RETRY_MS;
+        if (topo_affinity_rank(ctx, c) == 0) {
+            retry_ms *= 3u;
+        }
         if (c->last_tcp_attempt_ms != 0 &&
-            now - c->last_tcp_attempt_ms < NET_BOTH_TCP_RETRY_MS) {
+            now - c->last_tcp_attempt_ms < retry_ms) {
             return -1;
         }
         c->last_tcp_attempt_ms = now;
@@ -1008,15 +1098,15 @@ static void send_heartbeats(network_context *ctx)
     }
     ctx->last_heartbeat_ms = now;
 
-    int send_idx[NET_MAX_CONNECTIONS];
-    char reconnect_labels[NET_MAX_CONNECTIONS][64];
-    int pending_mtls[NET_MAX_CONNECTIONS];
+    int send_idx[ctx->conn_cap];
+    char reconnect_labels[ctx->conn_cap][64];
+    int pending_mtls[ctx->conn_cap];
     int n_send = 0;
     int n_hello = 0;
     int n_pending = 0;
     uint64_t stale_limit = (uint64_t)interval * 5u;
 
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (!ctx->connections[i].in_use) {
             continue;
         }
@@ -1042,7 +1132,7 @@ static void send_heartbeats(network_context *ctx)
                     ctx->connections[i].fd = ctx->udp_fd;
                     ctx->stats.active_connections =
                         recount_active_connections_locked(ctx);
-                    if (n_hello < NET_MAX_CONNECTIONS &&
+                    if (n_hello < ctx->conn_cap &&
                         ctx->connections[i].info.node_id[0] != '\0') {
                         strncpy(reconnect_labels[n_hello],
                                 ctx->connections[i].info.node_id,
@@ -1053,7 +1143,7 @@ static void send_heartbeats(network_context *ctx)
                         ctx->connections[i].hello_reengage = false;
                     }
                 }
-                if (n_send < NET_MAX_CONNECTIONS) {
+                if (n_send < ctx->conn_cap) {
                     send_idx[n_send++] = i;
                 }
                 continue;
@@ -1069,7 +1159,7 @@ static void send_heartbeats(network_context *ctx)
                     ctx->stats.active_connections =
                         recount_active_connections_locked(ctx);
                 }
-                if (n_send < NET_MAX_CONNECTIONS) {
+                if (n_send < ctx->conn_cap) {
                     send_idx[n_send++] = i;
                 }
             }
@@ -1077,7 +1167,7 @@ static void send_heartbeats(network_context *ctx)
                 (ctx->transport == DISLMDB_TRANSPORT_BOTH &&
                  ctx->connections[i].fd == ctx->udp_fd)) {
                 int tr = try_reconnect(ctx, i);
-                if (tr == 1 && n_pending < NET_MAX_CONNECTIONS) {
+                if (tr == 1 && n_pending < ctx->conn_cap) {
                     pending_mtls[n_pending++] = i;
                 } else if (tr == 0) {
                     strncpy(reconnect_labels[n_hello], ctx->connections[i].info.node_id,
@@ -1101,7 +1191,7 @@ static void send_heartbeats(network_context *ctx)
             close_conn(ctx, i);
             continue;
         }
-        if (n_send < NET_MAX_CONNECTIONS) {
+        if (n_send < ctx->conn_cap) {
             send_idx[n_send++] = i;
         }
     }
@@ -1155,12 +1245,12 @@ static void send_heartbeats(network_context *ctx)
     }
 
     /* Drain per-peer outboxes now that reconnect / heartbeats ran. */
-    int drain_idx[NET_MAX_CONNECTIONS];
+    int drain_idx[ctx->conn_cap];
     int n_drain = 0;
     pthread_mutex_lock(&ctx->lock);
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (ctx->connections[i].in_use && ctx->connections[i].outbox_count > 0 &&
-            n_drain < NET_MAX_CONNECTIONS) {
+            n_drain < ctx->conn_cap) {
             drain_idx[n_drain++] = i;
         }
     }
@@ -1250,7 +1340,7 @@ static int write_framed(network_context *ctx, int fd,
             ctx->dgram_pkt_num = 1;
         }
         pkt = ctx->dgram_pkt_num++;
-        for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        for (int i = 0; i < ctx->conn_cap; i++) {
             if (!ctx->connections[i].in_use ||
                 ctx->connections[i].info.hostname[0] == '\0') {
                 continue;
@@ -1463,7 +1553,7 @@ static void *network_thread(void *arg)
                 maxfd = ctx->udp_fd;
             }
         }
-        for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        for (int i = 0; i < ctx->conn_cap; i++) {
             /* Shared UDP socket is polled once above; skip per-conn UDP fds */
             if (ctx->connections[i].in_use && ctx->connections[i].fd >= 0 &&
                 ctx->connections[i].fd != ctx->udp_fd) {
@@ -1599,7 +1689,7 @@ static void *network_thread(void *arg)
                             idx = find_conn_by_id(ctx, msg.header.sender_id);
                         }
                         if (idx < 0) {
-                            for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+                            for (int i = 0; i < ctx->conn_cap; i++) {
                                 if (!ctx->connections[i].in_use) {
                                     continue;
                                 }
@@ -1755,7 +1845,7 @@ static void *network_thread(void *arg)
                     pthread_mutex_lock(&ctx->lock);
                     /* Prefer upgrading an existing UDP-only slot for this host. */
                     int idx = -1;
-                    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+                    for (int i = 0; i < ctx->conn_cap; i++) {
                         if (!ctx->connections[i].in_use) {
                             continue;
                         }
@@ -1798,7 +1888,7 @@ static void *network_thread(void *arg)
             }
         }
 
-        for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        for (int i = 0; i < ctx->conn_cap; i++) {
             int fd = -1;
             dislmdb_mtls_session *tls = NULL;
             bool have_io = false;
@@ -1924,6 +2014,15 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
     ctx->wake_r = -1;
     ctx->wake_w = -1;
     ctx->transport = config->transport;
+    ctx->connections = calloc(NET_CONN_INITIAL, sizeof(net_connection));
+    if (!ctx->connections) {
+        free_network_context(ctx);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    ctx->conn_cap = NET_CONN_INITIAL;
+    for (int i = 0; i < ctx->conn_cap; i++) {
+        ctx->connections[i].fd = -1;
+    }
     ctx->start_ms = dislmdb_get_time_ms();
     {
         uint8_t dig[32];
@@ -1967,7 +2066,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         if (!dislmdb_mtls_available() ||
             config->tls_cert_path[0] == '\0' ||
             config->tls_key_path[0] == '\0') {
-            free(ctx);
+            free_network_context(ctx);
             return DISLMDB_ERR_CONFIG;
         }
         dislmdb_mtls_config mc = {
@@ -1978,7 +2077,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         };
         ctx->mtls = dislmdb_mtls_create(&mc);
         if (!ctx->mtls) {
-            free(ctx);
+            free_network_context(ctx);
             return DISLMDB_ERR_AUTH_FAILED;
         }
         ctx->mtls_enabled = true;
@@ -1988,7 +2087,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         if (ctx->mtls) {
             dislmdb_mtls_destroy(ctx->mtls);
         }
-        free(ctx);
+        free_network_context(ctx);
         return DISLMDB_ERR_THREAD_ERROR;
     }
 
@@ -2011,7 +2110,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
             if (ctx->mtls) {
                 dislmdb_mtls_destroy(ctx->mtls);
             }
-            free(ctx);
+            free_network_context(ctx);
             return DISLMDB_ERR_NETWORK;
         }
         int on = 1;
@@ -2022,7 +2121,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
             if (ctx->mtls) {
                 dislmdb_mtls_destroy(ctx->mtls);
             }
-            free(ctx);
+            free_network_context(ctx);
             return DISLMDB_ERR_NETWORK;
         }
         set_nonblocking(fd);
@@ -2045,7 +2144,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
             if (ctx->mtls) {
                 dislmdb_mtls_destroy(ctx->mtls);
             }
-            free(ctx);
+            free_network_context(ctx);
             return DISLMDB_ERR_NETWORK;
         }
         int on = 1;
@@ -2067,7 +2166,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
             if (ctx->mtls) {
                 dislmdb_mtls_destroy(ctx->mtls);
             }
-            free(ctx);
+            free_network_context(ctx);
             return DISLMDB_ERR_NETWORK;
         }
         set_nonblocking(ufd);
@@ -2085,7 +2184,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         if (ctx->mtls) {
             dislmdb_mtls_destroy(ctx->mtls);
         }
-        free(ctx);
+        free_network_context(ctx);
         return DISLMDB_ERR_CONFIG;
     }
 
@@ -2112,7 +2211,7 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         if (ctx->mtls) {
             dislmdb_mtls_destroy(ctx->mtls);
         }
-        free(ctx);
+        free_network_context(ctx);
         return DISLMDB_ERR_THREAD_ERROR;
     }
 
@@ -2160,7 +2259,7 @@ int dislmdb_network_shutdown(DISLMDB_env *env)
     pthread_join(ctx->thread, NULL);
 
     pthread_mutex_lock(&ctx->lock);
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         close_conn(ctx, i);
     }
     if (ctx->listen_fd >= 0) {
@@ -2190,7 +2289,7 @@ int dislmdb_network_shutdown(DISLMDB_env *env)
         ctx->mtls = NULL;
     }
     pthread_mutex_destroy(&ctx->lock);
-    free(ctx);
+    free_network_context(ctx);
     env->network_context = NULL;
     return DISLMDB_SUCCESS;
 }
@@ -2268,14 +2367,14 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
     network_context *ctx = env->network_context;
     int overall = DISLMDB_SUCCESS;
 
-    int idxs[NET_MAX_CONNECTIONS];
-    char ids[NET_MAX_CONNECTIONS][64];
+    int idxs[ctx->conn_cap];
+    char ids[ctx->conn_cap][64];
     int n = 0;
     pthread_mutex_lock(&ctx->lock);
     /* Collect unique peer ids then resolve each via find_conn_by_id scoring */
-    char seen[NET_MAX_CONNECTIONS][64];
+    char seen[ctx->conn_cap][64];
     int nseen = 0;
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (!ctx->connections[i].in_use) {
             continue;
         }
@@ -2345,7 +2444,7 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
         }
         bool defer = false;
         pthread_mutex_lock(&ctx->lock);
-        if (idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+        if (idxs[i] >= 0 && idxs[i] < ctx->conn_cap &&
             ctx->connections[idxs[i]].in_use &&
             ctx->connections[idxs[i]].info.state != DISLMDB_CONNECTION_CONNECTED) {
             defer = true;
@@ -2365,7 +2464,7 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
         if (rc != DISLMDB_SUCCESS) {
             if (outbox_enqueue_locked(ctx, idxs[i], &msg) == DISLMDB_SUCCESS) {
                 if (used_fd >= 0 && used_fd != ctx->udp_fd &&
-                    idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+                    idxs[i] >= 0 && idxs[i] < ctx->conn_cap &&
                     ctx->connections[idxs[i]].in_use &&
                     ctx->connections[idxs[i]].fd == used_fd) {
                     close_conn(ctx, idxs[i]);
@@ -2373,7 +2472,7 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
             } else {
                 overall = rc;
                 if (used_fd >= 0 && used_fd != ctx->udp_fd &&
-                    idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+                    idxs[i] >= 0 && idxs[i] < ctx->conn_cap &&
                     ctx->connections[idxs[i]].in_use &&
                     ctx->connections[idxs[i]].fd == used_fd) {
                     close_conn(ctx, idxs[i]);
@@ -2381,7 +2480,7 @@ int dislmdb_network_broadcast(DISLMDB_env *env,
             }
         } else {
             ctx->stats.total_messages_sent++;
-            if (idxs[i] >= 0 && idxs[i] < NET_MAX_CONNECTIONS &&
+            if (idxs[i] >= 0 && idxs[i] < ctx->conn_cap &&
                 ctx->connections[idxs[i]].in_use) {
                 ctx->connections[idxs[i]].info.messages_sent++;
                 ctx->connections[idxs[i]].info.last_activity_time = dislmdb_get_time_ms();
@@ -2464,7 +2563,7 @@ int dislmdb_network_get_connected_nodes(DISLMDB_env *env,
     network_context *ctx = env->network_context;
     size_t n = 0;
     pthread_mutex_lock(&ctx->lock);
-    for (int i = 0; i < NET_MAX_CONNECTIONS && n < max_count; i++) {
+    for (int i = 0; i < ctx->conn_cap && n < max_count; i++) {
         if (ctx->connections[i].in_use &&
             ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTED &&
             ctx->connections[i].info.node_id[0] != '\0') {
@@ -2486,7 +2585,7 @@ uint32_t dislmdb_network_connected_peer_count(DISLMDB_env *env)
     network_context *ctx = env->network_context;
     uint32_t n = 0;
     pthread_mutex_lock(&ctx->lock);
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (ctx->connections[i].in_use &&
             ctx->connections[i].info.state == DISLMDB_CONNECTION_CONNECTED &&
             ctx->connections[i].info.node_id[0] != '\0' &&
@@ -2600,6 +2699,7 @@ int dislmdb_network_connect(DISLMDB_env *env,
                 ctx->connections[idx].outbound = true;
                 ctx->connections[idx].tls = NULL;
                 ctx->connections[idx].listen_port = node_addr->port;
+                conn_set_topo(&ctx->connections[idx], node_addr);
                 strncpy(ctx->connections[idx].info.node_id, node_addr->node_id,
                         sizeof(ctx->connections[idx].info.node_id) - 1);
                 strncpy(ctx->connections[idx].info.hostname, node_addr->hostname,
@@ -2640,6 +2740,7 @@ int dislmdb_network_connect(DISLMDB_env *env,
                 ctx->connections[idx].outbound = true;
                 ctx->connections[idx].tls = NULL;
                 ctx->connections[idx].listen_port = node_addr->port;
+                conn_set_topo(&ctx->connections[idx], node_addr);
                 strncpy(ctx->connections[idx].info.node_id, node_addr->node_id,
                         sizeof(ctx->connections[idx].info.node_id) - 1);
                 strncpy(ctx->connections[idx].info.hostname, node_addr->hostname,
@@ -2682,6 +2783,7 @@ int dislmdb_network_connect(DISLMDB_env *env,
     ctx->connections[idx].tls = tls;
     ctx->connections[idx].outbound = true;
     ctx->connections[idx].listen_port = node_addr->port;
+    conn_set_topo(&ctx->connections[idx], node_addr);
     ctx->connections[idx].info.state = DISLMDB_CONNECTION_CONNECTED;
     ctx->connections[idx].info.connect_time = dislmdb_get_time_ms();
     ctx->connections[idx].info.last_activity_time = ctx->connections[idx].info.connect_time;
@@ -2735,7 +2837,7 @@ int dislmdb_network_bind_peer_id(DISLMDB_env *env,
     }
     if (idx < 0) {
         /* Match any seed-* or empty-id live connection */
-        for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+        for (int i = 0; i < ctx->conn_cap; i++) {
             if (!ctx->connections[i].in_use) {
                 continue;
             }
@@ -2763,7 +2865,7 @@ int dislmdb_network_bind_peer_id(DISLMDB_env *env,
     }
     /* Drop silent duplicate dials to the same peer id. Never close a
      * CONNECTED slot that has already exchanged traffic. */
-    for (int i = 0; i < NET_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < ctx->conn_cap; i++) {
         if (i == idx || !ctx->connections[i].in_use) {
             continue;
         }

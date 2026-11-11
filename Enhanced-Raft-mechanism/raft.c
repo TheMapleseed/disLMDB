@@ -13,6 +13,8 @@
 #define RAFT_CFG_MAGIC 0x52434647u /* 'RCFG' */
 #define RAFT_CFG_PHASE_JOINT 1u
 #define RAFT_CFG_PHASE_NEW 2u
+#define RAFT_PEER_INITIAL_CAP 16u
+#define RAFT_PEER_SOFT_MAX 100000u /* corrupt-membership guard, not a product cap */
 
 struct RaftNode {
     RaftConfig cfg;
@@ -24,16 +26,22 @@ struct RaftNode {
     size_t log_count; /* number of entries; index = position+1 */
     uint64_t commit_index;
     uint64_t last_applied;
-    uint64_t next_index[RAFT_MAX_PEERS];
-    uint64_t match_index[RAFT_MAX_PEERS];
+    /* Growable peer tables (cfg.peer_count is authoritative length). */
+    char (*peers)[RAFT_NODE_ID_LEN];
+    uint32_t peer_cap;
+    uint64_t *next_index;
+    uint64_t *match_index;
+    bool *peer_voting; /* false = learner; excluded from quorum */
     uint32_t votes;      /* Cold (or sole) config vote tally while candidate */
     uint32_t votes_new;  /* Cnew vote tally while in joint consensus */
-    /* Joint consensus: Cold (old_*) and Cnew (new_*); cfg.peers = Cold ∪ Cnew */
+    /* Joint consensus: Cold (old_*) and Cnew (new_*); peers = Cold ∪ Cnew */
     bool in_joint;
-    char old_peers[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
+    char (*old_peers)[RAFT_NODE_ID_LEN];
     uint32_t old_peer_count;
-    char new_peers[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
+    uint32_t old_peer_cap;
+    char (*new_peers)[RAFT_NODE_ID_LEN];
     uint32_t new_peer_count;
+    uint32_t new_peer_cap;
     raft_outbound_fn outbound;
     raft_apply_fn apply;
     void *user_data;
@@ -47,8 +55,125 @@ struct RaftNode {
     uint64_t propose_index;
 };
 
+static int ensure_peer_cap(RaftNode *n, uint32_t need)
+{
+    if (!n || need > RAFT_PEER_SOFT_MAX) {
+        return -1;
+    }
+    if (n->peer_cap >= need) {
+        return 0;
+    }
+    uint32_t ncap = n->peer_cap ? n->peer_cap : RAFT_PEER_INITIAL_CAP;
+    while (ncap < need) {
+        if (ncap > RAFT_PEER_SOFT_MAX / 2u) {
+            ncap = need;
+            break;
+        }
+        ncap *= 2u;
+    }
+    if (ncap > RAFT_PEER_SOFT_MAX) {
+        ncap = RAFT_PEER_SOFT_MAX;
+    }
+    if (ncap < need) {
+        return -1;
+    }
+
+    char (*np)[RAFT_NODE_ID_LEN] =
+        realloc(n->peers, (size_t)ncap * sizeof(*np));
+    uint64_t *nn = realloc(n->next_index, (size_t)ncap * sizeof(uint64_t));
+    uint64_t *nm = realloc(n->match_index, (size_t)ncap * sizeof(uint64_t));
+    bool *nv = realloc(n->peer_voting, (size_t)ncap * sizeof(bool));
+    if (!np || !nn || !nm || !nv) {
+        if (np && np != n->peers) {
+            n->peers = np;
+        }
+        if (nn && nn != n->next_index) {
+            n->next_index = nn;
+        }
+        if (nm && nm != n->match_index) {
+            n->match_index = nm;
+        }
+        if (nv && nv != n->peer_voting) {
+            n->peer_voting = nv;
+        }
+        return -1;
+    }
+    for (uint32_t i = n->peer_cap; i < ncap; i++) {
+        memset(np[i], 0, RAFT_NODE_ID_LEN);
+        nn[i] = 0;
+        nm[i] = 0;
+        nv[i] = false;
+    }
+    n->peers = np;
+    n->next_index = nn;
+    n->match_index = nm;
+    n->peer_voting = nv;
+    n->peer_cap = ncap;
+    return 0;
+}
+
+static int ensure_named_cap(char (**arr)[RAFT_NODE_ID_LEN], uint32_t *cap, uint32_t need)
+{
+    if (!arr || !cap || need > RAFT_PEER_SOFT_MAX) {
+        return -1;
+    }
+    if (*cap >= need) {
+        return 0;
+    }
+    uint32_t ncap = *cap ? *cap : RAFT_PEER_INITIAL_CAP;
+    while (ncap < need) {
+        if (ncap > RAFT_PEER_SOFT_MAX / 2u) {
+            ncap = need;
+            break;
+        }
+        ncap *= 2u;
+    }
+    if (ncap > RAFT_PEER_SOFT_MAX) {
+        ncap = RAFT_PEER_SOFT_MAX;
+    }
+    if (ncap < need) {
+        return -1;
+    }
+    char (*np)[RAFT_NODE_ID_LEN] = realloc(*arr, (size_t)ncap * sizeof(*np));
+    if (!np) {
+        return -1;
+    }
+    for (uint32_t i = *cap; i < ncap; i++) {
+        memset(np[i], 0, RAFT_NODE_ID_LEN);
+    }
+    *arr = np;
+    *cap = ncap;
+    return 0;
+}
+
+static void free_peer_tables(RaftNode *n)
+{
+    if (!n) {
+        return;
+    }
+    free(n->peers);
+    free(n->next_index);
+    free(n->match_index);
+    free(n->peer_voting);
+    free(n->old_peers);
+    free(n->new_peers);
+    n->peers = NULL;
+    n->next_index = NULL;
+    n->match_index = NULL;
+    n->peer_voting = NULL;
+    n->old_peers = NULL;
+    n->new_peers = NULL;
+    n->peer_cap = 0;
+    n->old_peer_cap = 0;
+    n->new_peer_cap = 0;
+    n->cfg.peer_count = 0;
+    n->old_peer_count = 0;
+    n->new_peer_count = 0;
+}
+
 static uint64_t last_log_index(const RaftNode *n);
 static int peer_index(const RaftNode *n, const char *id);
+static uint32_t voting_majority(const RaftNode *n);
 
 static void write_u32(uint8_t *p, uint32_t v)
 {
@@ -75,7 +200,7 @@ static int encode_membership(uint8_t phase,
                              uint8_t **out,
                              size_t *out_len)
 {
-    if (!out || !out_len || peer_count > RAFT_MAX_PEERS) {
+    if (!out || !out_len || peer_count > RAFT_PEER_SOFT_MAX) {
         return -1;
     }
     if (peer_count > 0 && !peers) {
@@ -116,7 +241,7 @@ static int decode_membership(const uint8_t *data, size_t len,
         return -1;
     }
     uint32_t pc = read_u32(data + o); o += 4;
-    if (pc > RAFT_MAX_PEERS || o + (size_t)pc * RAFT_NODE_ID_LEN > len) {
+    if (pc > RAFT_PEER_SOFT_MAX || o + (size_t)pc * RAFT_NODE_ID_LEN > len) {
         return -1;
     }
     if (peers) {
@@ -135,52 +260,87 @@ static void install_peer_set(RaftNode *n,
                              const char peers[][RAFT_NODE_ID_LEN],
                              uint32_t count)
 {
-    uint64_t old_next[RAFT_MAX_PEERS];
-    uint64_t old_match[RAFT_MAX_PEERS];
-    char old_ids[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
     uint32_t old_count = n->cfg.peer_count;
-    memcpy(old_ids, n->cfg.peer_ids, sizeof(old_ids));
-    memcpy(old_next, n->next_index, sizeof(old_next));
-    memcpy(old_match, n->match_index, sizeof(old_match));
+    uint64_t *old_next = NULL;
+    uint64_t *old_match = NULL;
+    bool *old_voting = NULL;
+    char (*old_ids)[RAFT_NODE_ID_LEN] = NULL;
+    if (old_count > 0) {
+        old_next = calloc(old_count, sizeof(uint64_t));
+        old_match = calloc(old_count, sizeof(uint64_t));
+        old_voting = calloc(old_count, sizeof(bool));
+        old_ids = calloc(old_count, sizeof(*old_ids));
+        if (!old_next || !old_match || !old_voting || !old_ids) {
+            free(old_next);
+            free(old_match);
+            free(old_voting);
+            free(old_ids);
+            return;
+        }
+        memcpy(old_ids, n->peers, (size_t)old_count * sizeof(*old_ids));
+        memcpy(old_next, n->next_index, (size_t)old_count * sizeof(uint64_t));
+        memcpy(old_match, n->match_index, (size_t)old_count * sizeof(uint64_t));
+        memcpy(old_voting, n->peer_voting, (size_t)old_count * sizeof(bool));
+    }
 
-    memset(n->cfg.peer_ids, 0, sizeof(n->cfg.peer_ids));
-    memset(n->next_index, 0, sizeof(n->next_index));
-    memset(n->match_index, 0, sizeof(n->match_index));
+    if (ensure_peer_cap(n, count > 0 ? count : 1u) != 0) {
+        free(old_next);
+        free(old_match);
+        free(old_voting);
+        free(old_ids);
+        return;
+    }
+    for (uint32_t i = 0; i < n->peer_cap; i++) {
+        memset(n->peers[i], 0, RAFT_NODE_ID_LEN);
+        n->next_index[i] = 0;
+        n->match_index[i] = 0;
+        n->peer_voting[i] = false;
+    }
     n->cfg.peer_count = 0;
-    for (uint32_t i = 0; i < count && n->cfg.peer_count < RAFT_MAX_PEERS; i++) {
+    for (uint32_t i = 0; i < count; i++) {
         if (peers[i][0] == '\0') {
             continue;
         }
         if (strncmp(peers[i], n->cfg.node_id, RAFT_NODE_ID_LEN) == 0) {
             continue;
         }
+        if (ensure_peer_cap(n, n->cfg.peer_count + 1) != 0) {
+            break;
+        }
         uint32_t dst = n->cfg.peer_count;
-        strncpy(n->cfg.peer_ids[dst], peers[i], RAFT_NODE_ID_LEN - 1);
-        n->cfg.peer_ids[dst][RAFT_NODE_ID_LEN - 1] = '\0';
+        strncpy(n->peers[dst], peers[i], RAFT_NODE_ID_LEN - 1);
+        n->peers[dst][RAFT_NODE_ID_LEN - 1] = '\0';
         n->next_index[dst] = last_log_index(n) + 1;
         n->match_index[dst] = 0;
+        n->peer_voting[dst] = true; /* membership changes are voter-set by default */
         for (uint32_t j = 0; j < old_count; j++) {
             if (strncmp(old_ids[j], peers[i], RAFT_NODE_ID_LEN) == 0) {
                 n->next_index[dst] = old_next[j];
                 n->match_index[dst] = old_match[j];
+                n->peer_voting[dst] = old_voting[j];
                 break;
             }
         }
         n->cfg.peer_count++;
     }
+    free(old_next);
+    free(old_match);
+    free(old_voting);
+    free(old_ids);
 }
 
 static void union_peers(const char a[][RAFT_NODE_ID_LEN], uint32_t ac,
                         const char b[][RAFT_NODE_ID_LEN], uint32_t bc,
-                        char out[][RAFT_NODE_ID_LEN], uint32_t *out_count)
+                        char out[][RAFT_NODE_ID_LEN], uint32_t max_out,
+                        uint32_t *out_count)
 {
     *out_count = 0;
-    for (uint32_t i = 0; i < ac && *out_count < RAFT_MAX_PEERS; i++) {
+    for (uint32_t i = 0; i < ac && *out_count < max_out; i++) {
         strncpy(out[*out_count], a[i], RAFT_NODE_ID_LEN - 1);
         out[*out_count][RAFT_NODE_ID_LEN - 1] = '\0';
         (*out_count)++;
     }
-    for (uint32_t i = 0; i < bc && *out_count < RAFT_MAX_PEERS; i++) {
+    for (uint32_t i = 0; i < bc && *out_count < max_out; i++) {
         bool found = false;
         for (uint32_t j = 0; j < *out_count; j++) {
             if (strncmp(out[j], b[i], RAFT_NODE_ID_LEN) == 0) {
@@ -200,10 +360,11 @@ static void union_peers(const char a[][RAFT_NODE_ID_LEN], uint32_t ac,
 static uint32_t peers_excluding_self(const RaftNode *n,
                                      const char voters[][RAFT_NODE_ID_LEN],
                                      uint32_t vc,
-                                     char out[][RAFT_NODE_ID_LEN])
+                                     char out[][RAFT_NODE_ID_LEN],
+                                     uint32_t max_out)
 {
     uint32_t oc = 0;
-    for (uint32_t i = 0; i < vc && oc < RAFT_MAX_PEERS; i++) {
+    for (uint32_t i = 0; i < vc && oc < max_out; i++) {
         if (voters[i][0] == '\0') {
             continue;
         }
@@ -220,50 +381,99 @@ static uint32_t peers_excluding_self(const RaftNode *n,
 static void activate_membership_locked(RaftNode *n, const uint8_t *data, size_t len)
 {
     uint8_t phase = 0;
-    char voters[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
     uint32_t vc = 0;
-    memset(voters, 0, sizeof(voters));
-    if (decode_membership(data, len, &phase, voters, &vc) != 0) {
+    if (decode_membership(data, len, &phase, NULL, &vc) != 0) {
         return;
     }
-    char peers[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
-    memset(peers, 0, sizeof(peers));
-    uint32_t pc = peers_excluding_self(n, voters, vc, peers);
+    char (*voters)[RAFT_NODE_ID_LEN] = calloc(vc > 0 ? vc : 1u, sizeof(*voters));
+    if (!voters) {
+        return;
+    }
+    if (decode_membership(data, len, &phase, voters, &vc) != 0) {
+        free(voters);
+        return;
+    }
+    char (*peers)[RAFT_NODE_ID_LEN] = calloc(vc > 0 ? vc : 1u, sizeof(*peers));
+    if (!peers) {
+        free(voters);
+        return;
+    }
+    uint32_t pc = peers_excluding_self(n, voters, vc, peers, vc);
 
     if (phase == RAFT_CFG_PHASE_JOINT) {
+        if (ensure_named_cap(&n->old_peers, &n->old_peer_cap, n->cfg.peer_count) != 0 ||
+            ensure_named_cap(&n->new_peers, &n->new_peer_cap, pc > 0 ? pc : 1u) != 0) {
+            free(voters);
+            free(peers);
+            return;
+        }
         n->old_peer_count = n->cfg.peer_count;
-        memcpy(n->old_peers, n->cfg.peer_ids, sizeof(n->old_peers));
+        if (n->old_peer_count > 0) {
+            memcpy(n->old_peers, n->peers,
+                   (size_t)n->old_peer_count * sizeof(*n->old_peers));
+        }
         n->new_peer_count = pc;
-        memcpy(n->new_peers, peers, sizeof(n->new_peers));
-        char uni[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
+        if (pc > 0) {
+            memcpy(n->new_peers, peers, (size_t)pc * sizeof(*peers));
+        }
+        uint32_t uni_max = n->old_peer_count + pc;
+        char (*uni)[RAFT_NODE_ID_LEN] =
+            calloc(uni_max > 0 ? uni_max : 1u, sizeof(*uni));
+        if (!uni) {
+            free(voters);
+            free(peers);
+            return;
+        }
         uint32_t uc = 0;
         union_peers(n->old_peers, n->old_peer_count, n->new_peers, n->new_peer_count,
-                    uni, &uc);
+                    uni, uni_max > 0 ? uni_max : 1u, &uc);
         install_peer_set(n, uni, uc);
+        free(uni);
         n->in_joint = true;
     } else {
         install_peer_set(n, peers, pc);
+        if (ensure_named_cap(&n->new_peers, &n->new_peer_cap,
+                             n->cfg.peer_count > 0 ? n->cfg.peer_count : 1u) != 0) {
+            free(voters);
+            free(peers);
+            return;
+        }
         n->new_peer_count = n->cfg.peer_count;
-        memcpy(n->new_peers, n->cfg.peer_ids, sizeof(n->new_peers));
+        if (n->new_peer_count > 0) {
+            memcpy(n->new_peers, n->peers,
+                   (size_t)n->new_peer_count * sizeof(*n->new_peers));
+        }
         n->old_peer_count = 0;
-        memset(n->old_peers, 0, sizeof(n->old_peers));
         n->in_joint = false;
     }
+    free(voters);
+    free(peers);
 }
 
-/** Quorum in one peer set (self always counts). */
+/** Quorum in one peer set (self counts only if this node votes). */
 static bool set_has_majority(const RaftNode *n, uint64_t index,
                              const char peers[][RAFT_NODE_ID_LEN],
                              uint32_t peer_count)
 {
-    uint32_t replicas = 1; /* self */
+    uint32_t replicas = n->cfg.enable_voting ? 1u : 0u;
+    uint32_t voters = n->cfg.enable_voting ? 1u : 0u;
     for (uint32_t i = 0; i < peer_count; i++) {
         int pi = peer_index(n, peers[i]);
-        if (pi >= 0 && n->match_index[pi] >= index) {
+        if (pi < 0) {
+            continue;
+        }
+        if (!n->peer_voting[pi]) {
+            continue; /* learner — replicate only */
+        }
+        voters++;
+        if (n->match_index[pi] >= index) {
             replicas++;
         }
     }
-    uint32_t majority = (peer_count + 1) / 2 + 1;
+    if (voters == 0) {
+        return false;
+    }
+    uint32_t majority = voters / 2u + 1u;
     return replicas >= majority;
 }
 
@@ -273,13 +483,21 @@ static bool entry_committed_by_quorum(const RaftNode *n, uint64_t index)
         return set_has_majority(n, index, n->old_peers, n->old_peer_count) &&
                set_has_majority(n, index, n->new_peers, n->new_peer_count);
     }
-    uint32_t replicas = 1;
+    if (!n->cfg.enable_voting) {
+        return false; /* learners never decide commit */
+    }
+    uint32_t replicas = 1; /* leader/self is a voter here */
+    uint32_t voters = 1;
     for (uint32_t i = 0; i < n->cfg.peer_count; i++) {
+        if (!n->peer_voting[i]) {
+            continue;
+        }
+        voters++;
         if (n->match_index[i] >= index) {
             replicas++;
         }
     }
-    uint32_t majority = (n->cfg.peer_count + 1) / 2 + 1;
+    uint32_t majority = voters / 2u + 1u;
     return replicas >= majority;
 }
 
@@ -296,12 +514,15 @@ static bool peer_in_set(const char peers[][RAFT_NODE_ID_LEN], uint32_t count,
 
 static bool election_won(const RaftNode *n)
 {
+    if (!n->cfg.enable_voting) {
+        return false;
+    }
     if (n->in_joint) {
         uint32_t mo = (n->old_peer_count + 1) / 2 + 1;
         uint32_t mn = (n->new_peer_count + 1) / 2 + 1;
         return n->votes >= mo && n->votes_new >= mn;
     }
-    return n->votes >= (n->cfg.peer_count + 1) / 2 + 1;
+    return n->votes >= voting_majority(n);
 }
 
 static uint64_t now_ms(void)
@@ -326,7 +547,29 @@ RaftConfig raft_config_default(void)
     c.election_timeout_min_ms = 300;
     c.election_timeout_max_ms = 600;
     c.heartbeat_ms = 100;
+    c.enable_voting = true;
     return c;
+}
+
+/** Voting cluster size: self (if voter) + voting peers. */
+static uint32_t voting_cluster_size(const RaftNode *n)
+{
+    uint32_t v = n->cfg.enable_voting ? 1u : 0u;
+    for (uint32_t i = 0; i < n->cfg.peer_count; i++) {
+        if (n->peer_voting[i]) {
+            v++;
+        }
+    }
+    return v;
+}
+
+static uint32_t voting_majority(const RaftNode *n)
+{
+    uint32_t sz = voting_cluster_size(n);
+    if (sz == 0) {
+        return 1; /* no voters — unreachable for commits; refuse via other paths */
+    }
+    return sz / 2u + 1u;
 }
 
 static void reset_election_deadline(RaftNode *n)
@@ -352,7 +595,7 @@ static uint64_t last_log_term(const RaftNode *n)
 static int peer_index(const RaftNode *n, const char *id)
 {
     for (uint32_t i = 0; i < n->cfg.peer_count; i++) {
-        if (strncmp(n->cfg.peer_ids[i], id, RAFT_NODE_ID_LEN) == 0) {
+        if (strncmp(n->peers[i], id, RAFT_NODE_ID_LEN) == 0) {
             return (int)i;
         }
     }
@@ -441,7 +684,7 @@ static void broadcast_append(RaftNode *n, bool heartbeat_only)
         memset(&msg, 0, sizeof(msg));
         msg.type = RAFT_MSG_APPEND_ENTRIES;
         msg.term = n->current_term;
-        strncpy(msg.to, n->cfg.peer_ids[i], RAFT_NODE_ID_LEN - 1);
+        strncpy(msg.to, n->peers[i], RAFT_NODE_ID_LEN - 1);
         uint64_t next = n->next_index[i];
         msg.prev_log_index = next > 0 ? next - 1 : 0;
         msg.prev_log_term = 0;
@@ -479,10 +722,15 @@ static void broadcast_append(RaftNode *n, bool heartbeat_only)
 
 static void start_election(RaftNode *n)
 {
+    if (!n->cfg.enable_voting) {
+        /* Learner: wait for AppendEntries; never campaign. */
+        reset_election_deadline(n);
+        return;
+    }
     n->role = RAFT_CANDIDATE;
     n->current_term++;
     strncpy(n->voted_for, n->cfg.node_id, RAFT_NODE_ID_LEN - 1);
-    /* Self-vote counts in every voter set that includes this node (always). */
+    /* Self-vote counts in every voter set that includes this node. */
     n->votes = 1;
     n->votes_new = n->in_joint ? 1 : 0;
     n->leader_id[0] = '\0';
@@ -505,7 +753,7 @@ static void start_election(RaftNode *n)
         memset(&msg, 0, sizeof(msg));
         msg.type = RAFT_MSG_REQUEST_VOTE;
         msg.term = n->current_term;
-        strncpy(msg.to, n->cfg.peer_ids[i], RAFT_NODE_ID_LEN - 1);
+        strncpy(msg.to, n->peers[i], RAFT_NODE_ID_LEN - 1);
         msg.last_log_index = last_log_index(n);
         msg.last_log_term = last_log_term(n);
         send_msg(n, &msg);
@@ -522,7 +770,7 @@ static void *tick_thread(void *arg)
             if (now - n->last_heartbeat_ms >= n->cfg.heartbeat_ms) {
                 broadcast_append(n, true);
             }
-        } else if (now >= n->election_deadline_ms) {
+        } else if (n->cfg.enable_voting && now >= n->election_deadline_ms) {
             start_election(n);
         }
         pthread_mutex_unlock(&n->lock);
@@ -540,11 +788,35 @@ RaftNode *raft_create(const RaftConfig *cfg,
     if (!cfg || cfg->node_id[0] == '\0') {
         return NULL;
     }
+    if (cfg->peer_count > RAFT_MAX_PEERS) {
+        return NULL; /* bootstrap array bound; grow via raft_add_peer afterward */
+    }
     RaftNode *n = calloc(1, sizeof(*n));
     if (!n) {
         return NULL;
     }
     n->cfg = *cfg;
+    n->cfg.peer_count = 0;
+    uint32_t need = cfg->peer_count > 0 ? cfg->peer_count : RAFT_PEER_INITIAL_CAP;
+    if (ensure_peer_cap(n, need) != 0) {
+        free(n);
+        return NULL;
+    }
+    /* Copy bootstrap peers into the growable heap table. */
+    for (uint32_t i = 0; i < cfg->peer_count; i++) {
+        if (cfg->peer_ids[i][0] == '\0') {
+            continue;
+        }
+        if (strncmp(cfg->peer_ids[i], cfg->node_id, RAFT_NODE_ID_LEN) == 0) {
+            continue;
+        }
+        strncpy(n->peers[n->cfg.peer_count], cfg->peer_ids[i], RAFT_NODE_ID_LEN - 1);
+        n->peers[n->cfg.peer_count][RAFT_NODE_ID_LEN - 1] = '\0';
+        n->next_index[n->cfg.peer_count] = 1;
+        n->match_index[n->cfg.peer_count] = 0;
+        n->peer_voting[n->cfg.peer_count] = true;
+        n->cfg.peer_count++;
+    }
     n->role = RAFT_FOLLOWER;
     n->outbound = outbound;
     n->apply = apply;
@@ -565,6 +837,7 @@ void raft_destroy(RaftNode *node)
     for (size_t i = 0; i < node->log_count; i++) {
         free(node->log[i].data);
     }
+    free_peer_tables(node);
     pthread_mutex_destroy(&node->lock);
     pthread_cond_destroy(&node->commit_cv);
     free(node);
@@ -602,18 +875,49 @@ RaftError raft_add_peer(RaftNode *node, const char *peer_id)
         pthread_mutex_unlock(&node->lock);
         return RAFT_OK;
     }
-    if (node->cfg.peer_count >= RAFT_MAX_PEERS) {
+    if (ensure_peer_cap(node, node->cfg.peer_count + 1) != 0) {
         pthread_mutex_unlock(&node->lock);
         return RAFT_ERR_FULL;
     }
     uint32_t i = node->cfg.peer_count;
-    strncpy(node->cfg.peer_ids[i], peer_id, RAFT_NODE_ID_LEN - 1);
-    node->cfg.peer_ids[i][RAFT_NODE_ID_LEN - 1] = '\0';
+    strncpy(node->peers[i], peer_id, RAFT_NODE_ID_LEN - 1);
+    node->peers[i][RAFT_NODE_ID_LEN - 1] = '\0';
     node->next_index[i] = last_log_index(node) + 1;
     node->match_index[i] = 0;
+    node->peer_voting[i] = true;
     node->cfg.peer_count++;
     pthread_mutex_unlock(&node->lock);
     return RAFT_OK;
+}
+
+RaftError raft_add_learner(RaftNode *node, const char *peer_id)
+{
+    RaftError err = raft_add_peer(node, peer_id);
+    if (err != RAFT_OK) {
+        return err;
+    }
+    return raft_set_peer_voting(node, peer_id, false);
+}
+
+RaftError raft_set_peer_voting(RaftNode *node, const char *peer_id, bool voting)
+{
+    if (!node || !peer_id || peer_id[0] == '\0') {
+        return RAFT_ERR_INVALID;
+    }
+    pthread_mutex_lock(&node->lock);
+    int pi = peer_index(node, peer_id);
+    if (pi < 0) {
+        pthread_mutex_unlock(&node->lock);
+        return RAFT_ERR_INVALID;
+    }
+    node->peer_voting[pi] = voting;
+    pthread_mutex_unlock(&node->lock);
+    return RAFT_OK;
+}
+
+bool raft_voting_enabled(const RaftNode *node)
+{
+    return node && node->cfg.enable_voting;
 }
 
 RaftError raft_remove_peer(RaftNode *node, const char *peer_id)
@@ -628,14 +932,16 @@ RaftError raft_remove_peer(RaftNode *node, const char *peer_id)
         return RAFT_OK;
     }
     for (uint32_t i = (uint32_t)pi; i + 1 < node->cfg.peer_count; i++) {
-        memcpy(node->cfg.peer_ids[i], node->cfg.peer_ids[i + 1], RAFT_NODE_ID_LEN);
+        memcpy(node->peers[i], node->peers[i + 1], RAFT_NODE_ID_LEN);
         node->next_index[i] = node->next_index[i + 1];
         node->match_index[i] = node->match_index[i + 1];
+        node->peer_voting[i] = node->peer_voting[i + 1];
     }
     uint32_t last = node->cfg.peer_count - 1;
-    memset(node->cfg.peer_ids[last], 0, RAFT_NODE_ID_LEN);
+    memset(node->peers[last], 0, RAFT_NODE_ID_LEN);
     node->next_index[last] = 0;
     node->match_index[last] = 0;
+    node->peer_voting[last] = false;
     node->cfg.peer_count--;
     pthread_mutex_unlock(&node->lock);
     return RAFT_OK;
@@ -713,7 +1019,7 @@ RaftError raft_propose_membership(RaftNode *node,
                                   uint32_t peer_count,
                                   uint32_t timeout_ms)
 {
-    if (!node || (peer_count > 0 && !peer_ids) || peer_count > RAFT_MAX_PEERS) {
+    if (!node || (peer_count > 0 && !peer_ids) || peer_count > RAFT_PEER_SOFT_MAX) {
         return RAFT_ERR_INVALID;
     }
     /*
@@ -721,13 +1027,19 @@ RaftError raft_propose_membership(RaftNode *node,
      * leader). Each node installs peers = voters \ {self}, so followers do
      * not end up with an empty peer list.
      */
-    char voters[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
+    uint32_t vc_max = peer_count + 1u;
+    char (*voters)[RAFT_NODE_ID_LEN] = calloc(vc_max, sizeof(*voters));
+    char (*target_peers)[RAFT_NODE_ID_LEN] = calloc(vc_max, sizeof(*target_peers));
+    if (!voters || !target_peers) {
+        free(voters);
+        free(target_peers);
+        return RAFT_ERR_MEMORY;
+    }
     uint32_t vc = 0;
-    memset(voters, 0, sizeof(voters));
     strncpy(voters[vc], node->cfg.node_id, RAFT_NODE_ID_LEN - 1);
     voters[vc][RAFT_NODE_ID_LEN - 1] = '\0';
     vc++;
-    for (uint32_t i = 0; i < peer_count && vc < RAFT_MAX_PEERS; i++) {
+    for (uint32_t i = 0; i < peer_count; i++) {
         if (peer_ids[i][0] == '\0') {
             continue;
         }
@@ -739,10 +1051,7 @@ RaftError raft_propose_membership(RaftNode *node,
         vc++;
     }
 
-    /* Peer view (excluding self) for equality / joint Cold comparison. */
-    char target_peers[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
     uint32_t tc = 0;
-    memset(target_peers, 0, sizeof(target_peers));
     for (uint32_t i = 0; i < vc; i++) {
         if (strncmp(voters[i], node->cfg.node_id, RAFT_NODE_ID_LEN) == 0) {
             continue;
@@ -755,14 +1064,20 @@ RaftError raft_propose_membership(RaftNode *node,
     pthread_mutex_lock(&node->lock);
     if (node->role != RAFT_LEADER) {
         pthread_mutex_unlock(&node->lock);
+        free(voters);
+        free(target_peers);
         return RAFT_ERR_NOT_LEADER;
     }
     if (node->in_joint) {
         pthread_mutex_unlock(&node->lock);
+        free(voters);
+        free(target_peers);
         return RAFT_ERR_STATE;
     }
-    if (peer_sets_equal(node->cfg.peer_ids, node->cfg.peer_count, target_peers, tc)) {
+    if (peer_sets_equal(node->peers, node->cfg.peer_count, target_peers, tc)) {
         pthread_mutex_unlock(&node->lock);
+        free(voters);
+        free(target_peers);
         return RAFT_OK;
     }
 
@@ -770,15 +1085,21 @@ RaftError raft_propose_membership(RaftNode *node,
     size_t joint_len = 0;
     if (encode_membership(RAFT_CFG_PHASE_JOINT, voters, vc, &joint, &joint_len) != 0) {
         pthread_mutex_unlock(&node->lock);
+        free(voters);
+        free(target_peers);
         return RAFT_ERR_MEMORY;
     }
     RaftError err = append_and_wait_locked(node, joint, joint_len, timeout_ms);
     if (err != RAFT_OK) {
         pthread_mutex_unlock(&node->lock);
+        free(voters);
+        free(target_peers);
         return err;
     }
     if (node->role != RAFT_LEADER) {
         pthread_mutex_unlock(&node->lock);
+        free(voters);
+        free(target_peers);
         return RAFT_ERR_NOT_LEADER;
     }
 
@@ -786,10 +1107,14 @@ RaftError raft_propose_membership(RaftNode *node,
     size_t neu_len = 0;
     if (encode_membership(RAFT_CFG_PHASE_NEW, voters, vc, &neu, &neu_len) != 0) {
         pthread_mutex_unlock(&node->lock);
+        free(voters);
+        free(target_peers);
         return RAFT_ERR_MEMORY;
     }
     err = append_and_wait_locked(node, neu, neu_len, timeout_ms);
     pthread_mutex_unlock(&node->lock);
+    free(voters);
+    free(target_peers);
     return err;
 }
 
@@ -838,6 +1163,12 @@ static void handle_request_vote(RaftNode *n, const RaftMessage *msg)
     reply.term = n->current_term;
     strncpy(reply.to, msg->from, RAFT_NODE_ID_LEN - 1);
 
+    if (!n->cfg.enable_voting) {
+        reply.vote_granted = false;
+        send_msg(n, &reply);
+        return;
+    }
+
     if (msg->term < n->current_term) {
         reply.vote_granted = false;
         send_msg(n, &reply);
@@ -870,6 +1201,10 @@ static void handle_request_vote_reply(RaftNode *n, const RaftMessage *msg)
         return;
     }
     if (msg->vote_granted) {
+        int pi = peer_index(n, msg->from);
+        if (pi >= 0 && !n->peer_voting[pi]) {
+            return; /* learner ballots do not count */
+        }
         if (n->in_joint) {
             if (peer_in_set(n->old_peers, n->old_peer_count, msg->from)) {
                 n->votes++;
@@ -1071,7 +1406,7 @@ uint32_t raft_copy_peers(const RaftNode *node,
     }
     uint32_t n = node->cfg.peer_count < max_out ? node->cfg.peer_count : max_out;
     for (uint32_t i = 0; i < n; i++) {
-        memcpy(out[i], node->cfg.peer_ids[i], RAFT_NODE_ID_LEN);
+        memcpy(out[i], node->peers[i], RAFT_NODE_ID_LEN);
     }
     return n;
 }

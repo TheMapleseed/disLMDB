@@ -20,11 +20,18 @@ tests/
 ## Commands
 
 ```bash
-make check          # unit + integration + e2e
+make check            # unit + integration + e2e
+make check-sandbox    # unit + rigs (no LMDB mmap)
+make check-integration
+make check-stress     # 20× raft_mtls + matrix + connect_churn + chaos rig
 make unit
 make integration
 make e2e
 ```
+
+Shared IT helpers live in `tests/integration/it_cluster.h`. New coverage:
+`test_raft_matrix` (transport×mTLS), `test_connect_churn` (close/reopen peer),
+`test_auth_reject` (wrong cluster key), and `cluster_rig` spawn/kill + drop adversity.
 
 ## E2E golden workflow
 

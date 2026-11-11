@@ -79,6 +79,8 @@ typedef struct DISLMDB_node_addr {
     char hostname[256];            /**< Hostname or IP address */
     uint16_t port;                 /**< Port number */
     char node_id[64];              /**< Unique node identifier */
+    char region[64];               /**< Optional region id (affinity / nearest dial) */
+    char locality[64];             /**< Optional AZ / rack / zone */
 } DISLMDB_node_addr;
 
 /** @brief Wire transport for cluster traffic */
@@ -126,9 +128,15 @@ typedef struct DISLMDB_consensus_config {
     bool enable_liveness;                  /**< Enable view-change timeouts */
     bool persist_state;                    /**< Persist view/sequence/replicas to meta DB */
     bool persist_cluster_key;              /**< Persist raw cluster key in meta DB (off by default) */
+    /**
+     * Participate in elections / quorum (default true). Set false for large-cluster
+     * leaf/learner nodes — still replicate, never campaign or grant votes.
+     * Overridable by env `DISLMDB_VOTING=0|off|false` (or 1|on|true).
+     */
+    bool enable_voting;
 } DISLMDB_consensus_config;
 
-/** @brief Runtime metrics for DisLMDB */
+/** @brief Runtime metrics for DisLMDB (snapshot via dislmdb_get_metrics) */
 typedef struct DISLMDB_metrics {
     uint64_t total_commits;
     uint64_t total_operations;
@@ -138,10 +146,21 @@ typedef struct DISLMDB_metrics {
     uint64_t view_changes;
     uint64_t checkpoints;
     uint64_t state_transfers;
-    uint32_t current_view;
-    uint64_t last_committed_seq;
+    uint32_t current_view;           /**< PBFT view, or Raft term (cast) */
+    uint64_t last_committed_seq;     /**< PBFT seq / Raft commit index */
     uint32_t replica_count;
     uint32_t active_connections; /**< Live CONNECTED peers (from network stats) */
+    /** Consensus / role */
+    uint32_t consensus_mechanism; /**< DISLMDB_CONSENSUS_* */
+    bool is_leader;
+    bool voting_enabled;
+    uint64_t raft_term;
+    uint64_t raft_commit_index;
+    uint32_t raft_peer_count;
+    /** Network */
+    uint64_t messages_sent;
+    uint64_t messages_received;
+    uint32_t connection_failures;
     /** DQGM (UDP) substrate — copied from network stats when available */
     uint64_t dqgm_packets_rx;
     uint64_t dqgm_cid_mismatch;
@@ -149,6 +168,10 @@ typedef struct DISLMDB_metrics {
     uint64_t dqgm_session_rebind;
     uint64_t dqgm_ack_rx;
     uint64_t dqgm_ack_advance;
+    /** Per-peer outbound reliability queue */
+    uint64_t outbox_enqueued;
+    uint64_t outbox_drained;
+    uint64_t outbox_dropped;
 } DISLMDB_metrics;
 
 /** @brief Maximum entries in a shard map */
@@ -174,10 +197,18 @@ typedef struct DISLMDB_env DISLMDB_env;
 /** @brief Opaque structure for a distributed transaction */
 typedef struct DISLMDB_txn DISLMDB_txn;
 
+/** @brief Cross-region / multi-region data placement */
+typedef enum DISLMDB_TOPOLOGY_MODE {
+    DISLMDB_TOPO_MIRROR = 0, /**< Every region holds a full replica (async) */
+    DISLMDB_TOPO_SHARD = 1,  /**< Key → region/owner via shard map */
+    DISLMDB_TOPO_HYBRID = 2  /**< Hot prefixes mirrored; cold sharded */
+} DISLMDB_TOPOLOGY_MODE;
+
 /**
  * @brief Configuration for a DisLMDB environment
- * 
- * Combines the original LMDB configuration with distribution parameters
+ *
+ * Combines LMDB parameters with distribution. Region/locality/voting/secrets
+ * may also come from process env at open (`DISLMDB_REGION`, `DISLMDB_VOTING`, …).
  */
 typedef struct DISLMDB_env_config {
     /* Base LMDB configuration */
@@ -195,6 +226,18 @@ typedef struct DISLMDB_env_config {
     uint32_t sync_interval_ms;         /**< Interval between sync attempts */
     uint32_t max_sync_batch_size;      /**< Maximum batch size for sync */
     char node_name[64];                /**< Human-readable node name */
+
+    /* Regional topology (env-overridable) */
+    char region[64];                   /**< e.g. us-east — local voter plane */
+    char locality[64];                 /**< AZ / rack / city */
+    DISLMDB_TOPOLOGY_MODE topology_mode; /**< mirror | shard | hybrid */
+    uint32_t rtt_budget_ms;            /**< Soft reject peers slower than this (0=off) */
+    uint8_t region_key[32];            /**< Intra-region HMAC/AEAD (optional) */
+    bool has_region_key;
+    uint8_t cross_region_key[32];      /**< Inter-region plane key (optional) */
+    bool has_cross_region_key;
+    /** Soft peer ceiling (0 = unlimited). No hard deny at 64. */
+    uint32_t max_peers;
 } DISLMDB_env_config;
 
 /**
@@ -345,6 +388,15 @@ int dislmdb_get_node_state(DISLMDB_env *env, const char *node_id,
  */
 int dislmdb_get_leader(DISLMDB_env *env, char *leader_id, size_t id_size);
 
+/** @brief Copy configured region id (may be empty). */
+int dislmdb_get_region(DISLMDB_env *env, char *out, size_t out_sz);
+/** @brief Copy configured locality (may be empty). */
+int dislmdb_get_locality(DISLMDB_env *env, char *out, size_t out_sz);
+/** @brief Current topology mode (mirror/shard/hybrid). */
+int dislmdb_get_topology_mode(DISLMDB_env *env, DISLMDB_TOPOLOGY_MODE *out);
+/** @brief Whether this node participates in elections/quorum. */
+bool dislmdb_voting_enabled(DISLMDB_env *env);
+
 /**
  * @brief Force sync with other nodes
  * 
@@ -381,8 +433,8 @@ int dislmdb_set_status_callback(DISLMDB_env *env,
  * @param[in] bytecode_id Identifier for the bytecode
  * @param[in] options Additional options for bytecode storage
  *            0 - Default behavior
- *            DISLMDB_BYTECODE_VERIFY - Verify bytecode integrity before storage
- *            DISLMDB_BYTECODE_COMPRESS - Compress bytecode before storage
+ *            DISLMDB_BYTECODE_VERIFY - Persist SHA-256 and verify on get/apply
+ *            DISLMDB_BYTECODE_COMPRESS - Reserved; returns NOT_IMPLEMENTED
  * @return #DISLMDB_SUCCESS on success, error code on failure
  */
 int dislmdb_store_bytecode(DISLMDB_env *env, 
@@ -442,8 +494,20 @@ int dislmdb_checkpoint(DISLMDB_env *env);
 /** @brief Request state transfer from the current primary (or any peer) */
 int dislmdb_request_state_transfer(DISLMDB_env *env);
 
-/** @brief Read runtime metrics */
+/** @brief Read runtime metrics snapshot */
 int dislmdb_get_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics);
+
+/**
+ * @brief Format a metrics snapshot as Prometheus text exposition.
+ *
+ * Writes into @p buf (NUL-terminated when buf_sz > 0). @p written receives
+ * the byte count excluding the trailing NUL (or would-be size if truncated).
+ * Safe to call with a stack-filled DISLMDB_metrics from dislmdb_get_metrics.
+ */
+int dislmdb_format_metrics(const DISLMDB_metrics *metrics,
+                           char *buf,
+                           size_t buf_sz,
+                           size_t *written);
 
 /**
  * @brief Reconfigure replica membership

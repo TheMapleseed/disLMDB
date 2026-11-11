@@ -112,6 +112,9 @@ int main(void)
                 st.dqgm_packets_rx == 0 && st.dqgm_cid_mismatch == 0 &&
                 st.dqgm_replay_drop == 0 && st.dqgm_session_rebind == 0 &&
                 st.dqgm_ack_rx == 0 && st.dqgm_ack_advance == 0);
+    EXPECT_TRUE(&ctx, "stats_outbox_zero",
+                st.outbox_enqueued == 0 && st.outbox_drained == 0 &&
+                st.outbox_dropped == 0);
 
     return test_end(&ctx);
 }

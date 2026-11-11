@@ -3,7 +3,8 @@
  * @brief Sandbox-safe multi-node cluster harness (no LMDB / no mmap)
  *
  * In-memory KV + message bus + Raft. Mirrors integration scenarios:
- * multinode replicate, UDP-style bus delivery, fault after kill, Raft election.
+ * multinode replicate, UDP-style bus delivery, fault after kill, Raft election,
+ * spontaneous spawn/despawn, and adversarial drop.
  */
 #ifndef DISLMDB_CLUSTER_RIG_H
 #define DISLMDB_CLUSTER_RIG_H
@@ -42,6 +43,7 @@ typedef struct RigConfig {
     uint32_t election_timeout_max_ms;
     uint32_t heartbeat_ms;
     const char *id_prefix;         /* e.g. "n" → n0,n1,… ; NULL → "rig" */
+    uint32_t drop_pct;             /* 0..100 — random bus drop (adversity) */
 } RigConfig;
 
 RigConfig rig_config_default(void);
@@ -54,6 +56,23 @@ void rig_cluster_destroy(RigCluster *c);
 void rig_kill(RigCluster *c, uint32_t index);
 void rig_revive(RigCluster *c, uint32_t index);
 bool rig_alive(const RigCluster *c, uint32_t index);
+bool rig_in_use(const RigCluster *c, uint32_t index);
+
+/**
+ * Spontaneous join: allocate a free slot, create Raft node, wire peers,
+ * start elections. Returns slot index or -1.
+ */
+int rig_spawn(RigCluster *c, const char *node_id);
+
+/**
+ * Spontaneous leave: unpeer from the cluster, stop and destroy the node.
+ * Slot becomes free for a later spawn.
+ */
+int rig_despawn(RigCluster *c, uint32_t index);
+
+/** Adversity controls (applied on deliver). */
+void rig_set_drop_pct(RigCluster *c, uint32_t pct);
+uint64_t rig_dropped_msgs(const RigCluster *c);
 
 /** Wait until some alive node reports a leader. 0 on success. */
 int rig_wait_leader(RigCluster *c, char *out_id, size_t out_len, int timeout_ms);
@@ -69,7 +88,12 @@ int rig_get(const RigCluster *c, uint32_t node_index, const char *key,
 int rig_wait_get(RigCluster *c, uint32_t node_index, const char *key,
                  const char *expect, int timeout_ms);
 
-uint32_t rig_node_count(const RigCluster *c);
+/** Wait until every in-use+alive node sees key==expect. */
+int rig_wait_get_all_alive(RigCluster *c, const char *key, const char *expect,
+                           int timeout_ms);
+
+uint32_t rig_node_count(const RigCluster *c); /* initial configured count */
+uint32_t rig_active_count(const RigCluster *c); /* in_use slots */
 const char *rig_node_id(const RigCluster *c, uint32_t index);
 
 /** Counters for MIXED dual-lane delivery (0 on BUS/DGRAM). */

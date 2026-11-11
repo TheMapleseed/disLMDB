@@ -1,218 +1,163 @@
 # DisLMDB: Distributed Lightning Memory-Mapped Database
 
-DisLMDB is a distributed version of the [Lightning Memory-Mapped Database (LMDB)](https://symas.com/lmdb/), designed to provide synchronized database operations across multiple nodes using a Byzantine Fault Tolerance consensus mechanism.
+DisLMDB extends [LMDB](https://symas.com/lmdb/) with multi-node replication: Raft or Enhanced-PBFT consensus, TCP/UDP/BOTH transports, mTLS 1.3, and HMAC/AEAD cluster crypto. Storage remains LMDB’s mmap’d B+tree; consensus logs are in-memory today (see durability notes below).
 
-## Features
+Proprietary software — The Mapleseed Inc. Commercial license required.
 
-- **Distributed Database**: Synchronize operations across multiple nodes
-- **ACID Compliance**: Retains all the ACID properties of the original LMDB
-- **Consensus**: Enhanced-PBFT and Raft (`DISLMDB_CONSENSUS_RAFT`) with joint-consensus membership changes
-- **Transports**: TCP, UDP (DQGM v3 session envelope + packet numbers + cumulative ACK + CID rebind + peer-restart catch-up), and **BOTH** (UDP signalling + TCP data, with fallback)
-- **mTLS 1.3**: Portable mutual TLS (`enable_mtls`) via vendored Mbed TLS — same stack on every host
-- **Shard map**: Native key-prefix → owner affinity (`dislmdb_shard_map_*`), replicated via SMAP consensus
-- **Graceful leave**: `dislmdb_remove_node` broadcasts LEAVE and shrinks Raft voter sets
-- **Operation status**: `dislmdb_consensus_get_operation_status` / `get_last_op_id` via the local oplog ring
-- **DQGM metrics**: `dislmdb_get_metrics` exposes UDP session rx / CID mismatch / replay drop / rebind / ACK counters
-- **Modern C Implementation**: Written in modern C (C23 standard)
-- **Zero-Copy Design**: Inherits LMDB's zero-copy memory-mapped architecture for high performance
-- **Node Discovery**: HELLO/JOIN mesh engage before Raft elections
-- **Bytecode distribution**: Consensus-replicated ML/bytecode blobs (plus SOLO local store)
+## What works today
+
+| Area | Status |
+| --- | --- |
+| **Consensus** | Enhanced-PBFT and Raft (`DISLMDB_CONSENSUS_*`), joint-consensus membership, graceful leave |
+| **Voting** | First-class; `DISLMDB_VOTING=off` / `enable_voting=false` → learner (no campaign / no vote grant) |
+| **Transports** | TCP, UDP (DQGM v3: pkt_num, cumulative ACK, CID rebind, peer-restart), **BOTH** (UDP signalling + TCP data) |
+| **Crypto** | Cluster key HMAC + AEAD payload encryption; portable mTLS 1.3 via vendored Mbed TLS |
+| **Topology** | Env: `DISLMDB_REGION` / `LOCALITY` / `TOPOLOGY_MODE` / secrets / `MAX_PEERS`; persisted region fields; same-region dial preference |
+| **Scale** | Heap-growable peer + connection tables; soft `max_peers` (0 = unlimited). Full mesh still latency-bound |
+| **Shard map** | `dislmdb_shard_map_*` + SMAP consensus blob; longest-prefix owner lookup |
+| **Bytecode** | Consensus-replicated (or SOLO) store/get; `DISLMDB_BYTECODE_VERIFY` (SHA-256 on disk). Compress flag reserved (`NOT_IMPLEMENTED`) |
+| **Metrics** | `dislmdb_get_metrics` + `dislmdb_format_metrics` (Prometheus text). Covers commits, consensus, Raft term/commit, DQGM, outbox |
+| **Ops status** | `dislmdb_consensus_get_operation_status` / `get_last_op_id` via local oplog ring |
+| **Discovery** | HELLO/JOIN mesh engage before Raft elections |
+
+## Durability (honest)
+
+| What | Durable? |
+| --- | --- |
+| User KV / LMDB pages | **Yes** — mmap + commit / `dislmdb_force_sync` / checkpoint |
+| Meta (view, replicas, shard map, region) | **Yes** when `persist_state` |
+| Raft / PBFT log | **RAM** — catch-up after restart; Raft WAL is roadmap |
+| Network outbox / DQGM counters | RAM |
+
+Local ACID properties of LMDB still apply per node. Cross-node linearizability depends on the consensus path completing before the client sees success.
+
+## Not done / not claimed
+
+- Regional hierarchical Raft (global mesh still the default)
+- Raft WAL + snapshots
+- `DISLMDB_BYTECODE_COMPRESS`
+- Access-control layer / language bindings / full QUIC stack
+- Built-in Prometheus HTTP scrape port (format text yourself and expose)
 
 ## Requirements
 
-- C23 compatible compiler (GCC 13+ or Clang 16+)
-- Vendored Mbed TLS under `third_party/mbedtls` (TLS 1.3 mTLS; no OS-specific TLS stack)
-- OpenSSL *libcrypto* on non-Apple hosts (hash/HMAC only), or Apple CommonCrypto on Darwin
-- UUID development libraries (`uuid-dev`) on Linux
-- POSIX-compliant operating system
-- CMake 3.16 or higher (optional; Makefile is the primary build)
+- C23 compiler (GCC 13+ or Clang 16+)
+- Vendored Mbed TLS (`third_party/mbedtls`) for mTLS 1.3
+- OpenSSL *libcrypto* (non-Apple) or Apple CommonCrypto
+- `uuid` on Linux; POSIX OS
+- Makefile primary; CMake 3.16+ optional
 
-## Building
-
-Makefile (recommended on macOS; no Homebrew required):
+## Build & test
 
 ```bash
-make                 # build + sandbox-safe suite (no LMDB mmap)
-make check-sandbox   # unit + mTLS/Raft rigs — safe in Cursor agent sandbox
-make check-integration  # cluster/e2e — needs a normal unsandboxed shell
-make check           # everything
-make lib             # libraries only
+make                 # build + sandbox-safe suite
+make check-sandbox   # unit + rigs (no LMDB mmap — agent/sandbox safe)
+make check-integration
+make check-orb       # Docker/OrbStack
+make check           # sandbox + unit + integration
+make lib
 ```
-
-Agent sandboxes block LMDB `mmap`. Use `make check-sandbox` / `tests/rig/` (shared `cluster_rig` covers multinode / UDP / Raft / fault scenarios in-memory); run `make check-integration` locally for full LMDB cluster proof.
-
-CMake:
-
-```bash
-mkdir build && cd build
-cmake ..
-cmake --build .   # builds and runs CTest via the build_and_test target
-ctest --output-on-failure
-```
-
-### Tests
 
 | Layer | Location | Role |
 | --- | --- | --- |
-| Unit | `tests/unit/` | Crypto, AEAD, TV-BLAKE3 |
-| Rig (sandbox) | `tests/rig/` | In-memory multi-node consensus / mTLS / fault (no LMDB mmap) |
-| Integration | `tests/integration/`, `tests/dislmdb_test.c` | Ops, persist, membership, LMDB basics |
-| Orb (Docker) | `tests/orb/` | Join, spawn, shard-prefix on real containers (OrbStack/Docker) |
-| E2E | `tests/e2e/` | Scenario scripts vs golden `expected/*.out` |
+| Unit | `tests/unit/` | Raft, crypto, metrics format, transport |
+| Rig | `tests/rig/` | In-memory multi-node / fault (no LMDB mmap) |
+| Integration | `tests/integration/` | LMDB cluster, mTLS, matrix, topo env |
+| Orb | `tests/orb/` | Container join / shard |
+| E2E | `tests/e2e/` | Scenario scripts vs golden outputs |
 
-```bash
-make check-sandbox       # agent-safe
-make check-integration   # host LMDB
-make check-orb           # OrbStack / Docker cluster
-make check               # sandbox + unit + integration (+ e2e)
-```
+Agent sandboxes block LMDB `mmap` — use `check-sandbox` there; run `check-integration` on a normal host shell.
 
-### Attribution
-
-See [TRIBUTE_HOWARD_CHU.md](TRIBUTE_HOWARD_CHU.md) for a tribute to Howard Chu, inventor of LMDB, documenting the English Wikipedia article on Lightning Memory-Mapped Database.
-
-## Usage
-
-Here's a basic example of how to use DisLMDB:
+## Quick start (solo)
 
 ```c
 #include <dislmdb.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 int main(void) {
-    DISLMDB_env *env;
-    DISLMDB_txn *txn;
-    MDB_dbi dbi;
-    int rc;
-    
-    // Initialize configuration
+    DISLMDB_env *env = NULL;
     DISLMDB_env_config config;
     dislmdb_env_config_init(&config);
-    
-    // Set configuration parameters
     config.path = "./testdb";
-    config.lmdb_flags = 0;
-    config.mapsize = 10485760;  // 10MB
-    config.network.local_port = 9876;
-    
-    // Create environment
-    rc = dislmdb_env_create(&env);
-    if (rc != 0) {
-        fprintf(stderr, "Error creating environment: %s\n", dislmdb_strerror(rc));
+    config.mapsize = 10 * 1024 * 1024;
+    config.consensus.mechanism = DISLMDB_CONSENSUS_SOLO;
+
+    if (dislmdb_env_create(&env) || dislmdb_env_open(env, &config)) {
         return 1;
     }
-    
-    // Open environment
-    rc = dislmdb_env_open(env, &config);
-    if (rc != 0) {
-        fprintf(stderr, "Error opening environment: %s\n", dislmdb_strerror(rc));
+
+    DISLMDB_txn *txn = NULL;
+    if (dislmdb_txn_begin(env, NULL, 0, &txn)) {
         dislmdb_env_close(env);
         return 1;
     }
-    
-    // Begin transaction
-    rc = dislmdb_txn_begin(env, NULL, 0, &txn);
-    if (rc != 0) {
-        fprintf(stderr, "Error beginning transaction: %s\n", dislmdb_strerror(rc));
-        dislmdb_env_close(env);
-        return 1;
-    }
-    
-    // Get underlying LMDB transaction for database operations
-    MDB_txn *mdb_txn = dislmdb_get_lmdb_txn(txn);
-    
-    // Open database
-    rc = mdb_dbi_open(mdb_txn, "testdb", MDB_CREATE, &dbi);
-    if (rc != 0) {
-        fprintf(stderr, "Error opening database: %s\n", mdb_strerror(rc));
-        dislmdb_txn_abort(txn);
-        dislmdb_env_close(env);
-        return 1;
-    }
-    
-    // Put data
-    MDB_val key, data;
-    key.mv_size = 5;
-    key.mv_data = "hello";
-    data.mv_size = 5;
-    data.mv_data = "world";
-    
-    rc = mdb_put(mdb_txn, dbi, &key, &data, 0);
-    if (rc != 0) {
-        fprintf(stderr, "Error putting data: %s\n", mdb_strerror(rc));
-        dislmdb_txn_abort(txn);
-        dislmdb_env_close(env);
-        return 1;
-    }
-    
-    // Commit transaction
-    rc = dislmdb_txn_commit(txn);
-    if (rc != 0) {
-        fprintf(stderr, "Error committing transaction: %s\n", dislmdb_strerror(rc));
-        dislmdb_env_close(env);
-        return 1;
-    }
-    
-    // Close environment
+    MDB_dbi dbi;
+    MDB_txn *mt = dislmdb_get_lmdb_txn(txn);
+    mdb_dbi_open(mt, "kv", MDB_CREATE, &dbi);
+    MDB_val k = {.mv_size = 5, .mv_data = "hello"};
+    MDB_val v = {.mv_size = 5, .mv_data = "world"};
+    mdb_put(mt, dbi, &k, &v, 0);
+    dislmdb_txn_commit(txn);
+
+    DISLMDB_metrics m;
+    char buf[4096];
+    size_t n = 0;
+    dislmdb_get_metrics(env, &m);
+    dislmdb_format_metrics(&m, buf, sizeof(buf), &n);
+    /* ship buf to your scrape endpoint / log */
+
     dislmdb_env_close(env);
-    
     return 0;
 }
 ```
 
-## Distributed Operation
+Multi-node deployments **must** set a shared cluster key (`dislmdb_set_cluster_key` / `network.has_cluster_key`) or open fails closed. Prefer Raft for crashy LANs; PBFT when Byzantine tolerance matters. See `examples/`.
 
-To connect multiple nodes:
+## Topology env (large / regional fleets)
 
-```c
-// After environment creation, add nodes to the cluster
-DISLMDB_node_addr node;
-strncpy(node.hostname, "other-node.example.com", sizeof(node.hostname) - 1);
-node.port = 9876;
-strncpy(node.node_id, "node-id-string", sizeof(node.node_id) - 1);
-
-rc = dislmdb_add_node(env, &node);
-if (rc != 0) {
-    fprintf(stderr, "Error adding node: %s\n", dislmdb_strerror(rc));
-}
-```
+| Variable | Role |
+| --- | --- |
+| `DISLMDB_VOTING` | `on`/`off` — hubs vote; edges can be learners |
+| `DISLMDB_REGION` / `DISLMDB_LOCALITY` | Affinity for dial preference + persist |
+| `DISLMDB_REGION_SECRET` / `DISLMDB_CROSS_REGION_SECRET` | Intra- / inter-region key material |
+| `DISLMDB_TOPOLOGY_MODE` | `mirror` \| `shard` \| `hybrid` |
+| `DISLMDB_MAX_PEERS` | Soft membership cap (`0` = unlimited) |
+| `DISLMDB_RTT_BUDGET_MS` | Soft RTT budget (admit policy evolving) |
+| `DISLMDB_SEED_REGIONAL` | Comma-separated `host:port` seeds |
 
 ## Architecture
 
-DisLMDB is designed with the following components:
+1. **Core API** — LMDB transactions + distributed helpers (`include/dislmdb.h`)
+2. **Consensus** — `Enhanced-Raft-mechanism/` or `Enhanced-PBFT-mechanism/` via adapters
+3. **Network** — framed messages, DQGM UDP, outbox, mTLS (`src/network/`)
+4. **Storage** — LMDB mmap + meta DBI persist (`src/utils/dislmdb_persist.c`)
 
-1. **Core API Layer**: Extensions to LMDB for distributed operations
-2. **Consensus Layer**: PBFT-based consensus mechanism
-3. **Network Layer**: Communication between nodes
-4. **Storage Layer**: Underlying LMDB storage
+## Metrics
 
-## Byzantine Fault Tolerance
+```c
+DISLMDB_metrics m;
+dislmdb_get_metrics(env, &m);
+/* m.raft_term, m.dqgm_packets_rx, m.outbox_dropped, … */
 
-DisLMDB implements the Practical Byzantine Fault Tolerance (PBFT) algorithm, which provides consensus with the following properties:
+char text[8192];
+size_t n = 0;
+dislmdb_format_metrics(&m, text, sizeof(text), &n);
+```
 
-- Safety and liveness in an asynchronous environment
-- Highly optimized for normal operation
-- Tolerates f faulty nodes in a system with 3f+1 total nodes
-- Designed for minimal overhead during normal operation
+No embedded scrape HTTP server — expose `text` from your process supervisor or sidecar.
 
-## License
+## Attribution
 
-DisLMDB is commercial proprietary software owned by The Mapleseed Inc. This software is provided under a commercial license agreement only and requires payment of license fees.
-
-Use, distribution, or copying of this software without a valid license agreement is strictly prohibited.
-
-Copyright 2025 David Harmon, The Mapleseed Inc. All rights reserved.
-
-## Contributing
-
-Contributions are governed by the terms of our Contributor License Agreement. Please contact us before submitting any contributions.
+See [TRIBUTE_HOWARD_CHU.md](TRIBUTE_HOWARD_CHU.md).
 
 ## Roadmap
 
-- Implement additional consensus algorithms
-- Add encryption for inter-node communication
-- Add support for access control
-- Improve documentation and examples
-- Add benchmarks and performance optimization
-- Create bindings for other programming languages 
+Tracked in [TODO.md](TODO.md): regional Raft groups, Raft WAL/snapshots, RTT admit, cross-region key planes, QUIC, I/O worker pool.
+
+## License
+
+Commercial proprietary — The Mapleseed Inc. Unauthorized use prohibited.  
+Copyright 2025–2026 David Harmon, The Mapleseed Inc.
+
+## Contributing
+
+CLA required. Contact us before submitting contributions.

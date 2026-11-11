@@ -98,20 +98,10 @@ int dislmdb_raft_init(DISLMDB_env *env)
     cfg.heartbeat_ms = env->config.consensus.heartbeat_interval_ms
                            ? env->config.consensus.heartbeat_interval_ms
                            : 100;
+    cfg.enable_voting = env->config.consensus.enable_voting;
 
-    /* Seed peers from the configured node table; HELLO may add more before start. */
-    pthread_mutex_lock(&env->nodes_mutex);
-    for (uint32_t i = 0; i < env->node_count && cfg.peer_count < RAFT_MAX_PEERS; i++) {
-        if (strncmp(env->nodes[i].node_id, env->local_node_id, RAFT_NODE_ID_LEN) == 0) {
-            continue;
-        }
-        if (strncmp(env->nodes[i].node_id, "seed-", 5) == 0) {
-            continue;
-        }
-        strncpy(cfg.peer_ids[cfg.peer_count], env->nodes[i].node_id, RAFT_NODE_ID_LEN - 1);
-        cfg.peer_count++;
-    }
-    pthread_mutex_unlock(&env->nodes_mutex);
+    /* Peers grow via raft_add_peer after create (uncapped heap tables). */
+    cfg.peer_count = 0;
 
     raft_adapter_ctx *actx = calloc(1, sizeof(*actx));
     if (!actx) {
@@ -124,9 +114,10 @@ int dislmdb_raft_init(DISLMDB_env *env)
         free(actx);
         return DISLMDB_ERR_MEMORY_ERROR;
     }
+    raft_sync_peers_from_env(actx);
     env->consensus_context = actx;
     env->pbft_state.is_primary = false;
-    env->pbft_state.node_count = cfg.peer_count + 1;
+    env->pbft_state.node_count = raft_peer_count(actx->node) + 1;
     env->pbft_state.f = 0;
     strncpy(env->pbft_state.primary_id, "", sizeof(env->pbft_state.primary_id) - 1);
 
@@ -214,10 +205,30 @@ static void raft_record_commit(DISLMDB_env *env)
 }
 
 /** Propose opaque consensus payload (oplog / BCOD / SMAP); takes ownership of data. */
+void dislmdb_raft_fill_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics)
+{
+    if (!env || !metrics || !env->consensus_context ||
+        env->config.consensus.mechanism != DISLMDB_CONSENSUS_RAFT) {
+        return;
+    }
+    raft_adapter_ctx *actx = env->consensus_context;
+    if (!actx->node) {
+        return;
+    }
+    metrics->raft_term = raft_term(actx->node);
+    metrics->raft_commit_index = raft_commit_index(actx->node);
+    metrics->raft_peer_count = raft_peer_count(actx->node);
+    metrics->is_leader = raft_is_leader(actx->node);
+    metrics->voting_enabled = raft_voting_enabled(actx->node);
+    metrics->current_view = (uint32_t)metrics->raft_term;
+    metrics->last_committed_seq = metrics->raft_commit_index;
+}
+
 static int raft_propose_owned(DISLMDB_env *env, uint8_t *data, size_t size)
 {
     raft_adapter_ctx *actx = env->consensus_context;
     RaftNode *node = actx->node;
+    env->consensus_proposes++;
 
     for (int i = 0; i < 50 && !raft_is_leader(node); i++) {
         struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
@@ -336,11 +347,15 @@ int dislmdb_raft_remove_peer(DISLMDB_env *env, const char *node_id)
         return DISLMDB_ERR_IN_PROGRESS;
     }
 
-    char peers[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
+    char (*peers)[RAFT_NODE_ID_LEN] = NULL;
     uint32_t pc = 0;
-    memset(peers, 0, sizeof(peers));
+    uint32_t pcap = env->node_count > 0 ? env->node_count : 1u;
+    peers = calloc(pcap, sizeof(*peers));
+    if (!peers) {
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
     pthread_mutex_lock(&env->nodes_mutex);
-    for (uint32_t i = 0; i < env->node_count && pc < RAFT_MAX_PEERS; i++) {
+    for (uint32_t i = 0; i < env->node_count; i++) {
         const char *id = env->nodes[i].node_id;
         if (strncmp(id, env->local_node_id, RAFT_NODE_ID_LEN) == 0) {
             continue;
@@ -351,6 +366,9 @@ int dislmdb_raft_remove_peer(DISLMDB_env *env, const char *node_id)
         if (strncmp(id, "seed-", 5) == 0) {
             continue;
         }
+        if (pc >= pcap) {
+            break;
+        }
         strncpy(peers[pc], id, RAFT_NODE_ID_LEN - 1);
         peers[pc][RAFT_NODE_ID_LEN - 1] = '\0';
         pc++;
@@ -359,6 +377,7 @@ int dislmdb_raft_remove_peer(DISLMDB_env *env, const char *node_id)
 
     RaftError err = raft_propose_membership(actx->node, peers, pc,
                                             env->config.consensus.timeout_ms);
+    free(peers);
     if (err != RAFT_OK) {
         switch (err) {
             case RAFT_ERR_TIMEOUT: return DISLMDB_ERR_CONSENSUS_TIMEOUT;
@@ -414,6 +433,9 @@ int dislmdb_raft_store_bytecode(DISLMDB_env *env,
     }
     if (bytecode_size == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (options & DISLMDB_BYTECODE_COMPRESS) {
+        return DISLMDB_ERR_NOT_IMPLEMENTED;
     }
     raft_adapter_ctx *actx = env->consensus_context;
     if (!actx->started) {
@@ -500,24 +522,25 @@ int dislmdb_raft_reconfigure(DISLMDB_env *env,
     if (!actx->started) {
         return DISLMDB_ERR_NOT_INITIALIZED;
     }
-    if (node_count > RAFT_MAX_PEERS + 1) {
+    if (env->config.max_peers != 0 && node_count > env->config.max_peers) {
         return DISLMDB_ERR_MAX_NODES;
     }
 
-    char peers[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
+    char (*peers)[RAFT_NODE_ID_LEN] = calloc(node_count > 0 ? node_count : 1u,
+                                            sizeof(*peers));
+    if (!peers) {
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
     uint32_t pc = 0;
-    memset(peers, 0, sizeof(peers));
 
     for (size_t i = 0; i < node_count; i++) {
         int arc = dislmdb_add_node(env, &nodes[i]);
         if (arc != DISLMDB_SUCCESS) {
+            free(peers);
             return arc;
         }
         if (strncmp(nodes[i].node_id, env->local_node_id, RAFT_NODE_ID_LEN) == 0) {
             continue;
-        }
-        if (pc >= RAFT_MAX_PEERS) {
-            return DISLMDB_ERR_MAX_NODES;
         }
         strncpy(peers[pc], nodes[i].node_id, RAFT_NODE_ID_LEN - 1);
         peers[pc][RAFT_NODE_ID_LEN - 1] = '\0';
@@ -535,11 +558,13 @@ int dislmdb_raft_reconfigure(DISLMDB_env *env,
         nanosleep(&ts, NULL);
     }
     if (!raft_is_leader(actx->node)) {
+        free(peers);
         return DISLMDB_ERR_NO_LEADER;
     }
 
     RaftError err = raft_propose_membership(actx->node, peers, pc,
                                             env->config.consensus.timeout_ms);
+    free(peers);
     if (err != RAFT_OK) {
         switch (err) {
             case RAFT_ERR_TIMEOUT: return DISLMDB_ERR_CONSENSUS_TIMEOUT;

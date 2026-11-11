@@ -111,6 +111,32 @@ int main(void)
                   dislmdb_get_bytecode(env, "solo-bc-1", bout, &bsz, &bopts), 0);
     EXPECT_EQ_INT(&ctx, "solo_bc_len", (int)bsz, (int)sizeof(bc));
 
+    EXPECT_EQ_INT(&ctx, "bc_compress_nyi",
+                  dislmdb_store_bytecode(env, bc, sizeof(bc), "solo-bc-c",
+                                         DISLMDB_BYTECODE_COMPRESS),
+                  DISLMDB_ERR_NOT_IMPLEMENTED);
+    EXPECT_EQ_INT(&ctx, "solo_bc_verify",
+                  dislmdb_store_bytecode(env, bc, sizeof(bc), "solo-bc-v",
+                                         DISLMDB_BYTECODE_VERIFY),
+                  0);
+    bsz = sizeof(bout);
+    bopts = 0;
+    EXPECT_EQ_INT(&ctx, "solo_bc_verify_get",
+                  dislmdb_get_bytecode(env, "solo-bc-v", bout, &bsz, &bopts), 0);
+    EXPECT_EQ_INT(&ctx, "solo_bc_verify_len", (int)bsz, (int)sizeof(bc));
+    EXPECT_TRUE(&ctx, "solo_bc_verify_flag",
+                (bopts & DISLMDB_BYTECODE_VERIFY) != 0);
+
+    DISLMDB_metrics m2;
+    EXPECT_EQ_INT(&ctx, "metrics2", dislmdb_get_metrics(env, &m2), 0);
+    EXPECT_TRUE(&ctx, "metrics2_ops", m2.total_operations >= 1);
+    char mbuf[4096];
+    size_t mw = 0;
+    EXPECT_EQ_INT(&ctx, "metrics_fmt",
+                  dislmdb_format_metrics(&m2, mbuf, sizeof(mbuf), &mw), 0);
+    EXPECT_TRUE(&ctx, "metrics_fmt_len", mw > 100 && mw < sizeof(mbuf));
+    EXPECT_TRUE(&ctx, "metrics_prom", strstr(mbuf, "dislmdb_commits_total") != NULL);
+
     dislmdb_env_close(env);
     rm_rf(DBPATH);
     return test_end(&ctx);

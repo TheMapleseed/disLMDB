@@ -320,25 +320,26 @@ int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t
         const uint8_t *bytecode = data + o;
         size_t bytecode_size = size - o;
 
+        uint8_t *stored = NULL;
+        size_t stored_size = 0;
+        int rc = dislmdb_bytecode_pack(options, bytecode, bytecode_size, &stored, &stored_size);
+        if (rc != DISLMDB_SUCCESS) {
+            return rc;
+        }
+
         MDB_txn *txn = NULL;
-        int rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
+        rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
         if (rc != 0) {
+            free(stored);
             return rc;
         }
         MDB_dbi dbi;
         rc = mdb_dbi_open(txn, BYTECODE_DBI_NAME, MDB_CREATE, &dbi);
         if (rc != 0) {
+            free(stored);
             mdb_txn_abort(txn);
             return rc;
         }
-        size_t stored_size = 4 + bytecode_size;
-        uint8_t *stored = malloc(stored_size);
-        if (!stored) {
-            mdb_txn_abort(txn);
-            return DISLMDB_ERR_MEMORY_ERROR;
-        }
-        dislmdb_write_u32(stored, options);
-        memcpy(stored + 4, bytecode, bytecode_size);
         MDB_val key = {.mv_size = id_len, .mv_data = bytecode_id};
         MDB_val val = {.mv_size = stored_size, .mv_data = stored};
         rc = mdb_put(txn, dbi, &key, &val, 0);
@@ -352,6 +353,7 @@ int dislmdb_pbft_apply_transaction(DISLMDB_env *env, const uint8_t *data, size_t
             return rc;
         }
         env->consensus_commits++;
+        env->total_operations++;
         return DISLMDB_SUCCESS;
     }
 
@@ -805,6 +807,9 @@ int dislmdb_pbft_store_bytecode(DISLMDB_env *env,
     }
     if (bytecode_size == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (options & DISLMDB_BYTECODE_COMPRESS) {
+        return DISLMDB_ERR_NOT_IMPLEMENTED;
     }
 
     ConsensusCore *core = env->consensus_context;

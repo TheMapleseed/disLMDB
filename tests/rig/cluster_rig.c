@@ -34,16 +34,20 @@ struct RigCluster {
     char ids[RIG_MAX_NODES][RIG_ID_LEN];
     RaftNode *nodes[RIG_MAX_NODES];
     RigNodeCtx ctx[RIG_MAX_NODES];
+    bool in_use[RIG_MAX_NODES];
     bool alive[RIG_MAX_NODES];
     RigKvSlot kv[RIG_MAX_NODES][RIG_KV_SLOTS];
     pthread_mutex_t lock;
     BusMsg *head;
     BusMsg *tail;
-    /* MIXED: signalling lane (votes / vote replies) separate from data lane */
     BusMsg *sig_head;
     BusMsg *sig_tail;
     uint64_t signal_msgs;
     uint64_t data_msgs;
+    uint64_t dropped_msgs;
+    uint32_t drop_pct;
+    uint32_t rng;
+    uint32_t spawn_seq;
     pthread_t dispatcher;
     bool running;
     bool dispatcher_started;
@@ -54,10 +58,34 @@ static bool raft_msg_is_signal(RaftMsgType t)
     return t == RAFT_MSG_REQUEST_VOTE || t == RAFT_MSG_REQUEST_VOTE_REPLY;
 }
 
+static uint32_t rig_rand(RigCluster *c)
+{
+    /* xorshift32 — deterministic adversity without libc rand locking */
+    uint32_t x = c->rng ? c->rng : 0xA5A5u;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    c->rng = x ? x : 0xA5A5u;
+    return c->rng;
+}
+
 static int idx_of(RigCluster *c, const char *id)
 {
-    for (uint32_t i = 0; i < c->cfg.node_count; i++) {
+    for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+        if (!c->in_use[i]) {
+            continue;
+        }
         if (strncmp(c->ids[i], id, RIG_ID_LEN) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int find_free_slot(const RigCluster *c)
+{
+    for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+        if (!c->in_use[i]) {
             return (int)i;
         }
     }
@@ -98,7 +126,6 @@ static int kv_get(const RigCluster *c, uint32_t ni, const char *key,
     return -1;
 }
 
-/* Wire format: "PUT\0key\0value" */
 static int encode_put(const char *key, const char *val, uint8_t **out, size_t *out_len)
 {
     size_t k = strlen(key), v = strlen(val);
@@ -189,7 +216,7 @@ static void on_apply(uint64_t index, const uint8_t *data, size_t len, void *ud)
 {
     (void)index;
     RigNodeCtx *ctx = ud;
-    if (!ctx || !ctx->cluster || ctx->index >= ctx->cluster->cfg.node_count) {
+    if (!ctx || !ctx->cluster || ctx->index >= RIG_MAX_NODES) {
         return;
     }
     apply_put_blob(ctx->cluster, ctx->index, data, len);
@@ -198,7 +225,23 @@ static void on_apply(uint64_t index, const uint8_t *data, size_t len, void *ud)
 static void deliver_bus_msg(RigCluster *c, BusMsg *m)
 {
     int from_i = idx_of(c, m->msg.from);
-    if (from_i >= 0 && !c->alive[from_i]) {
+    if (from_i >= 0 && (!c->in_use[from_i] || !c->alive[from_i])) {
+        raft_message_clear(&m->msg);
+        free(m);
+        return;
+    }
+
+    pthread_mutex_lock(&c->lock);
+    uint32_t drop = c->drop_pct;
+    bool should_drop = false;
+    if (drop > 0) {
+        should_drop = (rig_rand(c) % 100u) < drop;
+        if (should_drop) {
+            c->dropped_msgs++;
+        }
+    }
+    pthread_mutex_unlock(&c->lock);
+    if (should_drop) {
         raft_message_clear(&m->msg);
         free(m);
         return;
@@ -206,12 +249,12 @@ static void deliver_bus_msg(RigCluster *c, BusMsg *m)
 
     if (m->msg.to[0] != '\0') {
         int ti = idx_of(c, m->msg.to);
-        if (ti >= 0 && c->alive[ti] && c->nodes[ti]) {
+        if (ti >= 0 && c->in_use[ti] && c->alive[ti] && c->nodes[ti]) {
             (void)raft_handle_message(c->nodes[ti], &m->msg);
         }
     } else {
-        for (uint32_t i = 0; i < c->cfg.node_count; i++) {
-            if (!c->alive[i] || !c->nodes[i]) {
+        for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+            if (!c->in_use[i] || !c->alive[i] || !c->nodes[i]) {
                 continue;
             }
             if (strncmp(c->ids[i], m->msg.from, RIG_ID_LEN) == 0) {
@@ -230,7 +273,6 @@ static void *dispatch_thread(void *arg)
     while (c->running) {
         BusMsg *m = NULL;
         pthread_mutex_lock(&c->lock);
-        /* MIXED: drain signalling lane first (UDP stand-in), then data (TCP). */
         if (c->sig_head) {
             m = c->sig_head;
             c->sig_head = m->next;
@@ -254,6 +296,26 @@ static void *dispatch_thread(void *arg)
     return NULL;
 }
 
+static RaftNode *make_node(RigCluster *c, uint32_t index)
+{
+    RaftConfig rc = raft_config_default();
+    strncpy(rc.node_id, c->ids[index], RAFT_NODE_ID_LEN - 1);
+    rc.peer_count = 0;
+    for (uint32_t j = 0; j < RIG_MAX_NODES; j++) {
+        if (j == index || !c->in_use[j]) {
+            continue;
+        }
+        strncpy(rc.peer_ids[rc.peer_count], c->ids[j], RAFT_NODE_ID_LEN - 1);
+        rc.peer_count++;
+    }
+    rc.election_timeout_min_ms = c->cfg.election_timeout_min_ms;
+    rc.election_timeout_max_ms = c->cfg.election_timeout_max_ms;
+    rc.heartbeat_ms = c->cfg.heartbeat_ms;
+    c->ctx[index].cluster = c;
+    c->ctx[index].index = index;
+    return raft_create(&rc, on_out, on_apply, &c->ctx[index]);
+}
+
 RigConfig rig_config_default(void)
 {
     RigConfig c;
@@ -264,6 +326,7 @@ RigConfig rig_config_default(void)
     c.election_timeout_max_ms = 160;
     c.heartbeat_ms = 40;
     c.id_prefix = "rig";
+    c.drop_pct = 0;
     return c;
 }
 
@@ -277,33 +340,19 @@ RigCluster *rig_cluster_create(const RigConfig *cfg)
         return NULL;
     }
     c->cfg = *cfg;
+    c->drop_pct = cfg->drop_pct > 100 ? 100 : cfg->drop_pct;
+    c->rng = 0xC0FFEEu ^ (cfg->node_count * 2654435761u);
     pthread_mutex_init(&c->lock, NULL);
 
     const char *pfx = cfg->id_prefix ? cfg->id_prefix : "rig";
     for (uint32_t i = 0; i < cfg->node_count; i++) {
         snprintf(c->ids[i], RIG_ID_LEN, "%s-%u", pfx, i);
+        c->in_use[i] = true;
         c->alive[i] = true;
-        c->ctx[i].cluster = c;
-        c->ctx[i].index = i;
     }
 
-    /* Create every Raft node before starting the bus or elections, so
-     * outbound votes never land on a NULL peer slot. */
     for (uint32_t i = 0; i < cfg->node_count; i++) {
-        RaftConfig rc = raft_config_default();
-        strncpy(rc.node_id, c->ids[i], RAFT_NODE_ID_LEN - 1);
-        rc.peer_count = 0;
-        for (uint32_t j = 0; j < cfg->node_count; j++) {
-            if (j == i) {
-                continue;
-            }
-            strncpy(rc.peer_ids[rc.peer_count], c->ids[j], RAFT_NODE_ID_LEN - 1);
-            rc.peer_count++;
-        }
-        rc.election_timeout_min_ms = cfg->election_timeout_min_ms;
-        rc.election_timeout_max_ms = cfg->election_timeout_max_ms;
-        rc.heartbeat_ms = cfg->heartbeat_ms;
-        c->nodes[i] = raft_create(&rc, on_out, on_apply, &c->ctx[i]);
+        c->nodes[i] = make_node(c, i);
         if (!c->nodes[i]) {
             rig_cluster_destroy(c);
             return NULL;
@@ -313,7 +362,7 @@ RigCluster *rig_cluster_create(const RigConfig *cfg)
     c->running = true;
     if (pthread_create(&c->dispatcher, NULL, dispatch_thread, c) != 0) {
         c->running = false;
-        for (uint32_t i = 0; i < cfg->node_count; i++) {
+        for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
             if (c->nodes[i]) {
                 raft_destroy(c->nodes[i]);
                 c->nodes[i] = NULL;
@@ -336,7 +385,7 @@ void rig_cluster_destroy(RigCluster *c)
     if (!c) {
         return;
     }
-    for (uint32_t i = 0; i < c->cfg.node_count; i++) {
+    for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
         if (c->nodes[i]) {
             raft_stop(c->nodes[i]);
         }
@@ -346,11 +395,13 @@ void rig_cluster_destroy(RigCluster *c)
         pthread_join(c->dispatcher, NULL);
         c->dispatcher_started = false;
     }
-    for (uint32_t i = 0; i < c->cfg.node_count; i++) {
+    for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
         if (c->nodes[i]) {
             raft_destroy(c->nodes[i]);
             c->nodes[i] = NULL;
         }
+        c->in_use[i] = false;
+        c->alive[i] = false;
     }
     while (c->head) {
         BusMsg *m = c->head;
@@ -378,9 +429,24 @@ uint64_t rig_data_msgs(const RigCluster *c)
     return c ? c->data_msgs : 0;
 }
 
+void rig_set_drop_pct(RigCluster *c, uint32_t pct)
+{
+    if (!c) {
+        return;
+    }
+    pthread_mutex_lock(&c->lock);
+    c->drop_pct = pct > 100 ? 100 : pct;
+    pthread_mutex_unlock(&c->lock);
+}
+
+uint64_t rig_dropped_msgs(const RigCluster *c)
+{
+    return c ? c->dropped_msgs : 0;
+}
+
 void rig_kill(RigCluster *c, uint32_t index)
 {
-    if (!c || index >= c->cfg.node_count) {
+    if (!c || index >= RIG_MAX_NODES || !c->in_use[index]) {
         return;
     }
     c->alive[index] = false;
@@ -388,7 +454,7 @@ void rig_kill(RigCluster *c, uint32_t index)
 
 void rig_revive(RigCluster *c, uint32_t index)
 {
-    if (!c || index >= c->cfg.node_count) {
+    if (!c || index >= RIG_MAX_NODES || !c->in_use[index]) {
         return;
     }
     c->alive[index] = true;
@@ -396,7 +462,95 @@ void rig_revive(RigCluster *c, uint32_t index)
 
 bool rig_alive(const RigCluster *c, uint32_t index)
 {
-    return c && index < c->cfg.node_count && c->alive[index];
+    return c && index < RIG_MAX_NODES && c->in_use[index] && c->alive[index];
+}
+
+bool rig_in_use(const RigCluster *c, uint32_t index)
+{
+    return c && index < RIG_MAX_NODES && c->in_use[index];
+}
+
+int rig_spawn(RigCluster *c, const char *node_id)
+{
+    if (!c) {
+        return -1;
+    }
+    pthread_mutex_lock(&c->lock);
+    int slot = find_free_slot(c);
+    if (slot < 0) {
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
+    char idbuf[RIG_ID_LEN];
+    if (node_id && node_id[0] != '\0') {
+        strncpy(idbuf, node_id, RIG_ID_LEN - 1);
+        idbuf[RIG_ID_LEN - 1] = '\0';
+    } else {
+        const char *pfx = c->cfg.id_prefix ? c->cfg.id_prefix : "rig";
+        snprintf(idbuf, sizeof(idbuf), "%s-s%u", pfx, c->spawn_seq++);
+    }
+    if (idx_of(c, idbuf) >= 0) {
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
+    strncpy(c->ids[slot], idbuf, RIG_ID_LEN - 1);
+    c->ids[slot][RIG_ID_LEN - 1] = '\0';
+    c->in_use[slot] = true;
+    c->alive[slot] = true;
+    memset(c->kv[slot], 0, sizeof(c->kv[slot]));
+    pthread_mutex_unlock(&c->lock);
+
+    RaftNode *n = make_node(c, (uint32_t)slot);
+    if (!n) {
+        pthread_mutex_lock(&c->lock);
+        c->in_use[slot] = false;
+        c->alive[slot] = false;
+        c->ids[slot][0] = '\0';
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
+    c->nodes[slot] = n;
+
+    /* Wire existing peers ↔ newcomer */
+    for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+        if ((int)i == slot || !c->in_use[i] || !c->nodes[i]) {
+            continue;
+        }
+        (void)raft_add_peer(c->nodes[i], c->ids[slot]);
+        (void)raft_add_peer(c->nodes[slot], c->ids[i]);
+    }
+    raft_start(c->nodes[slot]);
+    return slot;
+}
+
+int rig_despawn(RigCluster *c, uint32_t index)
+{
+    if (!c || index >= RIG_MAX_NODES || !c->in_use[index] || !c->nodes[index]) {
+        return -1;
+    }
+    /* Keep a quorum foothold — refuse to drop below 2 active slots. */
+    if (rig_active_count(c) <= 2) {
+        return -1;
+    }
+    char leaving[RIG_ID_LEN];
+    strncpy(leaving, c->ids[index], RIG_ID_LEN - 1);
+    leaving[RIG_ID_LEN - 1] = '\0';
+
+    for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+        if (i == index || !c->in_use[i] || !c->nodes[i]) {
+            continue;
+        }
+        (void)raft_remove_peer(c->nodes[i], leaving);
+    }
+
+    raft_stop(c->nodes[index]);
+    raft_destroy(c->nodes[index]);
+    c->nodes[index] = NULL;
+    c->alive[index] = false;
+    c->in_use[index] = false;
+    c->ids[index][0] = '\0';
+    memset(c->kv[index], 0, sizeof(c->kv[index]));
+    return 0;
 }
 
 int rig_wait_leader(RigCluster *c, char *out_id, size_t out_len, int timeout_ms)
@@ -406,8 +560,8 @@ int rig_wait_leader(RigCluster *c, char *out_id, size_t out_len, int timeout_ms)
     }
     int w = 0;
     while (w < timeout_ms) {
-        for (uint32_t i = 0; i < c->cfg.node_count; i++) {
-            if (!c->alive[i]) {
+        for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+            if (!c->in_use[i] || !c->alive[i] || !c->nodes[i]) {
                 continue;
             }
             char lid[RAFT_NODE_ID_LEN];
@@ -450,7 +604,8 @@ int rig_put(RigCluster *c, const char *key, const char *value, int timeout_ms)
 int rig_get(const RigCluster *c, uint32_t node_index, const char *key,
             char *out, size_t out_len)
 {
-    if (!c || node_index >= c->cfg.node_count || !key || !out) {
+    if (!c || node_index >= RIG_MAX_NODES || !c->in_use[node_index] || !key ||
+        !out) {
         return -1;
     }
     return kv_get(c, node_index, key, out, out_len);
@@ -472,14 +627,59 @@ int rig_wait_get(RigCluster *c, uint32_t node_index, const char *key,
     return -1;
 }
 
+int rig_wait_get_all_alive(RigCluster *c, const char *key, const char *expect,
+                           int timeout_ms)
+{
+    if (!c || !key || !expect) {
+        return -1;
+    }
+    int w = 0;
+    while (w < timeout_ms) {
+        bool all = true;
+        uint32_t seen = 0;
+        for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+            if (!c->in_use[i] || !c->alive[i]) {
+                continue;
+            }
+            seen++;
+            char buf[RIG_VAL_LEN];
+            if (rig_get(c, i, key, buf, sizeof(buf)) != 0 ||
+                strcmp(buf, expect) != 0) {
+                all = false;
+                break;
+            }
+        }
+        if (all && seen > 0) {
+            return 0;
+        }
+        usleep(10 * 1000);
+        w += 10;
+    }
+    return -1;
+}
+
 uint32_t rig_node_count(const RigCluster *c)
 {
     return c ? c->cfg.node_count : 0;
 }
 
+uint32_t rig_active_count(const RigCluster *c)
+{
+    if (!c) {
+        return 0;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < RIG_MAX_NODES; i++) {
+        if (c->in_use[i]) {
+            n++;
+        }
+    }
+    return n;
+}
+
 const char *rig_node_id(const RigCluster *c, uint32_t index)
 {
-    if (!c || index >= c->cfg.node_count) {
+    if (!c || index >= RIG_MAX_NODES || !c->in_use[index]) {
         return "";
     }
     return c->ids[index];

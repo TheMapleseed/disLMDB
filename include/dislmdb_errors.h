@@ -75,6 +75,10 @@ enum {
     ((DISLMDB_PROTOCOL_VERSION_MAJOR << 16) | DISLMDB_PROTOCOL_VERSION_MINOR)
 
 #define DISLMDB_DEFAULT_PORT 9876
+/**
+ * Historical soft default / initial connection table size. Membership is no
+ * longer hard-capped here — use env_config.max_peers (0 = unlimited).
+ */
 #define DISLMDB_MAX_NODES 64
 #define DISLMDB_MAX_DBS 256
 #define DISLMDB_DEFAULT_TIMEOUT_MS 5000

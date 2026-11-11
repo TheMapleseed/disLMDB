@@ -56,8 +56,25 @@ int main(void)
     EXPECT_TRUE(&ctx, "payload",
                 last_len == strlen(payload) && memcmp(last_payload, payload, last_len) == 0);
     EXPECT_TRUE(&ctx, "commit_idx", raft_commit_index(n) >= 1);
+    EXPECT_TRUE(&ctx, "voting_on", raft_voting_enabled(n));
 
     raft_stop(n);
     raft_destroy(n);
+
+    /* Voting off: learner never campaigns / becomes leader. */
+    RaftConfig leaf = raft_config_default();
+    strncpy(leaf.node_id, "learner", sizeof(leaf.node_id) - 1);
+    leaf.enable_voting = false;
+    leaf.election_timeout_min_ms = 30;
+    leaf.election_timeout_max_ms = 60;
+    RaftNode *L = raft_create(&leaf, on_out, on_apply, NULL);
+    EXPECT_TRUE(&ctx, "learner_create", L != NULL);
+    EXPECT_TRUE(&ctx, "voting_off", !raft_voting_enabled(L));
+    raft_start(L);
+    usleep(250 * 1000);
+    EXPECT_TRUE(&ctx, "learner_not_leader", !raft_is_leader(L));
+    raft_stop(L);
+    raft_destroy(L);
+
     return test_end(&ctx);
 }

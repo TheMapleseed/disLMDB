@@ -49,6 +49,9 @@ int dislmdb_raft_remove_peer(DISLMDB_env *env, const char *node_id);
 /** Step down and force a new election (Raft view-change analogue). */
 int dislmdb_raft_force_election(DISLMDB_env *env);
 
+/** Fill Raft-specific fields of a metrics snapshot (no-op if not Raft). */
+void dislmdb_raft_fill_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics);
+
 #ifdef __cplusplus
 }
 #endif

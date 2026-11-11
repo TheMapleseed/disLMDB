@@ -66,6 +66,8 @@ UNIT_SANDBOX_TESTS := \
   $(BINDIR)/test_tvb3 \
   $(BINDIR)/test_raft \
   $(BINDIR)/test_raft_membership \
+  $(BINDIR)/test_raft_peer_growth \
+  $(BINDIR)/test_metrics_format \
   $(BINDIR)/test_mtls \
   $(BINDIR)/test_transport_adapt
 
@@ -95,6 +97,10 @@ INTEGRATION_TESTS := \
   $(BINDIR)/test_raft_both \
   $(BINDIR)/test_raft_mtls \
   $(BINDIR)/test_raft_mtls_tcp \
+  $(BINDIR)/test_raft_matrix \
+  $(BINDIR)/test_connect_churn \
+  $(BINDIR)/test_auth_reject \
+  $(BINDIR)/test_topo_env \
   $(BINDIR)/test_raft_fault \
   $(BINDIR)/test_raft_stage \
   $(BINDIR)/test_raft_membership_it \
@@ -106,7 +112,8 @@ BASIC_TEST := $(BINDIR)/dislmdb_test
 E2E_RUNNER := $(BINDIR)/e2e_runner
 
 .PHONY: all dirs lib mbedtls examples test-bins check check-sandbox check-integration \
-        check-orb orb-bins unit unit-sandbox rig integration e2e test clean smoke-example
+        check-orb check-stress orb-bins unit unit-sandbox rig integration e2e test \
+        clean smoke-example
 
 # Default: build + sandbox-safe suite (works under Cursor agent sandbox)
 all: lib examples test-bins check-sandbox
@@ -181,6 +188,12 @@ $(BINDIR)/test_raft: tests/unit/test_raft.c Enhanced-Raft-mechanism/raft.c | dir
 $(BINDIR)/test_raft_membership: tests/unit/test_raft_membership.c Enhanced-Raft-mechanism/raft.c | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LIBS)
 
+$(BINDIR)/test_raft_peer_growth: tests/unit/test_raft_peer_growth.c Enhanced-Raft-mechanism/raft.c | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_metrics_format: tests/unit/test_metrics_format.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) $(RPATH)
+
 $(BINDIR)/test_mtls: tests/unit/test_mtls.c src/network/dislmdb_mtls.c $(MBEDTLS_LIBS) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit/test_mtls.c src/network/dislmdb_mtls.c -o $@ \
 	  $(MBEDTLS_LIBS) $(LIBS)
@@ -246,6 +259,22 @@ $(BINDIR)/test_raft_mtls_tcp: tests/integration/test_raft_mtls_tcp.c $(LIBDIR)/l
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
 
+$(BINDIR)/test_raft_matrix: tests/integration/test_raft_matrix.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_connect_churn: tests/integration/test_connect_churn.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_auth_reject: tests/integration/test_auth_reject.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
+$(BINDIR)/test_topo_env: tests/integration/test_topo_env.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
+	  -Wl,-rpath,$(abspath $(LIBDIR))
+
 $(BINDIR)/test_raft_fault: tests/integration/test_raft_fault.c $(LIBDIR)/libdislmdb.$(SHARED_EXT) | dirs
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -L$(LIBDIR) -ldislmdb $(LIBS) \
 	  -Wl,-rpath,$(abspath $(LIBDIR))
@@ -281,6 +310,8 @@ unit-sandbox: $(UNIT_SANDBOX_TESTS)
 	@$(BINDIR)/test_tvb3
 	@$(BINDIR)/test_raft
 	@$(BINDIR)/test_raft_membership
+	@$(BINDIR)/test_raft_peer_growth
+	@cd $(BUILD) && ./bin/test_metrics_format
 	@cd $(BUILD) && ./bin/test_mtls
 	@cd $(BUILD) && ./bin/test_transport_adapt
 
@@ -318,12 +349,31 @@ integration: $(INTEGRATION_TESTS) $(BASIC_TEST)
 	@cd $(BUILD) && ./bin/test_raft_both
 	@cd $(BUILD) && ./bin/test_raft_mtls
 	@cd $(BUILD) && ./bin/test_raft_mtls_tcp
+	@cd $(BUILD) && ./bin/test_raft_matrix
+	@cd $(BUILD) && ./bin/test_connect_churn
+	@cd $(BUILD) && ./bin/test_auth_reject
+	@cd $(BUILD) && ./bin/test_topo_env
 	@cd $(BUILD) && ./bin/test_raft_fault
 	@cd $(BUILD) && ./bin/test_raft_stage
 	@cd $(BUILD) && ./bin/test_raft_membership_it
 	@cd $(BUILD) && ./bin/test_raft_leave
 	@cd $(BUILD) && ./bin/test_pbft_viewchange
 	@cd $(BUILD) && ./bin/test_fault_tolerance
+
+# Repeat flake-prone / matrix cells for soak confidence
+check-stress: $(BINDIR)/test_raft_mtls $(BINDIR)/test_raft_matrix \
+		$(BINDIR)/test_connect_churn $(BINDIR)/test_cluster_rig
+	@echo ""
+	@echo ">>>> Stress (repeat flake-prone + matrix + churn)"
+	@fails=0; \
+	for i in $$(seq 1 20); do \
+	  $(BINDIR)/test_raft_mtls >/dev/null || { fails=$$((fails+1)); echo "raft_mtls fail $$i"; }; \
+	done; \
+	$(BINDIR)/test_raft_matrix || fails=$$((fails+1)); \
+	$(BINDIR)/test_connect_churn || fails=$$((fails+1)); \
+	cd $(BUILD) && ./bin/test_cluster_rig || fails=$$((fails+1)); \
+	if [ $$fails -ne 0 ]; then echo "STRESS FAILED ($$fails)"; exit 1; fi; \
+	echo "Stress PASSED (20× raft_mtls + matrix + connect_churn + cluster_rig)."
 
 e2e: $(E2E_RUNNER)
 	@echo ""

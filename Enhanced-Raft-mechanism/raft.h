@@ -19,7 +19,12 @@
 extern "C" {
 #endif
 
-#define RAFT_MAX_PEERS 64
+/**
+ * Bootstrap peer array size in RaftConfig (create-time convenience).
+ * Runtime peer tables on RaftNode are heap-growable past this; soft guard
+ * is RAFT_PEER_SOFT_MAX inside raft.c.
+ */
+#define RAFT_MAX_PEERS 512
 #define RAFT_MAX_LOG 4096
 #define RAFT_NODE_ID_LEN 64
 #define RAFT_DIGEST_LEN 32
@@ -79,11 +84,18 @@ typedef void (*raft_apply_fn)(uint64_t index, const uint8_t *data, size_t len, v
 
 typedef struct RaftConfig {
     char node_id[RAFT_NODE_ID_LEN];
+    /** Copied into a growable heap table at raft_create(); not used afterward. */
     char peer_ids[RAFT_MAX_PEERS][RAFT_NODE_ID_LEN];
     uint32_t peer_count;
     uint32_t election_timeout_min_ms;
     uint32_t election_timeout_max_ms;
     uint32_t heartbeat_ms;
+    /**
+     * When false, this node is a learner/replicate-only member: it never
+     * campaigns and never grants votes. Large clusters turn this off via
+     * DISLMDB_VOTING=0 while regional hubs keep voting on.
+     */
+    bool enable_voting;
 } RaftConfig;
 
 typedef struct RaftNode RaftNode;
@@ -105,9 +117,23 @@ void raft_stop(RaftNode *node);
 RaftError raft_add_peer(RaftNode *node, const char *peer_id);
 
 /**
+ * @brief Register a non-voting peer (learner). Receives log replication but
+ * is excluded from election/commit quorum. Idempotent; upgrades existing.
+ */
+RaftError raft_add_learner(RaftNode *node, const char *peer_id);
+
+/**
+ * @brief Mark an existing peer as voter (true) or learner (false).
+ */
+RaftError raft_set_peer_voting(RaftNode *node, const char *peer_id, bool voting);
+
+/**
  * @brief Drop a peer locally (idempotent). Bootstrap / cleanup only.
  */
 RaftError raft_remove_peer(RaftNode *node, const char *peer_id);
+
+/** @brief True if this node participates in elections/quorum. */
+bool raft_voting_enabled(const RaftNode *node);
 
 /**
  * @brief Joint-consensus membership change to the given peer set (excluding self).

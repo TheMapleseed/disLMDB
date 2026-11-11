@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <time.h>
 #include <errno.h>
@@ -28,6 +29,78 @@
 #define BYTECODE_DBI_NAME "__dislmdb_bytecode__"
 
 extern const char *dislmdb_error_string(int err);
+
+int dislmdb_bytecode_pack(unsigned int options,
+                          const uint8_t *src,
+                          size_t src_len,
+                          uint8_t **out,
+                          size_t *out_len)
+{
+    if (!src || src_len == 0 || !out || !out_len) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (options & DISLMDB_BYTECODE_COMPRESS) {
+        return DISLMDB_ERR_NOT_IMPLEMENTED;
+    }
+    size_t hdr = 4;
+    if (options & DISLMDB_BYTECODE_VERIFY) {
+        hdr += DISLMDB_SHA256_DIGEST_LENGTH;
+    }
+    uint8_t *buf = malloc(hdr + src_len);
+    if (!buf) {
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    dislmdb_write_u32(buf, options);
+    size_t o = 4;
+    if (options & DISLMDB_BYTECODE_VERIFY) {
+        if (dislmdb_crypto_sha256(src, src_len, buf + o) != 0) {
+            free(buf);
+            return DISLMDB_ERR_AUTH_FAILED;
+        }
+        o += DISLMDB_SHA256_DIGEST_LENGTH;
+    }
+    memcpy(buf + o, src, src_len);
+    *out = buf;
+    *out_len = hdr + src_len;
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_bytecode_unpack(const uint8_t *stored,
+                            size_t stored_len,
+                            unsigned int *options_out,
+                            const uint8_t **data_out,
+                            size_t *data_len_out)
+{
+    if (!stored || stored_len < 4 || !options_out || !data_out || !data_len_out) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    unsigned int opts = dislmdb_read_u32(stored);
+    size_t o = 4;
+    if (opts & DISLMDB_BYTECODE_VERIFY) {
+        if (stored_len < 4 + DISLMDB_SHA256_DIGEST_LENGTH) {
+            return DISLMDB_ERR_DATA_CORRUPTION;
+        }
+        const uint8_t *expect = stored + o;
+        o += DISLMDB_SHA256_DIGEST_LENGTH;
+        const uint8_t *payload = stored + o;
+        size_t plen = stored_len - o;
+        uint8_t got[DISLMDB_SHA256_DIGEST_LENGTH];
+        if (dislmdb_crypto_sha256(payload, plen, got) != 0) {
+            return DISLMDB_ERR_AUTH_FAILED;
+        }
+        if (memcmp(expect, got, DISLMDB_SHA256_DIGEST_LENGTH) != 0) {
+            return DISLMDB_ERR_DATA_CORRUPTION;
+        }
+        *options_out = opts;
+        *data_out = payload;
+        *data_len_out = plen;
+        return DISLMDB_SUCCESS;
+    }
+    *options_out = opts;
+    *data_out = stored + 4;
+    *data_len_out = stored_len - 4;
+    return DISLMDB_SUCCESS;
+}
 
 static const DISLMDB_env_config default_env_config = {
     .path = NULL,
@@ -65,12 +138,22 @@ static const DISLMDB_env_config default_env_config = {
         .fault_tolerance = 0,
         .enable_liveness = true,
         .persist_state = true,
-        .persist_cluster_key = false
+        .persist_cluster_key = false,
+        .enable_voting = true
     },
     .read_only_node = false,
     .sync_interval_ms = 60000,
     .max_sync_batch_size = 1000,
-    .node_name = "DisLMDB Node"
+    .node_name = "DisLMDB Node",
+    .region = {0},
+    .locality = {0},
+    .topology_mode = DISLMDB_TOPO_MIRROR,
+    .rtt_budget_ms = 0,
+    .region_key = {0},
+    .has_region_key = false,
+    .cross_region_key = {0},
+    .has_cross_region_key = false,
+    .max_peers = 0 /* unlimited */
 };
 
 const char *dislmdb_version(int *major, int *minor, int *patch)
@@ -255,7 +338,8 @@ static int deep_copy_config(DISLMDB_env *env, const DISLMDB_env_config *config)
     env->config.network.node_count = 0;
 
     if (config->network.node_count > 0) {
-        if (config->network.node_count > DISLMDB_MAX_NODES) {
+        if (config->max_peers != 0 &&
+            config->network.node_count > config->max_peers) {
             return DISLMDB_ERR_MAX_NODES;
         }
         if (!config->network.nodes) {
@@ -303,6 +387,140 @@ static void env_open_cleanup(DISLMDB_env *env, bool close_mdb, bool stop_net, bo
     }
 }
 
+static int env_parse_bool(const char *s, bool *out)
+{
+    if (!s || !out) {
+        return -1;
+    }
+    if (strcmp(s, "0") == 0 || strcasecmp(s, "off") == 0 ||
+        strcasecmp(s, "false") == 0 || strcasecmp(s, "no") == 0) {
+        *out = false;
+        return 0;
+    }
+    if (strcmp(s, "1") == 0 || strcasecmp(s, "on") == 0 ||
+        strcasecmp(s, "true") == 0 || strcasecmp(s, "yes") == 0) {
+        *out = true;
+        return 0;
+    }
+    return -1;
+}
+
+/** Fill 32-byte key from hex (64 chars) or raw bytes (padded/truncated). */
+static int env_parse_key32(const char *s, uint8_t out[32])
+{
+    if (!s || !out) {
+        return -1;
+    }
+    size_t n = strlen(s);
+    memset(out, 0, 32);
+    if (n == 64) {
+        for (size_t i = 0; i < 32; i++) {
+            unsigned int b = 0;
+            if (sscanf(s + i * 2, "%2x", &b) != 1) {
+                return -1;
+            }
+            out[i] = (uint8_t)b;
+        }
+        return 0;
+    }
+    if (n == 0) {
+        return -1;
+    }
+    memcpy(out, s, n < 32 ? n : 32);
+    return 0;
+}
+
+/**
+ * Overlay deployment knobs from the process environment (never required).
+ * Secrets/region/voting for large-cluster topology — see TODO.md Phase C.
+ */
+static void apply_environ_overrides(DISLMDB_env *env)
+{
+    bool b;
+    const char *voting = getenv("DISLMDB_VOTING");
+    if (voting && env_parse_bool(voting, &b) == 0) {
+        env->config.consensus.enable_voting = b;
+    }
+
+    const char *region = getenv("DISLMDB_REGION");
+    if (region && region[0] != '\0') {
+        strncpy(env->config.region, region, sizeof(env->config.region) - 1);
+        env->config.region[sizeof(env->config.region) - 1] = '\0';
+    }
+    const char *locality = getenv("DISLMDB_LOCALITY");
+    if (locality && locality[0] != '\0') {
+        strncpy(env->config.locality, locality, sizeof(env->config.locality) - 1);
+        env->config.locality[sizeof(env->config.locality) - 1] = '\0';
+    }
+
+    const char *mode = getenv("DISLMDB_TOPOLOGY_MODE");
+    if (mode && mode[0] != '\0') {
+        if (strcasecmp(mode, "mirror") == 0) {
+            env->config.topology_mode = DISLMDB_TOPO_MIRROR;
+        } else if (strcasecmp(mode, "shard") == 0) {
+            env->config.topology_mode = DISLMDB_TOPO_SHARD;
+        } else if (strcasecmp(mode, "hybrid") == 0) {
+            env->config.topology_mode = DISLMDB_TOPO_HYBRID;
+        }
+    }
+
+    const char *rtt = getenv("DISLMDB_RTT_BUDGET_MS");
+    if (rtt && rtt[0] != '\0') {
+        char *end = NULL;
+        unsigned long v = strtoul(rtt, &end, 10);
+        if (end != rtt) {
+            env->config.rtt_budget_ms = (uint32_t)v;
+        }
+    }
+
+    const char *maxp = getenv("DISLMDB_MAX_PEERS");
+    if (maxp && maxp[0] != '\0') {
+        char *end = NULL;
+        unsigned long v = strtoul(maxp, &end, 10);
+        if (end != maxp) {
+            env->config.max_peers = (uint32_t)v; /* 0 = unlimited */
+        }
+    }
+
+    uint8_t key[32];
+    const char *rk = getenv("DISLMDB_REGION_SECRET");
+    if (rk && env_parse_key32(rk, key) == 0) {
+        memcpy(env->config.region_key, key, 32);
+        env->config.has_region_key = true;
+        /* Intra-region secret becomes the active cluster key when none set. */
+        if (!env->config.network.has_cluster_key) {
+            memcpy(env->config.network.cluster_key, key, 32);
+            env->config.network.has_cluster_key = true;
+            env->config.network.enable_message_auth = true;
+            env->config.network.enable_payload_encryption = true;
+        }
+    }
+    const char *ck = getenv("DISLMDB_CROSS_REGION_SECRET");
+    if (ck && env_parse_key32(ck, key) == 0) {
+        memcpy(env->config.cross_region_key, key, 32);
+        env->config.has_cross_region_key = true;
+    }
+
+    const char *seeds = getenv("DISLMDB_SEED_REGIONAL");
+    if (seeds && seeds[0] != '\0' && env->config.network.seed_node_count == 0) {
+        /* Comma-separated host:port list (up to array capacity). */
+        char buf[1024];
+        strncpy(buf, seeds, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *save = NULL;
+        for (char *tok = strtok_r(buf, ",", &save);
+             tok && env->config.network.seed_node_count < 10;
+             tok = strtok_r(NULL, ",", &save)) {
+            while (*tok == ' ') {
+                tok++;
+            }
+            strncpy(env->config.network.seed_nodes[env->config.network.seed_node_count],
+                    tok, sizeof(env->config.network.seed_nodes[0]) - 1);
+            env->config.network.seed_node_count++;
+        }
+    }
+}
+
 int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
 {
     if (!env || !config || !config->path) {
@@ -316,6 +534,7 @@ int dislmdb_env_open(DISLMDB_env *env, const DISLMDB_env_config *config)
     if (rc != DISLMDB_SUCCESS) {
         return rc;
     }
+    apply_environ_overrides(env);
 
     /* Multi-node / BFT deployments must have a shared cluster key (fail closed). */
     bool multi = (env->config.network.node_count > 0) ||
@@ -716,27 +935,26 @@ int dislmdb_add_node_internal(DISLMDB_env *env, const DISLMDB_node_addr *node_ad
         }
     }
 
-    if (env->node_count >= DISLMDB_MAX_NODES) {
+    if (env->config.max_peers != 0 &&
+        env->node_count >= env->config.max_peers) {
         pthread_mutex_unlock(&env->nodes_mutex);
         return DISLMDB_ERR_MAX_NODES;
     }
 
     DISLMDB_node_addr *new_nodes = realloc(env->nodes,
                                            (env->node_count + 1) * sizeof(DISLMDB_node_addr));
-    DISLMDB_NODE_STATE *new_states = realloc(env->node_states,
-                                             (env->node_count + 1) * sizeof(DISLMDB_NODE_STATE));
-    if (!new_nodes || !new_states) {
-        /* On failure, keep previous pointers if realloc failed for that array */
-        if (new_nodes) {
-            env->nodes = new_nodes;
-        }
-        if (new_states) {
-            env->node_states = new_states;
-        }
+    if (!new_nodes) {
         pthread_mutex_unlock(&env->nodes_mutex);
         return DISLMDB_ERR_MEMORY_ERROR;
     }
     env->nodes = new_nodes;
+    DISLMDB_NODE_STATE *new_states = realloc(env->node_states,
+                                             (env->node_count + 1) * sizeof(DISLMDB_NODE_STATE));
+    if (!new_states) {
+        /* nodes already grown; leave spare slot unused — count unchanged */
+        pthread_mutex_unlock(&env->nodes_mutex);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
     env->node_states = new_states;
     memcpy(&env->nodes[env->node_count], node_addr, sizeof(DISLMDB_node_addr));
     env->node_states[env->node_count] = DISLMDB_NODE_STATE_UNKNOWN;
@@ -900,6 +1118,40 @@ int dislmdb_get_leader(DISLMDB_env *env, char *leader_id, size_t id_size)
     return DISLMDB_SUCCESS;
 }
 
+int dislmdb_get_region(DISLMDB_env *env, char *out, size_t out_sz)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !out || out_sz < 2) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    strncpy(out, env->config.region, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_get_locality(DISLMDB_env *env, char *out, size_t out_sz)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !out || out_sz < 2) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    strncpy(out, env->config.locality, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_get_topology_mode(DISLMDB_env *env, DISLMDB_TOPOLOGY_MODE *out)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !out) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    *out = env->config.topology_mode;
+    return DISLMDB_SUCCESS;
+}
+
+bool dislmdb_voting_enabled(DISLMDB_env *env)
+{
+    return env && env->magic == DISLMDB_MAGIC && env->config.consensus.enable_voting;
+}
+
 int dislmdb_force_sync(DISLMDB_env *env)
 {
     if (!env || env->magic != DISLMDB_MAGIC) {
@@ -947,6 +1199,9 @@ int dislmdb_store_bytecode(DISLMDB_env *env,
     if (env->config.read_only_node) {
         return DISLMDB_ERR_READ_ONLY;
     }
+    if (options & DISLMDB_BYTECODE_COMPRESS) {
+        return DISLMDB_ERR_NOT_IMPLEMENTED;
+    }
     if (env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         return dislmdb_pbft_store_bytecode(env, bytecode, bytecode_size, bytecode_id, options);
     }
@@ -958,25 +1213,25 @@ int dislmdb_store_bytecode(DISLMDB_env *env,
     if (id_len == 0 || id_len > 128 || bytecode_size == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    uint8_t *stored = NULL;
+    size_t stored_size = 0;
+    int rc = dislmdb_bytecode_pack(options, bytecode, bytecode_size, &stored, &stored_size);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
     MDB_txn *txn = NULL;
-    int rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
+    rc = mdb_txn_begin(env->mdb_env, NULL, 0, &txn);
     if (rc != 0) {
+        free(stored);
         return rc;
     }
     MDB_dbi dbi;
     rc = mdb_dbi_open(txn, BYTECODE_DBI_NAME, MDB_CREATE, &dbi);
     if (rc != 0) {
+        free(stored);
         mdb_txn_abort(txn);
         return rc;
     }
-    size_t stored_size = 4 + bytecode_size;
-    uint8_t *stored = malloc(stored_size);
-    if (!stored) {
-        mdb_txn_abort(txn);
-        return DISLMDB_ERR_MEMORY_ERROR;
-    }
-    dislmdb_write_u32(stored, options);
-    memcpy(stored + 4, bytecode, bytecode_size);
     MDB_val key = {.mv_size = id_len, .mv_data = (void *)bytecode_id};
     MDB_val val = {.mv_size = stored_size, .mv_data = stored};
     rc = mdb_put(txn, dbi, &key, &val, 0);
@@ -1092,6 +1347,10 @@ int dislmdb_get_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics)
     metrics->current_view = env->pbft_state.view;
     metrics->last_committed_seq = env->pbft_state.sequence;
     metrics->replica_count = env->node_count;
+    metrics->consensus_mechanism = (uint32_t)env->config.consensus.mechanism;
+    metrics->voting_enabled = env->config.consensus.enable_voting;
+    metrics->is_leader = env->pbft_state.is_primary;
+
     if (env->consensus_context &&
         env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         ConsensusMetrics cm;
@@ -1103,19 +1362,169 @@ int dislmdb_get_metrics(DISLMDB_env *env, DISLMDB_metrics *metrics)
         metrics->state_transfers += cm.state_transfers;
         metrics->current_view = consensus_core_view(env->consensus_context);
         metrics->last_committed_seq = consensus_core_last_committed(env->consensus_context);
+        metrics->is_leader = consensus_core_is_primary(env->consensus_context);
+    } else if (env->consensus_context &&
+               env->config.consensus.mechanism == DISLMDB_CONSENSUS_RAFT) {
+        dislmdb_raft_fill_metrics(env, metrics);
     }
+
     if (env->network_context) {
         DISLMDB_network_stats ns;
         if (dislmdb_network_get_stats(env, &ns) == DISLMDB_SUCCESS) {
             metrics->active_connections = ns.active_connections;
             metrics->total_sync_bytes += ns.total_bytes_received + ns.total_bytes_sent;
+            metrics->messages_sent = ns.total_messages_sent;
+            metrics->messages_received = ns.total_messages_received;
+            metrics->connection_failures = ns.connection_failures;
             metrics->dqgm_packets_rx = ns.dqgm_packets_rx;
             metrics->dqgm_cid_mismatch = ns.dqgm_cid_mismatch;
             metrics->dqgm_replay_drop = ns.dqgm_replay_drop;
             metrics->dqgm_session_rebind = ns.dqgm_session_rebind;
             metrics->dqgm_ack_rx = ns.dqgm_ack_rx;
             metrics->dqgm_ack_advance = ns.dqgm_ack_advance;
+            metrics->outbox_enqueued = ns.outbox_enqueued;
+            metrics->outbox_drained = ns.outbox_drained;
+            metrics->outbox_dropped = ns.outbox_dropped;
         }
+    }
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_format_metrics(const DISLMDB_metrics *m,
+                           char *buf,
+                           size_t buf_sz,
+                           size_t *written)
+{
+    if (!m) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    /*
+     * Prometheus text exposition (no HTTP server — callers expose via their
+     * own scrape endpoint, log shipper, or file).
+     */
+    int n = snprintf(buf && buf_sz ? buf : NULL, buf ? buf_sz : 0,
+        "# HELP dislmdb_commits_total Committed local transactions\n"
+        "# TYPE dislmdb_commits_total counter\n"
+        "dislmdb_commits_total %llu\n"
+        "# HELP dislmdb_operations_total Recorded operations\n"
+        "# TYPE dislmdb_operations_total counter\n"
+        "dislmdb_operations_total %llu\n"
+        "# HELP dislmdb_sync_bytes_total Bytes synchronized / transferred\n"
+        "# TYPE dislmdb_sync_bytes_total counter\n"
+        "dislmdb_sync_bytes_total %llu\n"
+        "# HELP dislmdb_consensus_proposes_total Consensus proposes\n"
+        "# TYPE dislmdb_consensus_proposes_total counter\n"
+        "dislmdb_consensus_proposes_total %llu\n"
+        "# HELP dislmdb_consensus_commits_total Consensus commits applied\n"
+        "# TYPE dislmdb_consensus_commits_total counter\n"
+        "dislmdb_consensus_commits_total %llu\n"
+        "# HELP dislmdb_view_changes_total View changes / elections stepped\n"
+        "# TYPE dislmdb_view_changes_total counter\n"
+        "dislmdb_view_changes_total %llu\n"
+        "# HELP dislmdb_checkpoints_total Checkpoints taken\n"
+        "# TYPE dislmdb_checkpoints_total counter\n"
+        "dislmdb_checkpoints_total %llu\n"
+        "# HELP dislmdb_state_transfers_total State transfer requests\n"
+        "# TYPE dislmdb_state_transfers_total counter\n"
+        "dislmdb_state_transfers_total %llu\n"
+        "# HELP dislmdb_replica_count Known replicas\n"
+        "# TYPE dislmdb_replica_count gauge\n"
+        "dislmdb_replica_count %u\n"
+        "# HELP dislmdb_active_connections Live CONNECTED peers\n"
+        "# TYPE dislmdb_active_connections gauge\n"
+        "dislmdb_active_connections %u\n"
+        "# HELP dislmdb_is_leader 1 if this node is primary/leader\n"
+        "# TYPE dislmdb_is_leader gauge\n"
+        "dislmdb_is_leader %u\n"
+        "# HELP dislmdb_voting_enabled 1 if this node votes\n"
+        "# TYPE dislmdb_voting_enabled gauge\n"
+        "dislmdb_voting_enabled %u\n"
+        "# HELP dislmdb_consensus_mechanism 0=pbft 1=raft 2=solo\n"
+        "# TYPE dislmdb_consensus_mechanism gauge\n"
+        "dislmdb_consensus_mechanism %u\n"
+        "# HELP dislmdb_raft_term Current Raft term\n"
+        "# TYPE dislmdb_raft_term gauge\n"
+        "dislmdb_raft_term %llu\n"
+        "# HELP dislmdb_raft_commit_index Raft commit index\n"
+        "# TYPE dislmdb_raft_commit_index gauge\n"
+        "dislmdb_raft_commit_index %llu\n"
+        "# HELP dislmdb_raft_peer_count Raft peer count\n"
+        "# TYPE dislmdb_raft_peer_count gauge\n"
+        "dislmdb_raft_peer_count %u\n"
+        "# HELP dislmdb_messages_sent_total Network messages sent\n"
+        "# TYPE dislmdb_messages_sent_total counter\n"
+        "dislmdb_messages_sent_total %llu\n"
+        "# HELP dislmdb_messages_received_total Network messages received\n"
+        "# TYPE dislmdb_messages_received_total counter\n"
+        "dislmdb_messages_received_total %llu\n"
+        "# HELP dislmdb_connection_failures_total Connection failures\n"
+        "# TYPE dislmdb_connection_failures_total counter\n"
+        "dislmdb_connection_failures_total %u\n"
+        "# HELP dislmdb_dqgm_packets_rx_total DQGM envelopes accepted\n"
+        "# TYPE dislmdb_dqgm_packets_rx_total counter\n"
+        "dislmdb_dqgm_packets_rx_total %llu\n"
+        "# HELP dislmdb_dqgm_cid_mismatch_total DQGM CID mismatches\n"
+        "# TYPE dislmdb_dqgm_cid_mismatch_total counter\n"
+        "dislmdb_dqgm_cid_mismatch_total %llu\n"
+        "# HELP dislmdb_dqgm_replay_drop_total DQGM replay drops\n"
+        "# TYPE dislmdb_dqgm_replay_drop_total counter\n"
+        "dislmdb_dqgm_replay_drop_total %llu\n"
+        "# HELP dislmdb_dqgm_session_rebind_total DQGM session rebinds\n"
+        "# TYPE dislmdb_dqgm_session_rebind_total counter\n"
+        "dislmdb_dqgm_session_rebind_total %llu\n"
+        "# HELP dislmdb_dqgm_ack_rx_total DQGM ACKs observed\n"
+        "# TYPE dislmdb_dqgm_ack_rx_total counter\n"
+        "dislmdb_dqgm_ack_rx_total %llu\n"
+        "# HELP dislmdb_dqgm_ack_advance_total DQGM ACK advances\n"
+        "# TYPE dislmdb_dqgm_ack_advance_total counter\n"
+        "dislmdb_dqgm_ack_advance_total %llu\n"
+        "# HELP dislmdb_outbox_enqueued_total Outbox enqueues\n"
+        "# TYPE dislmdb_outbox_enqueued_total counter\n"
+        "dislmdb_outbox_enqueued_total %llu\n"
+        "# HELP dislmdb_outbox_drained_total Outbox drains\n"
+        "# TYPE dislmdb_outbox_drained_total counter\n"
+        "dislmdb_outbox_drained_total %llu\n"
+        "# HELP dislmdb_outbox_dropped_total Outbox drops\n"
+        "# TYPE dislmdb_outbox_dropped_total counter\n"
+        "dislmdb_outbox_dropped_total %llu\n",
+        (unsigned long long)m->total_commits,
+        (unsigned long long)m->total_operations,
+        (unsigned long long)m->total_sync_bytes,
+        (unsigned long long)m->consensus_proposes,
+        (unsigned long long)m->consensus_commits,
+        (unsigned long long)m->view_changes,
+        (unsigned long long)m->checkpoints,
+        (unsigned long long)m->state_transfers,
+        (unsigned)m->replica_count,
+        (unsigned)m->active_connections,
+        m->is_leader ? 1u : 0u,
+        m->voting_enabled ? 1u : 0u,
+        (unsigned)m->consensus_mechanism,
+        (unsigned long long)m->raft_term,
+        (unsigned long long)m->raft_commit_index,
+        (unsigned)m->raft_peer_count,
+        (unsigned long long)m->messages_sent,
+        (unsigned long long)m->messages_received,
+        (unsigned)m->connection_failures,
+        (unsigned long long)m->dqgm_packets_rx,
+        (unsigned long long)m->dqgm_cid_mismatch,
+        (unsigned long long)m->dqgm_replay_drop,
+        (unsigned long long)m->dqgm_session_rebind,
+        (unsigned long long)m->dqgm_ack_rx,
+        (unsigned long long)m->dqgm_ack_advance,
+        (unsigned long long)m->outbox_enqueued,
+        (unsigned long long)m->outbox_drained,
+        (unsigned long long)m->outbox_dropped);
+
+    if (n < 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (written) {
+        *written = (size_t)n;
+    }
+    if (buf && buf_sz > 0 && (size_t)n >= buf_sz) {
+        buf[buf_sz - 1] = '\0';
+        return DISLMDB_ERR_BUFFER_OVERFLOW;
     }
     return DISLMDB_SUCCESS;
 }
@@ -1127,7 +1536,7 @@ int dislmdb_reconfigure_replicas(DISLMDB_env *env,
     if (!env || env->magic != DISLMDB_MAGIC || !nodes || node_count == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    if (node_count > DISLMDB_MAX_NODES) {
+    if (env->config.max_peers != 0 && node_count > env->config.max_peers) {
         return DISLMDB_ERR_MAX_NODES;
     }
     if (env->consensus_context &&
@@ -1190,8 +1599,14 @@ int dislmdb_get_bytecode(DISLMDB_env *env,
         return DISLMDB_ERR_DATA_CORRUPTION;
     }
 
-    unsigned int opts = dislmdb_read_u32(val.mv_data);
-    size_t data_size = val.mv_size - 4;
+    unsigned int opts = 0;
+    const uint8_t *payload = NULL;
+    size_t data_size = 0;
+    rc = dislmdb_bytecode_unpack(val.mv_data, val.mv_size, &opts, &payload, &data_size);
+    if (rc != DISLMDB_SUCCESS) {
+        mdb_txn_abort(txn);
+        return rc;
+    }
     if (options) {
         *options = opts;
     }
@@ -1205,7 +1620,7 @@ int dislmdb_get_bytecode(DISLMDB_env *env,
         mdb_txn_abort(txn);
         return DISLMDB_ERR_BUFFER_OVERFLOW;
     }
-    memcpy(bytecode, (uint8_t *)val.mv_data + 4, data_size);
+    memcpy(bytecode, payload, data_size);
     *bytecode_size = data_size;
     mdb_txn_abort(txn);
     return DISLMDB_SUCCESS;

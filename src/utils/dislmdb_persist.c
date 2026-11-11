@@ -16,6 +16,9 @@
 #define META_KEY_CK "cluster_key"
 #define META_KEY_REPLICAS "replicas"
 #define META_KEY_SHARDS "shard_map"
+#define META_KEY_REGION "region"
+#define META_KEY_LOCALITY "locality"
+#define META_KEY_TOPO_MODE "topo_mode"
 
 /* Packed shard: count u32 + N * (64 + 128 + 64) */
 #define SHARD_PACK_SIZE (DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN + 64)
@@ -125,6 +128,42 @@ int dislmdb_persist_save(DISLMDB_env *env)
         mdb_txn_abort(txn);
         return rc;
     }
+
+    /* Regional topology metadata (dedicated plane inside meta DBI). */
+    if (env->config.region[0] != '\0') {
+        k.mv_size = strlen(META_KEY_REGION);
+        k.mv_data = (void *)META_KEY_REGION;
+        v.mv_size = strnlen(env->config.region, sizeof(env->config.region));
+        v.mv_data = env->config.region;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+    }
+    if (env->config.locality[0] != '\0') {
+        k.mv_size = strlen(META_KEY_LOCALITY);
+        k.mv_data = (void *)META_KEY_LOCALITY;
+        v.mv_size = strnlen(env->config.locality, sizeof(env->config.locality));
+        v.mv_data = env->config.locality;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+    }
+    {
+        uint8_t mode = (uint8_t)env->config.topology_mode;
+        k.mv_size = strlen(META_KEY_TOPO_MODE);
+        k.mv_data = (void *)META_KEY_TOPO_MODE;
+        v.mv_size = 1;
+        v.mv_data = &mode;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+    }
     return mdb_txn_commit(txn);
 }
 
@@ -195,6 +234,39 @@ int dislmdb_persist_load(DISLMDB_env *env)
                 env->shards[i].owner_node_id[63] = '\0';
             }
             pthread_mutex_unlock(&env->shard_mutex);
+        }
+    }
+    /* Env-configured region wins over disk; otherwise restore persisted topo. */
+    k.mv_size = strlen(META_KEY_REGION);
+    k.mv_data = (void *)META_KEY_REGION;
+    if (env->config.region[0] == '\0' &&
+        mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size > 0) {
+        size_t n = v.mv_size < sizeof(env->config.region) - 1
+                       ? v.mv_size
+                       : sizeof(env->config.region) - 1;
+        memcpy(env->config.region, v.mv_data, n);
+        env->config.region[n] = '\0';
+    }
+    k.mv_size = strlen(META_KEY_LOCALITY);
+    k.mv_data = (void *)META_KEY_LOCALITY;
+    if (env->config.locality[0] == '\0' &&
+        mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size > 0) {
+        size_t n = v.mv_size < sizeof(env->config.locality) - 1
+                       ? v.mv_size
+                       : sizeof(env->config.locality) - 1;
+        memcpy(env->config.locality, v.mv_data, n);
+        env->config.locality[n] = '\0';
+    }
+    k.mv_size = strlen(META_KEY_TOPO_MODE);
+    k.mv_data = (void *)META_KEY_TOPO_MODE;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 1) {
+        uint8_t mode = ((const uint8_t *)v.mv_data)[0];
+        if (mode <= (uint8_t)DISLMDB_TOPO_HYBRID) {
+            /* Only restore if env did not explicitly set hybrid/shard via env. */
+            const char *emode = getenv("DISLMDB_TOPOLOGY_MODE");
+            if (!emode || emode[0] == '\0') {
+                env->config.topology_mode = (DISLMDB_TOPOLOGY_MODE)mode;
+            }
         }
     }
     mdb_txn_abort(txn);
