@@ -111,10 +111,11 @@ blockchain and security products.
 Closing
 -------
 
-This file lives in the repo root so contributors see where the storage engine
-came from. DisLMDB’s distributed layer is separate work; LMDB remains under the
-OpenLDAP Public License, and we do not claim to have invented it. If you ship
-or cite DisLMDB, please mention LMDB and Howard Chu as well.
+This file is the standalone tribute; the same text is inlined at the top of
+``README.rst`` (GitHub does not expand RST ``include``). DisLMDB’s distributed
+layer is separate work; LMDB remains under the OpenLDAP Public License, and we
+do not claim to have invented it. If you ship or cite DisLMDB, please mention
+LMDB and Howard Chu as well.
 
 Source:
 `en.wikipedia.org/wiki/Lightning_Memory-Mapped_Database <https://en.wikipedia.org/wiki/Lightning_Memory-Mapped_Database>`_.
