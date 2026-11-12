@@ -58,6 +58,8 @@ abi version="1.0" {
     fn dislmdb_acl_role_assign
     fn dislmdb_acl_role_unassign
     fn dislmdb_acl_effective
+    fn dislmdb_acl_grant_delegate
+    fn dislmdb_acl_revoke_delegate
   }
 
   topology {

@@ -116,11 +116,11 @@ blockchain and security products.
 Closing
 -------
 
-This section (and ``TRIBUTE_HOWARD_CHU.rst``) exists so contributors see where
-the storage engine came from. DisLMDB’s distributed layer is separate work;
-LMDB remains under the OpenLDAP Public License, and we do not claim to have
-invented it. If you ship or cite DisLMDB, please mention LMDB and Howard Chu as
-well.
+This tribute leads ``README.rst`` (inlined for GitHub; RST ``include`` is not
+rendered there) and is also kept as ``TRIBUTE_HOWARD_CHU.rst``. DisLMDB’s
+distributed layer is separate work; LMDB remains under the OpenLDAP Public
+License, and we do not claim to have invented it. If you ship or cite DisLMDB,
+please mention LMDB and Howard Chu as well.
 
 Source:
 `en.wikipedia.org/wiki/Lightning_Memory-Mapped_Database <https://en.wikipedia.org/wiki/Lightning_Memory-Mapped_Database>`_.
@@ -174,8 +174,9 @@ What works today
        ``MAX_PEERS``; persisted region + peer_topo; same-region dial preference
    * - **Topo modes**
      - ``mirror`` / ``shard`` / ``hybrid``; auto-forward puts/dels
-       (``enable_auto_forward``); read proxy ``dislmdb_topo_get`` /
-       ``forward_get``
+       (``enable_auto_forward``); FWD3 origin+principal bind; atomic
+       ``FWD_OP_TXN`` for same-owner ``index_put``/``del``; read proxy
+       ``dislmdb_topo_get`` / ``forward_get``
    * - **Scale**
      - Heap-growable peer + connection tables; soft ``max_peers`` (0 =
        unlimited). Regional voters; voter HB vs learner AE lanes
@@ -195,8 +196,8 @@ What works today
      - Consensus-replicated (or SOLO) store/get; ``VERIFY`` (SHA-256 plaintext)
        + ``COMPRESS`` (zlib)
    * - **ACL**
-     - Opt-in ``enable_acl``: principal grants + **prefix grants** + **RBAC
-       roles** (global or prefix-scoped)
+     - Opt-in ``enable_acl`` (persisted): principal + prefix grants + RBAC
+       roles + **peer delegates** for FWD3/SYN2 asserted principals
    * - **Metrics**
      - ``dislmdb_get_metrics`` + ``format_metrics`` + ``export_metrics_file`` /
        ``DISLMDB_METRICS_FILE`` (no embedded HTTP)
@@ -226,7 +227,8 @@ Durability (honest)
      - Durable?
    * - User KV / LMDB pages
      - **Yes** — mmap + commit / ``dislmdb_force_sync`` / checkpoint
-   * - Meta (view, replicas, shard map, region, ACL/RBAC tables)
+   * - Meta (view, replicas, shard map, region, ``enable_acl``, ACL/RBAC
+       + delegate tables)
      - **Yes** when ``persist_state``
    * - Optional cluster key
      - Meta DBI only if ``persist_cluster_key``
@@ -270,6 +272,11 @@ All three surfaces consume the same C ABI (`bindings/ABI.kdl <bindings/ABI.kdl>`
 
 Both high-level bindings link the **native** shared library (not pure Rust /
 pure Go). Build ``libdislmdb`` first; rpath is wired for local ``build/lib``.
+
+``Env::open`` / ``dislmdb.Open`` force **``DISLMDB_CONSENSUS_SOLO``** and
+``network.local_port = 0`` (OS ephemeral bind). C ``dislmdb_env_config_init``
+still defaults to **PBFT** + port **9876** — set SOLO (and optionally port 0)
+explicitly in C, as in the quick start below.
 
 Rust (crate)
 ~~~~~~~~~~~~
@@ -463,17 +470,20 @@ Short form:
        Puts/dels across named DBIs in that txn are applied atomically.
    * - **Secondary indexes**
      - App-owned DBI via ``index_put`` / ``index_del`` / ``index_get`` /
-       ``index_scan``.
+       ``index_scan``. Under auto-forward, same-owner remote keys go as one
+       atomic ``FWD_OP_TXN``; cross-shard primary/index is rejected.
    * - **Versioned LWW**
      - ``dislmdb_put_versioned`` / ``dislmdb_get_versioned`` +
        ``DISLMDB_MIRROR_CLIENT_TIMESTAMP`` (env
        ``DISLMDB_MIRROR_CONFLICT=client_timestamp|lww``).
    * - **ACL / RBAC**
-     - Principal grants, prefix grants, roles (global or prefix-scoped). See
+     - Principal / prefix / roles + peer delegates for forward/SYN2. Reserved
+       DBI names (``__*``) are not app-writable via oplog/forward. See
        ``docs/acl.kdl``.
    * - **Auto-forward**
      - Only when the txn has no prior local pending ops — no mixed
-       local+forward batch.
+       local+forward batch. Wire is FWD3: ``origin == sender_id``; asserted
+       principal must equal origin or an ADMIN delegate grant.
    * - **Success**
      - Raft/PBFT: client sees success after consensus commit (staging aborted;
        durable via apply). SOLO: local LMDB commit.
@@ -514,9 +524,10 @@ consensus when using the client-timestamp mirror policy.
 ACL & RBAC
 ----------
 
-Opt-in via ``DISLMDB_env_config.enable_acl`` (off by default). Independent of
-transport crypto / mTLS / QUIC PKI. Normative doc:
-`docs/acl.kdl <docs/acl.kdl>`_.
+Opt-in via ``DISLMDB_env_config.enable_acl`` (off by default; **persisted**
+when ``persist_state`` is on — cold open restores the flag; legacy DBs with
+grant blobs but no flag force-enable ACL). Independent of transport crypto /
+mTLS / QUIC PKI. Normative doc: `docs/acl.kdl <docs/acl.kdl>`_.
 
 .. list-table::
    :header-rows: 1
@@ -540,14 +551,19 @@ transport crypto / mTLS / QUIC PKI. Normative doc:
    * - Membership
      - ``acl_role_assign`` / ``unassign``
      - Requires ADMIN after bootstrap
+   * - Peer delegate
+     - ``acl_grant_delegate`` / ``revoke_delegate``
+     - Allow peer ``node_id`` to assert a principal on FWD3 / SYN2 (ADMIN)
    * - Effective
      - ``acl_effective``
      - Direct grant ∪ empty-prefix role bits
 
 Bootstrap: first grant with empty grant table establishes the initial admin.
 Prefix-scoped role bits are key-dependent (same longest-match rules as prefix
-grants). Tables persist under meta keys ``acl_roles`` / ``acl_role_members``
-when ``persist_state`` is on.
+grants). On FWD3/SYN2, an asserted principal is accepted only if empty, equal
+to the authenticated origin, or listed as a delegate for that peer. Tables
+persist under ``acl_*`` meta keys (including ``acl_delegates`` and
+``enable_acl``) when ``persist_state`` is on.
 
 Ops & geo (playbooks)
 ---------------------
