@@ -112,12 +112,6 @@ void consensus_core_primary_id(const ConsensusCore *core, char out[EPDFT_NODE_ID
 /** Recompute fault_tolerance to the largest f with 3f+1 <= replica_count (capped by prefer_f if >0). */
 void consensus_core_recompute_faults(ConsensusCore *core, uint32_t prefer_f);
 
-ConsensusError consensus_core_handle_message(ConsensusCore *core,
-                                             MessageType type,
-                                             const char *from_node,
-                                             const uint8_t *data,
-                                             size_t size);
-
 ConsensusError consensus_core_handle_pbft(ConsensusCore *core, const PbftMessage *msg);
 
 bool consensus_core_is_primary(const ConsensusCore *core);

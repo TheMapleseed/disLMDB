@@ -3,6 +3,7 @@
  * @brief Distributed put/del with operation-log replication
  */
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,9 +29,24 @@ void dislmdb_free_pending_ops(DISLMDB_txn *txn)
     txn->operation_count = 0;
 }
 
+bool dislmdb_dbname_is_reserved(const char *name)
+{
+    if (!name || name[0] == '\0') {
+        return false;
+    }
+    /* Internal DBIs use a leading "__" (meta, raft, bytecode, …). */
+    if (name[0] == '_' && name[1] == '_') {
+        return true;
+    }
+    return false;
+}
+
 static int record_op(DISLMDB_txn *txn, DISLMDB_OP_TYPE type, const char *dbname,
                      const MDB_val *key, const MDB_val *val, unsigned int flags)
 {
+    if (dislmdb_dbname_is_reserved(dbname)) {
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
     DISLMDB_pending_op *op = calloc(1, sizeof(*op));
     if (!op) {
         return DISLMDB_ERR_MEMORY_ERROR;
@@ -166,6 +182,9 @@ int dislmdb_dbi_open(DISLMDB_txn *txn, const char *name, unsigned int flags, MDB
     if (!txn || txn->magic != DISLMDB_MAGIC || !dbi) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    if (dislmdb_dbname_is_reserved(name)) {
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
     int rc = mdb_dbi_open(txn->mdb_txn, name, flags, dbi);
     if (rc != 0) {
         return rc;
@@ -242,12 +261,108 @@ int dislmdb_del(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data)
     return rc;
 }
 
+/**
+ * When auto-forward would split primary vs index across owners, either forward
+ * both atomically to the same remote owner or reject. Local-only path unchanged.
+ */
+static int index_pair_prepare_forward(DISLMDB_txn *txn, MDB_val *pk, MDB_val *sk,
+                                      char owner_out[64], bool *need_fwd)
+{
+    *need_fwd = false;
+    if (!txn->is_distributed || !txn->is_write_txn) {
+        return DISLMDB_SUCCESS;
+    }
+    int prc = dislmdb_topo_key_writable(txn->env, pk->mv_data, pk->mv_size);
+    int src = dislmdb_topo_key_writable(txn->env, sk->mv_data, sk->mv_size);
+    if (prc == DISLMDB_SUCCESS && src == DISLMDB_SUCCESS) {
+        return DISLMDB_SUCCESS;
+    }
+    if (!txn->env->config.enable_auto_forward) {
+        return (prc != DISLMDB_SUCCESS) ? prc : src;
+    }
+    if (prc != DISLMDB_ERR_OPERATION_REJECTED &&
+        src != DISLMDB_ERR_OPERATION_REJECTED) {
+        return (prc != DISLMDB_SUCCESS) ? prc : src;
+    }
+    if (txn->pending_ops != NULL || txn->operation_count > 0) {
+        return DISLMDB_ERR_OPERATION_REJECTED;
+    }
+    char owner_p[64] = {0};
+    char owner_s[64] = {0};
+    if (dislmdb_topo_resolve_owner(txn->env, pk->mv_data, pk->mv_size, owner_p) !=
+            DISLMDB_SUCCESS ||
+        dislmdb_topo_resolve_owner(txn->env, sk->mv_data, sk->mv_size, owner_s) !=
+            DISLMDB_SUCCESS) {
+        return DISLMDB_ERR_OPERATION_REJECTED;
+    }
+    if (strncmp(owner_p, owner_s, 63) != 0) {
+        /* Cross-shard index is not atomically forwardable. */
+        return DISLMDB_ERR_OPERATION_REJECTED;
+    }
+    if (strncmp(owner_p, txn->env->local_node_id, 63) == 0) {
+        return (prc != DISLMDB_SUCCESS) ? prc : src;
+    }
+    if (!owner_peer_connected(txn->env, owner_p)) {
+        return DISLMDB_ERR_OPERATION_REJECTED;
+    }
+    strncpy(owner_out, owner_p, 63);
+    owner_out[63] = '\0';
+    *need_fwd = true;
+    return DISLMDB_SUCCESS;
+}
+
 int dislmdb_index_put(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
                       MDB_val *primary_key, MDB_val *primary_val,
                       MDB_val *secondary_key, unsigned int flags)
 {
     if (!txn || !primary_key || !primary_val || !secondary_key) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    char owner[64];
+    bool need_fwd = false;
+    int prep = index_pair_prepare_forward(txn, primary_key, secondary_key, owner,
+                                          &need_fwd);
+    if (prep != DISLMDB_SUCCESS) {
+        return prep;
+    }
+    if (need_fwd) {
+        if (flags != 0) {
+            return DISLMDB_ERR_OPERATION_REJECTED;
+        }
+        const char *pdb = dbname_for_dbi(txn, primary_dbi);
+        const char *idb = dbname_for_dbi(txn, index_dbi);
+        const char *pname = (pdb && pdb[0] != '\0') ? pdb : "kv";
+        const char *iname = (idb && idb[0] != '\0') ? idb : "kv";
+        DISLMDB_fwd_op ops[2];
+        memset(ops, 0, sizeof(ops));
+        ops[0].op = 1; /* FWD_OP_PUT */
+        ops[0].dbname = pname;
+        ops[0].key = primary_key->mv_data;
+        ops[0].key_len = primary_key->mv_size;
+        ops[0].val = primary_val->mv_data;
+        ops[0].val_len = primary_val->mv_size;
+        ops[1].op = 1;
+        ops[1].dbname = iname;
+        ops[1].key = secondary_key->mv_data;
+        ops[1].key_len = secondary_key->mv_size;
+        ops[1].val = primary_key->mv_data;
+        ops[1].val_len = primary_key->mv_size;
+        uint32_t to = txn->env->config.consensus.timeout_ms;
+        if (to < 10000u) {
+            to = 10000u;
+        }
+        if (txn->mdb_txn) {
+            mdb_txn_abort(txn->mdb_txn);
+            txn->mdb_txn = NULL;
+        }
+        int rc = dislmdb_topo_forward_txn(txn->env, ops, 2, to);
+        if (txn->is_write_txn && txn->env->mdb_env) {
+            MDB_txn *fresh = NULL;
+            if (mdb_txn_begin(txn->env->mdb_env, NULL, 0, &fresh) == 0) {
+                txn->mdb_txn = fresh;
+            }
+        }
+        return rc;
     }
     int rc = dislmdb_put(txn, primary_dbi, primary_key, primary_val, flags);
     if (rc != DISLMDB_SUCCESS) {
@@ -264,6 +379,45 @@ int dislmdb_index_del(DISLMDB_txn *txn, MDB_dbi primary_dbi, MDB_dbi index_dbi,
 {
     if (!txn || !primary_key || !secondary_key) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    char owner[64];
+    bool need_fwd = false;
+    int prep = index_pair_prepare_forward(txn, primary_key, secondary_key, owner,
+                                          &need_fwd);
+    if (prep != DISLMDB_SUCCESS) {
+        return prep;
+    }
+    if (need_fwd) {
+        const char *pdb = dbname_for_dbi(txn, primary_dbi);
+        const char *idb = dbname_for_dbi(txn, index_dbi);
+        const char *pname = (pdb && pdb[0] != '\0') ? pdb : "kv";
+        const char *iname = (idb && idb[0] != '\0') ? idb : "kv";
+        DISLMDB_fwd_op ops[2];
+        memset(ops, 0, sizeof(ops));
+        ops[0].op = 2; /* FWD_OP_DEL */
+        ops[0].dbname = pname;
+        ops[0].key = primary_key->mv_data;
+        ops[0].key_len = primary_key->mv_size;
+        ops[1].op = 2;
+        ops[1].dbname = iname;
+        ops[1].key = secondary_key->mv_data;
+        ops[1].key_len = secondary_key->mv_size;
+        uint32_t to = txn->env->config.consensus.timeout_ms;
+        if (to < 10000u) {
+            to = 10000u;
+        }
+        if (txn->mdb_txn) {
+            mdb_txn_abort(txn->mdb_txn);
+            txn->mdb_txn = NULL;
+        }
+        int rc = dislmdb_topo_forward_txn(txn->env, ops, 2, to);
+        if (txn->is_write_txn && txn->env->mdb_env) {
+            MDB_txn *fresh = NULL;
+            if (mdb_txn_begin(txn->env->mdb_env, NULL, 0, &fresh) == 0) {
+                txn->mdb_txn = fresh;
+            }
+        }
+        return rc;
     }
     int rc = dislmdb_del(txn, primary_dbi, primary_key, NULL);
     if (rc != 0 && rc != MDB_NOTFOUND) {
@@ -477,6 +631,198 @@ int dislmdb_get_versioned(DISLMDB_txn *txn, MDB_dbi dbi, MDB_val *key,
     return DISLMDB_SUCCESS;
 }
 
+int dislmdb_acl_authorize_oplog(DISLMDB_env *env, const char *principal,
+                                const uint8_t *data, size_t size)
+{
+    if (!env || !data || size < 12) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (!env->config.enable_acl) {
+        return DISLMDB_SUCCESS;
+    }
+    if (dislmdb_read_u32(data) != DISLMDB_OPLOG_MAGIC) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    uint32_t ver = dislmdb_read_u32(data + 4);
+    if (ver != 1) {
+        return DISLMDB_ERR_VERSION_MISMATCH;
+    }
+    uint32_t count = dislmdb_read_u32(data + 8);
+    size_t o = 12;
+
+    char saved[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+    memset(saved, 0, sizeof(saved));
+    const char *cur = dislmdb_acl_current_principal(env);
+    if (cur && cur[0] != '\0') {
+        strncpy(saved, cur, DISLMDB_ACL_PRINCIPAL_MAX);
+    }
+    int prc = dislmdb_acl_set_thread_principal(
+        env, (principal && principal[0] != '\0') ? principal : NULL);
+    if (prc != DISLMDB_SUCCESS) {
+        return prc;
+    }
+
+    int rc = DISLMDB_SUCCESS;
+    for (uint32_t i = 0; i < count; i++) {
+        if (o + 4 + 2 > size) {
+            rc = DISLMDB_ERR_MESSAGE_VALIDATION;
+            break;
+        }
+        DISLMDB_OP_TYPE type = (DISLMDB_OP_TYPE)dislmdb_read_u32(data + o);
+        o += 4;
+        uint16_t nlen = dislmdb_read_u16(data + o);
+        o += 2;
+        if (o + nlen + 4 > size || nlen >= 64) {
+            rc = DISLMDB_ERR_MESSAGE_VALIDATION;
+            break;
+        }
+        char dbname[64];
+        memset(dbname, 0, sizeof(dbname));
+        if (nlen) {
+            memcpy(dbname, data + o, nlen);
+        }
+        o += nlen;
+        if (dislmdb_dbname_is_reserved(dbname)) {
+            rc = DISLMDB_ERR_NOT_AUTHORIZED;
+            break;
+        }
+        uint32_t klen = dislmdb_read_u32(data + o);
+        o += 4;
+        if (o + klen + 4 > size) {
+            rc = DISLMDB_ERR_MESSAGE_VALIDATION;
+            break;
+        }
+        const uint8_t *key = data + o;
+        o += klen;
+        uint32_t vlen = dislmdb_read_u32(data + o);
+        o += 4;
+        if (o + vlen + 4 > size) {
+            rc = DISLMDB_ERR_MESSAGE_VALIDATION;
+            break;
+        }
+        o += vlen;
+        o += 4; /* flags */
+        if (type == DISLMDB_OP_TYPE_PUT || type == DISLMDB_OP_TYPE_DEL) {
+            rc = dislmdb_acl_require_key(env, DISLMDB_ACL_WRITE, key, klen);
+            if (rc != DISLMDB_SUCCESS) {
+                break;
+            }
+        }
+    }
+    (void)dislmdb_acl_set_thread_principal(
+        env, saved[0] != '\0' ? saved : NULL);
+    return rc;
+}
+
+int dislmdb_sync_wrap_oplog(DISLMDB_env *env, const uint8_t *oplog, size_t oplog_len,
+                            uint8_t **out, size_t *out_len)
+{
+    if (!env || !oplog || oplog_len == 0 || !out || !out_len) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    const char *origin = env->local_node_id;
+    size_t olen = strnlen(origin, 63);
+    const char *who = dislmdb_acl_current_principal(env);
+    size_t plen = 0;
+    if (who && who[0] != '\0') {
+        plen = strnlen(who, DISLMDB_ACL_PRINCIPAL_MAX);
+    }
+    size_t need = 4 + 1 + olen + 1 + plen + oplog_len;
+    uint8_t *buf = malloc(need);
+    if (!buf) {
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    size_t o = 0;
+    dislmdb_write_u32(buf + o, DISLMDB_SYNC_WRAP_MAGIC);
+    o += 4;
+    buf[o++] = (uint8_t)olen;
+    if (olen) {
+        memcpy(buf + o, origin, olen);
+        o += olen;
+    }
+    buf[o++] = (uint8_t)plen;
+    if (plen) {
+        memcpy(buf + o, who, plen);
+        o += plen;
+    }
+    memcpy(buf + o, oplog, oplog_len);
+    *out = buf;
+    *out_len = need;
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_sync_unwrap_authorize(DISLMDB_env *env, const char *sender_id,
+                                  const uint8_t *data, size_t size,
+                                  const uint8_t **oplog_out, size_t *oplog_len,
+                                  bool *oplog_owned)
+{
+    if (!env || !data || size < 12 || !oplog_out || !oplog_len || !oplog_owned) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    *oplog_out = NULL;
+    *oplog_len = 0;
+    *oplog_owned = false;
+
+    uint32_t magic = dislmdb_read_u32(data);
+    if (magic == DISLMDB_OPLOG_MAGIC) {
+        /* Legacy bare OPLG: only when ACL is off (pre-SYN2 peers / solo). */
+        if (env->config.enable_acl) {
+            return DISLMDB_ERR_NOT_AUTHORIZED;
+        }
+        *oplog_out = data;
+        *oplog_len = size;
+        return DISLMDB_SUCCESS;
+    }
+    if (magic != DISLMDB_SYNC_WRAP_MAGIC || size < 6) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    size_t o = 4;
+    uint8_t olen = data[o++];
+    if ((size_t)o + olen + 1 > size || olen >= 64) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    char origin[64];
+    memset(origin, 0, sizeof(origin));
+    if (olen) {
+        memcpy(origin, data + o, olen);
+    }
+    o += olen;
+    if (sender_id && sender_id[0] != '\0' &&
+        strncmp(origin, sender_id, 63) != 0) {
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
+    uint8_t plen = data[o++];
+    if ((size_t)o + plen > size || plen > DISLMDB_ACL_PRINCIPAL_MAX) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    char principal[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+    memset(principal, 0, sizeof(principal));
+    if (plen) {
+        memcpy(principal, data + o, plen);
+    }
+    o += plen;
+    {
+        int arc = dislmdb_acl_authorize_asserted_principal(
+            env, origin, principal[0] ? principal : NULL);
+        if (arc != DISLMDB_SUCCESS) {
+            return arc;
+        }
+    }
+    if (o >= size) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    const uint8_t *oplog = data + o;
+    size_t olen_payload = size - o;
+    int arc = dislmdb_acl_authorize_oplog(env, principal[0] ? principal : NULL,
+                                         oplog, olen_payload);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
+    *oplog_out = oplog;
+    *oplog_len = olen_payload;
+    return DISLMDB_SUCCESS;
+}
+
 int dislmdb_serialize_pending_ops(const DISLMDB_txn *txn, uint8_t **out, size_t *out_len)
 {
     if (!txn || !out || !out_len) {
@@ -549,6 +895,10 @@ int dislmdb_apply_oplog_payload(DISLMDB_env *env, const uint8_t *data, size_t si
         char dbname[64];
         memset(dbname, 0, sizeof(dbname));
         memcpy(dbname, data + o, nlen); o += nlen;
+        if (dislmdb_dbname_is_reserved(dbname)) {
+            mdb_txn_abort(txn);
+            return DISLMDB_ERR_NOT_AUTHORIZED;
+        }
         uint32_t klen = dislmdb_read_u32(data + o); o += 4;
         if (o + klen + 4 > size) {
             mdb_txn_abort(txn);

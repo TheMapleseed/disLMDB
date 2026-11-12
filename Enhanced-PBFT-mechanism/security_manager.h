@@ -49,11 +49,6 @@ void security_manager_hash_consensus(SecurityManager *sm,
                                      size_t size,
                                      uint8_t out[SECURITY_DIGEST_LEN]);
 
-void security_manager_hash(SecurityManager *sm,
-                           const uint8_t *data,
-                           size_t size,
-                           uint8_t out[SECURITY_DIGEST_LEN]);
-
 bool security_manager_digest_eq(const uint8_t a[SECURITY_DIGEST_LEN],
                                 const uint8_t b[SECURITY_DIGEST_LEN]);
 

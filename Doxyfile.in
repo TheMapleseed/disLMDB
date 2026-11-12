@@ -34,7 +34,9 @@ EXCLUDE_PATTERNS       = */build/* */lib/* */bin/*
 EXAMPLE_PATH           = @CMAKE_CURRENT_SOURCE_DIR@/examples
 EXAMPLE_PATTERNS       = *.c
 EXAMPLE_RECURSIVE      = YES
-USE_MDFILE_AS_MAINPAGE = @CMAKE_CURRENT_SOURCE_DIR@/README.md
+# Project narrative lives in README.rst (includes TRIBUTE_HOWARD_CHU.rst).
+# Doxygen does not treat RST as a main page — API docs come from headers.
+USE_MDFILE_AS_MAINPAGE =
 MARKDOWN_SUPPORT       = YES
 TOC_INCLUDE_HEADINGS   = 5
 AUTOLINK_SUPPORT       = YES

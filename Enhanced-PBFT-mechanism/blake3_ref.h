@@ -60,9 +60,6 @@ void blake3_derive_key(const char *context,
 void blake3_hasher_update(blake3_hasher *self, const uint8_t *input, size_t input_len);
 void blake3_hasher_finalize(const blake3_hasher *self, uint8_t *out, size_t out_len);
 
-/** One-shot 32-byte BLAKE3 hash. */
-void blake3_hash_32(const uint8_t *input, size_t input_len, uint8_t out[BLAKE3_OUT_LEN]);
-
 #ifdef __cplusplus
 }
 #endif

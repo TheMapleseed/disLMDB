@@ -60,6 +60,19 @@ abi version="1.0" {
     fn dislmdb_acl_effective
   }
 
+  topology {
+    fn dislmdb_add_node
+    fn dislmdb_get_topology_mode
+    fn dislmdb_shard_map_set
+    fn dislmdb_shard_map_get
+    fn dislmdb_shard_lookup
+    fn dislmdb_topo_map_publish
+    fn dislmdb_topo_forward_put
+    fn dislmdb_topo_forward_del
+    fn dislmdb_topo_forward_get
+    fn dislmdb_topo_get
+  }
+
   metrics {
     fn dislmdb_get_metrics
     fn dislmdb_format_metrics
@@ -68,7 +81,16 @@ abi version="1.0" {
 
   notes {
     // Opaque DISLMDB_env / DISLMDB_txn — never layout-dependent across majors.
-    // enable_acl default false; COMPRESS requires zlib at link time.
+    // enable_acl default false; persisted with grants; COMPRESS needs zlib.
     // Metrics: format_metrics only — no in-process scrape HTTP (sidecar forever).
+    // dislmdb_txn_commit always consumes the txn (success or fail).
+    // Forward RPC FWD3: origin==sender_id; principal==origin or ACL delegate.
+    // FWD_OP_TXN = atomic multi-op forward (index_put/del under auto-forward).
+    // SYNC_REQUEST SYN2: origin bound + asserted principal authorized + OPLG ACL.
+    // Reserved DBI names (__*) rejected from app open / oplog / forward.
+    // network.local_port 0 = ephemeral bind (not remapped to 9876).
+    // Bindings Open() force SOLO + port 0; C config_init still defaults PBFT.
+    // Multi-peer PBFT rejects unsigned messages without a cluster key.
+    // Raft InstallSnapshot restore preserves __* sub-DB roots on main DBI.
   }
 }

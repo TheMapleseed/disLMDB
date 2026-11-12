@@ -6,8 +6,73 @@
 #include "dislmdb_errors.h"
 #include "dislmdb_crypto.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+
+/** Known ACL capability bits (ignore garbage from disk). */
+#define ACL_PERMS_MASK (DISLMDB_ACL_READ | DISLMDB_ACL_WRITE | DISLMDB_ACL_ADMIN)
+
+static pthread_key_t acl_tls_key;
+static pthread_once_t acl_tls_once = PTHREAD_ONCE_INIT;
+
+static void acl_tls_dtor(void *p)
+{
+    free(p);
+}
+
+static void acl_tls_make_key(void)
+{
+    (void)pthread_key_create(&acl_tls_key, acl_tls_dtor);
+}
+
+static void acl_tls_ensure(void)
+{
+    (void)pthread_once(&acl_tls_once, acl_tls_make_key);
+}
+
+const char *dislmdb_acl_current_principal(DISLMDB_env *env)
+{
+    acl_tls_ensure();
+    const char *tls = (const char *)pthread_getspecific(acl_tls_key);
+    if (tls && tls[0] != '\0') {
+        return tls;
+    }
+    if (env && env->acl_principal[0] != '\0') {
+        return env->acl_principal;
+    }
+    return "";
+}
+
+int dislmdb_acl_set_thread_principal(DISLMDB_env *env, const char *principal)
+{
+    (void)env;
+    acl_tls_ensure();
+    char *prev = (char *)pthread_getspecific(acl_tls_key);
+    if (prev) {
+        free(prev);
+        (void)pthread_setspecific(acl_tls_key, NULL);
+    }
+    if (!principal || principal[0] == '\0') {
+        return DISLMDB_SUCCESS;
+    }
+    if (strnlen(principal, DISLMDB_ACL_PRINCIPAL_MAX + 1) >
+        DISLMDB_ACL_PRINCIPAL_MAX) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    size_t n = strnlen(principal, DISLMDB_ACL_PRINCIPAL_MAX);
+    char *copy = malloc(n + 1);
+    if (!copy) {
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    memcpy(copy, principal, n);
+    copy[n] = '\0';
+    if (pthread_setspecific(acl_tls_key, copy) != 0) {
+        free(copy);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    return DISLMDB_SUCCESS;
+}
 
 /** On-disk: magic 'ACL1' + count + N × (name[65] + perms u32). */
 #define ACL_PERSIST_MAGIC 0x314C4341u
@@ -49,11 +114,11 @@ static unsigned int acl_global_effective_locked(DISLMDB_env *env,
 
 static bool acl_caller_is_admin_locked(DISLMDB_env *env)
 {
-    if (env->acl_principal[0] == '\0') {
+    const char *who = dislmdb_acl_current_principal(env);
+    if (!who || who[0] == '\0') {
         return false;
     }
-    return (acl_global_effective_locked(env, env->acl_principal) &
-            DISLMDB_ACL_ADMIN) != 0;
+    return (acl_global_effective_locked(env, who) & DISLMDB_ACL_ADMIN) != 0;
 }
 
 static int acl_prefix_find(DISLMDB_env *env, const char *principal,
@@ -170,10 +235,10 @@ static unsigned int acl_prefix_effective_locked(DISLMDB_env *env,
             size_t plen =
                 strnlen(env->acl_roles[r].prefix, DISLMDB_ACL_PREFIX_MAX);
             if (plen == 0 || plen > key_len || plen < best) {
-                break;
+                continue;
             }
             if (memcmp(kb, env->acl_roles[r].prefix, plen) != 0) {
-                break;
+                continue;
             }
             best = plen;
             best_perms = env->acl_roles[r].perms &
@@ -195,13 +260,13 @@ int dislmdb_acl_require(DISLMDB_env *env, unsigned int need)
     if (!env->acl_mutex_ready) {
         return DISLMDB_ERR_NOT_INITIALIZED;
     }
+    const char *who = dislmdb_acl_current_principal(env);
     pthread_mutex_lock(&env->acl_mutex);
-    if (env->acl_principal[0] == '\0') {
+    if (!who || who[0] == '\0') {
         pthread_mutex_unlock(&env->acl_mutex);
         return DISLMDB_ERR_NOT_AUTHORIZED;
     }
-    unsigned int have =
-        acl_global_effective_locked(env, env->acl_principal);
+    unsigned int have = acl_global_effective_locked(env, who);
     pthread_mutex_unlock(&env->acl_mutex);
     if ((have & need) != need) {
         return DISLMDB_ERR_NOT_AUTHORIZED;
@@ -229,19 +294,18 @@ int dislmdb_acl_require_key(DISLMDB_env *env, unsigned int need,
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
 
+    const char *who = dislmdb_acl_current_principal(env);
     pthread_mutex_lock(&env->acl_mutex);
-    if (env->acl_principal[0] == '\0') {
+    if (!who || who[0] == '\0') {
         pthread_mutex_unlock(&env->acl_mutex);
         return DISLMDB_ERR_NOT_AUTHORIZED;
     }
-    unsigned int have =
-        acl_global_effective_locked(env, env->acl_principal);
+    unsigned int have = acl_global_effective_locked(env, who);
     if ((have & need) == need) {
         pthread_mutex_unlock(&env->acl_mutex);
         return DISLMDB_SUCCESS;
     }
-    unsigned int pfx =
-        acl_prefix_effective_locked(env, env->acl_principal, key, key_len);
+    unsigned int pfx = acl_prefix_effective_locked(env, who, key, key_len);
     pthread_mutex_unlock(&env->acl_mutex);
     if ((pfx & need) == need) {
         return DISLMDB_SUCCESS;
@@ -261,6 +325,12 @@ int dislmdb_acl_set_principal(DISLMDB_env *env, const char *principal)
                          DISLMDB_ACL_PRINCIPAL_MAX) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    /* Thread-local principal (preferred for concurrent callers). */
+    int trc = dislmdb_acl_set_thread_principal(env, principal);
+    if (trc != DISLMDB_SUCCESS) {
+        return trc;
+    }
+    /* Env fallback for threads that never set TLS (solo / sync apps). */
     pthread_mutex_lock(&env->acl_mutex);
     if (!principal || principal[0] == '\0') {
         env->acl_principal[0] = '\0';
@@ -291,17 +361,15 @@ int dislmdb_acl_grant(DISLMDB_env *env, const char *principal, unsigned int perm
 
     pthread_mutex_lock(&env->acl_mutex);
     bool empty = (env->acl_grant_count == 0);
-    if (!empty) {
-        if (env->acl_principal[0] == '\0') {
+    if (empty) {
+        /* First bootstrap only once; sealed after any prior grant table. */
+        if (env->acl_sealed) {
             pthread_mutex_unlock(&env->acl_mutex);
             return DISLMDB_ERR_NOT_AUTHORIZED;
         }
-        int self = acl_find(env, env->acl_principal);
-        if (self < 0 ||
-            (env->acl_grants[self].perms & DISLMDB_ACL_ADMIN) == 0) {
-            pthread_mutex_unlock(&env->acl_mutex);
-            return DISLMDB_ERR_NOT_AUTHORIZED;
-        }
+    } else if (!acl_caller_is_admin_locked(env)) {
+        pthread_mutex_unlock(&env->acl_mutex);
+        return DISLMDB_ERR_NOT_AUTHORIZED;
     }
 
     int idx = acl_find(env, principal);
@@ -317,7 +385,8 @@ int dislmdb_acl_grant(DISLMDB_env *env, const char *principal, unsigned int perm
         env->acl_grants[idx].used = true;
         env->acl_grant_count++;
     }
-    env->acl_grants[idx].perms |= perms;
+    env->acl_grants[idx].perms |= (perms & ACL_PERMS_MASK);
+    env->acl_sealed = true;
     pthread_mutex_unlock(&env->acl_mutex);
     if (env->config.consensus.persist_state) {
         (void)dislmdb_persist_save(env);
@@ -339,12 +408,7 @@ int dislmdb_acl_revoke(DISLMDB_env *env, const char *principal, unsigned int per
     }
 
     pthread_mutex_lock(&env->acl_mutex);
-    if (env->acl_principal[0] == '\0') {
-        pthread_mutex_unlock(&env->acl_mutex);
-        return DISLMDB_ERR_NOT_AUTHORIZED;
-    }
-    int self = acl_find(env, env->acl_principal);
-    if (self < 0 || (env->acl_grants[self].perms & DISLMDB_ACL_ADMIN) == 0) {
+    if (!acl_caller_is_admin_locked(env)) {
         pthread_mutex_unlock(&env->acl_mutex);
         return DISLMDB_ERR_NOT_AUTHORIZED;
     }
@@ -427,7 +491,8 @@ int dislmdb_acl_persist_unpack(DISLMDB_env *env, const uint8_t *data, size_t len
         if (name[0] == '\0') {
             continue;
         }
-        unsigned int perms = dislmdb_read_u32(rec + ACL_PERSIST_NAME);
+        unsigned int perms =
+            dislmdb_read_u32(rec + ACL_PERSIST_NAME) & ACL_PERMS_MASK;
         if (perms == 0) {
             continue;
         }
@@ -440,6 +505,9 @@ int dislmdb_acl_persist_unpack(DISLMDB_env *env, const uint8_t *data, size_t len
         env->acl_grants[slot].perms = perms;
         env->acl_grants[slot].used = true;
         env->acl_grant_count++;
+    }
+    if (env->acl_grant_count > 0) {
+        env->acl_sealed = true;
     }
     pthread_mutex_unlock(&env->acl_mutex);
     return DISLMDB_SUCCESS;
@@ -1031,7 +1099,8 @@ int dislmdb_acl_roles_persist_unpack(DISLMDB_env *env, const uint8_t *data,
         memcpy(prefix, rec + ACL_ROLE_NAME, ACL_PREFIX_FIELD);
         prefix[ACL_PREFIX_FIELD - 1] = '\0';
         unsigned int perms =
-            dislmdb_read_u32(rec + ACL_ROLE_NAME + ACL_PREFIX_FIELD);
+            dislmdb_read_u32(rec + ACL_ROLE_NAME + ACL_PREFIX_FIELD) &
+            ACL_PERMS_MASK;
         if (name[0] == '\0' || perms == 0) {
             continue;
         }
@@ -1132,6 +1201,230 @@ int dislmdb_acl_role_members_persist_unpack(DISLMDB_env *env,
         env->acl_role_members[slot].role[DISLMDB_ACL_ROLE_MAX] = '\0';
         env->acl_role_members[slot].used = true;
         env->acl_role_member_count++;
+    }
+    pthread_mutex_unlock(&env->acl_mutex);
+    return DISLMDB_SUCCESS;
+}
+
+/** On-disk: magic 'ACLD' + count + N × (peer[64] + principal[65]). */
+#define ACL_DELEGATE_MAGIC 0x444C4341u
+#define ACL_DELEGATE_PEER  64
+#define ACL_DELEGATE_REC   (ACL_DELEGATE_PEER + ACL_PERSIST_NAME)
+
+static int acl_delegate_find(DISLMDB_env *env, const char *peer,
+                             const char *principal)
+{
+    if (!env || !peer || !principal || peer[0] == '\0' ||
+        principal[0] == '\0') {
+        return -1;
+    }
+    for (uint32_t i = 0; i < DISLMDB_ACL_MAX_DELEGATES; i++) {
+        if (env->acl_delegates[i].used &&
+            strncmp(env->acl_delegates[i].peer, peer, 63) == 0 &&
+            strncmp(env->acl_delegates[i].principal, principal,
+                    DISLMDB_ACL_PRINCIPAL_MAX) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int acl_delegate_alloc(DISLMDB_env *env)
+{
+    for (uint32_t i = 0; i < DISLMDB_ACL_MAX_DELEGATES; i++) {
+        if (!env->acl_delegates[i].used) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+int dislmdb_acl_authorize_asserted_principal(DISLMDB_env *env,
+                                             const char *origin,
+                                             const char *principal)
+{
+    if (!env) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (!env->config.enable_acl) {
+        return DISLMDB_SUCCESS;
+    }
+    if (!principal || principal[0] == '\0') {
+        return DISLMDB_SUCCESS;
+    }
+    if (!origin || origin[0] == '\0') {
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
+    if (strncmp(principal, origin, DISLMDB_ACL_PRINCIPAL_MAX) == 0) {
+        return DISLMDB_SUCCESS;
+    }
+    if (!env->acl_mutex_ready) {
+        return DISLMDB_ERR_NOT_INITIALIZED;
+    }
+    pthread_mutex_lock(&env->acl_mutex);
+    int idx = acl_delegate_find(env, origin, principal);
+    pthread_mutex_unlock(&env->acl_mutex);
+    return idx >= 0 ? DISLMDB_SUCCESS : DISLMDB_ERR_NOT_AUTHORIZED;
+}
+
+int dislmdb_acl_grant_delegate(DISLMDB_env *env, const char *peer_node_id,
+                               const char *principal)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !peer_node_id ||
+        peer_node_id[0] == '\0' || !principal || principal[0] == '\0') {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (strnlen(peer_node_id, 64) >= 64 ||
+        strnlen(principal, DISLMDB_ACL_PRINCIPAL_MAX + 1) >
+            DISLMDB_ACL_PRINCIPAL_MAX) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (!env->acl_mutex_ready) {
+        return DISLMDB_ERR_NOT_INITIALIZED;
+    }
+    if (!env->config.enable_acl) {
+        return DISLMDB_ERR_INVALID_OPERATION;
+    }
+
+    pthread_mutex_lock(&env->acl_mutex);
+    if (!acl_caller_is_admin_locked(env)) {
+        pthread_mutex_unlock(&env->acl_mutex);
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
+    int idx = acl_delegate_find(env, peer_node_id, principal);
+    if (idx < 0) {
+        idx = acl_delegate_alloc(env);
+        if (idx < 0) {
+            pthread_mutex_unlock(&env->acl_mutex);
+            return DISLMDB_ERR_BUFFER_OVERFLOW;
+        }
+        memset(&env->acl_delegates[idx], 0, sizeof(env->acl_delegates[idx]));
+        strncpy(env->acl_delegates[idx].peer, peer_node_id, 63);
+        env->acl_delegates[idx].peer[63] = '\0';
+        strncpy(env->acl_delegates[idx].principal, principal,
+                DISLMDB_ACL_PRINCIPAL_MAX);
+        env->acl_delegates[idx].principal[DISLMDB_ACL_PRINCIPAL_MAX] = '\0';
+        env->acl_delegates[idx].used = true;
+        env->acl_delegate_count++;
+    }
+    pthread_mutex_unlock(&env->acl_mutex);
+    if (env->config.consensus.persist_state) {
+        (void)dislmdb_persist_save(env);
+    }
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_acl_revoke_delegate(DISLMDB_env *env, const char *peer_node_id,
+                                const char *principal)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !peer_node_id ||
+        peer_node_id[0] == '\0' || !principal || principal[0] == '\0') {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (!env->acl_mutex_ready) {
+        return DISLMDB_ERR_NOT_INITIALIZED;
+    }
+    if (!env->config.enable_acl) {
+        return DISLMDB_ERR_INVALID_OPERATION;
+    }
+
+    pthread_mutex_lock(&env->acl_mutex);
+    if (!acl_caller_is_admin_locked(env)) {
+        pthread_mutex_unlock(&env->acl_mutex);
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
+    int idx = acl_delegate_find(env, peer_node_id, principal);
+    if (idx < 0) {
+        pthread_mutex_unlock(&env->acl_mutex);
+        return DISLMDB_ERR_NODE_NOT_FOUND;
+    }
+    env->acl_delegates[idx].used = false;
+    env->acl_delegates[idx].peer[0] = '\0';
+    env->acl_delegates[idx].principal[0] = '\0';
+    if (env->acl_delegate_count > 0) {
+        env->acl_delegate_count--;
+    }
+    pthread_mutex_unlock(&env->acl_mutex);
+    if (env->config.consensus.persist_state) {
+        (void)dislmdb_persist_save(env);
+    }
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_acl_delegates_persist_pack(DISLMDB_env *env, uint8_t **out,
+                                       size_t *out_len)
+{
+    if (!env || !out || !out_len || !env->acl_mutex_ready) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    pthread_mutex_lock(&env->acl_mutex);
+    uint32_t n = env->acl_delegate_count;
+    size_t need = 8 + (size_t)n * ACL_DELEGATE_REC;
+    uint8_t *buf = calloc(1, need ? need : 8);
+    if (!buf) {
+        pthread_mutex_unlock(&env->acl_mutex);
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    dislmdb_write_u32(buf, ACL_DELEGATE_MAGIC);
+    dislmdb_write_u32(buf + 4, n);
+    size_t o = 8;
+    uint32_t written = 0;
+    for (uint32_t i = 0;
+         i < DISLMDB_ACL_MAX_DELEGATES && written < n; i++) {
+        if (!env->acl_delegates[i].used) {
+            continue;
+        }
+        memcpy(buf + o, env->acl_delegates[i].peer, ACL_DELEGATE_PEER);
+        memcpy(buf + o + ACL_DELEGATE_PEER, env->acl_delegates[i].principal,
+               ACL_PERSIST_NAME);
+        o += ACL_DELEGATE_REC;
+        written++;
+    }
+    pthread_mutex_unlock(&env->acl_mutex);
+    *out = buf;
+    *out_len = o;
+    return DISLMDB_SUCCESS;
+}
+
+int dislmdb_acl_delegates_persist_unpack(DISLMDB_env *env, const uint8_t *data,
+                                         size_t len)
+{
+    if (!env || !data || !env->acl_mutex_ready) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (len < 8 || dislmdb_read_u32(data) != ACL_DELEGATE_MAGIC) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    uint32_t n = dislmdb_read_u32(data + 4);
+    if (n > DISLMDB_ACL_MAX_DELEGATES ||
+        len < 8 + (size_t)n * ACL_DELEGATE_REC) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    pthread_mutex_lock(&env->acl_mutex);
+    memset(env->acl_delegates, 0, sizeof(env->acl_delegates));
+    env->acl_delegate_count = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *rec = data + 8 + (size_t)i * ACL_DELEGATE_REC;
+        char peer[ACL_DELEGATE_PEER];
+        char principal[ACL_PERSIST_NAME];
+        memcpy(peer, rec, ACL_DELEGATE_PEER);
+        peer[ACL_DELEGATE_PEER - 1] = '\0';
+        memcpy(principal, rec + ACL_DELEGATE_PEER, ACL_PERSIST_NAME);
+        principal[ACL_PERSIST_NAME - 1] = '\0';
+        if (peer[0] == '\0' || principal[0] == '\0') {
+            continue;
+        }
+        int slot = acl_delegate_alloc(env);
+        if (slot < 0) {
+            break;
+        }
+        strncpy(env->acl_delegates[slot].peer, peer, 63);
+        env->acl_delegates[slot].peer[63] = '\0';
+        strncpy(env->acl_delegates[slot].principal, principal,
+                DISLMDB_ACL_PRINCIPAL_MAX);
+        env->acl_delegates[slot].principal[DISLMDB_ACL_PRINCIPAL_MAX] = '\0';
+        env->acl_delegates[slot].used = true;
+        env->acl_delegate_count++;
     }
     pthread_mutex_unlock(&env->acl_mutex);
     return DISLMDB_SUCCESS;

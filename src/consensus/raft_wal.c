@@ -449,12 +449,20 @@ static int fsm_restore_all(uint64_t last_included, uint64_t last_included_term,
             mdb_txn_abort(txn);
             return -1;
         }
-        /* Clear existing keys. */
+        /*
+         * Clear existing user keys. For the unnamed/main DBI, never delete
+         * sub-database root entries — snapshots skip those (and __* internals),
+         * so deleting them here would permanently drop meta/ACL/WAL/bytecode.
+         */
         MDB_cursor *cur = NULL;
         if (mdb_cursor_open(txn, dbi, &cur) == 0) {
             MDB_val k, v;
             int crc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
             while (crc == 0) {
+                if (nlen == 0 && fsm_main_key_is_subdb(txn, &k)) {
+                    crc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+                    continue;
+                }
                 if (mdb_cursor_del(cur, 0) != 0) {
                     break;
                 }

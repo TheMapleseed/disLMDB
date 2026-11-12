@@ -113,6 +113,8 @@ enum {
 #define DISLMDB_ACL_MAX_ROLES 64
 /** @brief Max principal→role memberships */
 #define DISLMDB_ACL_MAX_ROLE_MEMBERS 256
+/** @brief Max peer→principal forward/SYN2 delegation entries */
+#define DISLMDB_ACL_MAX_DELEGATES 128
 
 #ifdef __cplusplus
 }

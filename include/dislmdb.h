@@ -130,7 +130,7 @@ typedef enum DISLMDB_TRANSPORT {
 typedef struct DISLMDB_network_config {
     DISLMDB_node_addr *nodes;      /**< Array of known node addresses */
     size_t node_count;             /**< Number of nodes in the array */
-    uint16_t local_port;           /**< Port for this node to listen on */
+    uint16_t local_port;           /**< Listen port; 0 = OS ephemeral bind */
     bool is_seed_node;             /**< Whether this node is a seed node */
     char seed_nodes[10][256];      /**< List of seed node addresses */
     size_t seed_node_count;        /**< Number of seed nodes */
@@ -304,6 +304,11 @@ typedef struct DISLMDB_env_config {
      * When true, put/get/admin paths require a principal with matching ACL
      * bits (@ref DISLMDB_ACL_*). Off by default (transport crypto unchanged).
      */
+    /**
+     * When true, ACL/RBAC is enforced. Persisted under meta when
+     * consensus.persist_state is set; cold open restores the flag. Legacy DBs
+     * with grant blobs but no flag force-enable ACL (fail closed).
+     */
     bool enable_acl;
 } DISLMDB_env_config;
 
@@ -380,7 +385,11 @@ int dislmdb_txn_begin(DISLMDB_env *env, DISLMDB_txn *parent,
 
 /**
  * @brief Commit a transaction
- * 
+ *
+ * Always consumes @p txn (success or failure). Do not call
+ * dislmdb_txn_abort on the same handle afterward; abort is a no-op if the
+ * handle was already consumed (magic cleared).
+ *
  * @param txn The transaction handle
  * @return 0 on success, non-zero on error
  */
@@ -388,7 +397,9 @@ int dislmdb_txn_commit(DISLMDB_txn *txn);
 
 /**
  * @brief Abort a transaction
- * 
+ *
+ * Safe to call after a failed dislmdb_txn_commit (no-op once consumed).
+ *
  * @param txn The transaction handle
  */
 void dislmdb_txn_abort(DISLMDB_txn *txn);
@@ -604,6 +615,18 @@ int dislmdb_acl_role_assign(DISLMDB_env *env, const char *principal,
 /** @brief Remove membership (requires ADMIN). */
 int dislmdb_acl_role_unassign(DISLMDB_env *env, const char *principal,
                               const char *role);
+
+/**
+ * @brief Allow authenticated peer @p peer_node_id to assert @p principal on
+ * FWD3 / SYN2 (requires ADMIN). Without a delegate, peers may only assert a
+ * principal equal to their own node id.
+ */
+int dislmdb_acl_grant_delegate(DISLMDB_env *env, const char *peer_node_id,
+                               const char *principal);
+
+/** @brief Revoke a peer→principal delegation (requires ADMIN). */
+int dislmdb_acl_revoke_delegate(DISLMDB_env *env, const char *peer_node_id,
+                                const char *principal);
 
 /**
  * @brief Effective permission mask for @p principal.

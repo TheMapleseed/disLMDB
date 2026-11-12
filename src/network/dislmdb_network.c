@@ -886,6 +886,32 @@ static int outbox_enqueue_locked(network_context *ctx, int idx,
 static bool outbox_drain(network_context *ctx, int idx, uint32_t max_frames);
 
 /**
+ * Pin connection slot node_id to first non-empty sender_id, then reject spoofs.
+ * Caller must hold ctx->lock. Empty sender_id is allowed (no pin change).
+ */
+static bool conn_accept_sender(network_context *ctx, int idx, const char *sender_id)
+{
+    if (!ctx || idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use) {
+        return false;
+    }
+    if (!sender_id || sender_id[0] == '\0') {
+        return true;
+    }
+    char *cid = ctx->connections[idx].info.node_id;
+    size_t cap = sizeof(ctx->connections[idx].info.node_id);
+    if (cid[0] == '\0' || strncmp(cid, "seed-", 5) == 0) {
+        strncpy(cid, sender_id, cap - 1);
+        cid[cap - 1] = '\0';
+        return true;
+    }
+    if (strncmp(cid, sender_id, 63) != 0) {
+        ctx->stats.total_errors++;
+        return false;
+    }
+    return true;
+}
+
+/**
  * Fair multi-peer drain on the net thread: round-robin one frame per peer
  * per pass (no worker-join). Caps total frames so poll/RX stays responsive.
  * Prior async join-parallelism starved RX and flaked FORWARD RPC.
@@ -1100,14 +1126,27 @@ static bool demote_tcp_to_udp_locked(network_context *ctx, int idx)
     return false;
 }
 
+static void fire_conn_callback(network_context *ctx, int idx,
+                               DISLMDB_CONNECTION_STATE old_st,
+                               DISLMDB_CONNECTION_STATE new_st)
+{
+    if (!ctx || !ctx->env || old_st == new_st || !ctx->env->conn_callback) {
+        return;
+    }
+    char nid[64];
+    strncpy(nid, ctx->connections[idx].info.node_id, sizeof(nid) - 1);
+    nid[sizeof(nid) - 1] = '\0';
+    ctx->env->conn_callback(nid, old_st, new_st, ctx->env->conn_callback_data);
+}
+
 static void close_conn(network_context *ctx, int idx)
 {
     if (idx < 0 || idx >= ctx->conn_cap || !ctx->connections[idx].in_use) {
         return;
     }
     ctx->connections[idx].hs_inflight = false;
-    bool was_connected =
-        (ctx->connections[idx].info.state == DISLMDB_CONNECTION_CONNECTED);
+    DISLMDB_CONNECTION_STATE old_st = ctx->connections[idx].info.state;
+    bool was_connected = (old_st == DISLMDB_CONNECTION_CONNECTED);
     if (demote_tcp_to_udp_locked(ctx, idx)) {
         /* BOTH: UDP signalling stays up; TCP will re-dial on a backoff. */
         return;
@@ -1122,6 +1161,7 @@ static void close_conn(network_context *ctx, int idx)
         } else {
             ctx->stats.active_connections = recount_active_connections_locked(ctx);
         }
+        fire_conn_callback(ctx, idx, old_st, DISLMDB_CONNECTION_CLOSED);
         return;
     }
     outbox_clear(&ctx->connections[idx]);
@@ -1132,6 +1172,7 @@ static void close_conn(network_context *ctx, int idx)
     } else {
         ctx->stats.active_connections = recount_active_connections_locked(ctx);
     }
+    fire_conn_callback(ctx, idx, old_st, DISLMDB_CONNECTION_CLOSED);
 }
 
 /** Another live TCP slot already reaches this peer (by id and/or host:port). */
@@ -2171,6 +2212,13 @@ int dislmdb_network_set_auth_key(DISLMDB_env *env, const uint8_t key[32])
     pthread_mutex_lock(&ctx->lock);
     memcpy(ctx->auth_key, key, 32);
     ctx->auth_enabled = true;
+    /* Keep AEAD gate consistent with config once a live key is installed. */
+    if (env->config.network.enable_payload_encryption ||
+        env->config.network.enable_tls) {
+        ctx->encrypt_payloads = true;
+    }
+    env->config.network.has_cluster_key = true;
+    memcpy(env->config.network.cluster_key, key, 32);
     pthread_mutex_unlock(&ctx->lock);
     return DISLMDB_SUCCESS;
 }
@@ -2961,16 +3009,19 @@ static void *network_thread(void *arg)
                                 ctx->stats.dqgm_packets_rx++;
                             }
                         }
-                        if (idx >= 0 && msg.header.sender_id[0] != '\0') {
-                            char *nid = ctx->connections[idx].info.node_id;
-                            if (nid[0] == '\0' || strncmp(nid, "seed-", 5) == 0) {
-                                strncpy(nid, msg.header.sender_id, 63);
+                        bool udp_sender_ok = true;
+                        if (idx >= 0) {
+                            udp_sender_ok =
+                                conn_accept_sender(ctx, idx, msg.header.sender_id);
+                            if (udp_sender_ok) {
+                                ctx->connections[idx].info.last_activity_time =
+                                    dislmdb_get_time_ms();
+                                ctx->connections[idx].info.messages_received++;
                             }
-                            ctx->connections[idx].info.last_activity_time = dislmdb_get_time_ms();
-                            ctx->connections[idx].info.messages_received++;
                         }
                         pthread_mutex_unlock(&ctx->lock);
-                        if (cid_ok && msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
+                        if (cid_ok && udp_sender_ok &&
+                            msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
                             dispatch_message(ctx, &msg);
                         }
                     }
@@ -3063,19 +3114,16 @@ static void *network_thread(void *arg)
             }
 
             pthread_mutex_lock(&ctx->lock);
-            if (msg.header.sender_id[0] != '\0') {
-                char *cid = ctx->connections[i].info.node_id;
-                if (cid[0] == '\0' || strncmp(cid, "seed-", 5) == 0) {
-                    strncpy(cid, msg.header.sender_id, sizeof(ctx->connections[i].info.node_id) - 1);
-                    cid[sizeof(ctx->connections[i].info.node_id) - 1] = '\0';
-                }
-            }
+            bool sender_ok =
+                conn_accept_sender(ctx, i, msg.header.sender_id);
             ctx->connections[i].info.last_activity_time = dislmdb_get_time_ms();
-            ctx->connections[i].info.messages_received++;
+            if (sender_ok) {
+                ctx->connections[i].info.messages_received++;
+            }
             pthread_mutex_unlock(&ctx->lock);
 
             /* Heartbeats only refresh activity; no consensus dispatch */
-            if (msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
+            if (sender_ok && msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
                 dispatch_message(ctx, &msg);
             }
             free(msg.payload);
@@ -3106,17 +3154,14 @@ static void *network_thread(void *arg)
                     break;
                 }
                 pthread_mutex_lock(&ctx->lock);
-                if (msg.header.sender_id[0] != '\0') {
-                    char *cid = ctx->connections[i].info.node_id;
-                    if (cid[0] == '\0' || strncmp(cid, "seed-", 5) == 0) {
-                        strncpy(cid, msg.header.sender_id,
-                                sizeof(ctx->connections[i].info.node_id) - 1);
-                    }
-                }
+                bool drain_ok =
+                    conn_accept_sender(ctx, i, msg.header.sender_id);
                 ctx->connections[i].info.last_activity_time = dislmdb_get_time_ms();
-                ctx->connections[i].info.messages_received++;
+                if (drain_ok) {
+                    ctx->connections[i].info.messages_received++;
+                }
                 pthread_mutex_unlock(&ctx->lock);
-                if (msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
+                if (drain_ok && msg.header.type != DISLMDB_MESSAGE_HEARTBEAT) {
                     dispatch_message(ctx, &msg);
                 }
                 free(msg.payload);
@@ -3178,9 +3223,13 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
     {
         uint8_t dig[32];
         char seed[96];
-        snprintf(seed, sizeof(seed), "%s:%u",
-                 env->local_node_id,
-                 (unsigned)(config->local_port ? config->local_port : DISLMDB_DEFAULT_PORT));
+        if (config->local_port) {
+            snprintf(seed, sizeof(seed), "%s:%u", env->local_node_id,
+                     (unsigned)config->local_port);
+        } else {
+            /* local_port 0 → ephemeral bind; cid from node id alone. */
+            snprintf(seed, sizeof(seed), "%s:ephemeral", env->local_node_id);
+        }
         if (dislmdb_crypto_sha256(seed, strnlen(seed, sizeof(seed)), dig) == 0) {
             ctx->dgram_cid = dislmdb_read_u64(dig);
         } else {
@@ -3291,7 +3340,9 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
         return DISLMDB_ERR_THREAD_ERROR;
     }
 
-    uint16_t port = config->local_port ? config->local_port : DISLMDB_DEFAULT_PORT;
+    /* 0 = OS-assigned ephemeral port (bindings / solo tests). Non-zero keeps
+     * the historical default when callers leave config at DISLMDB_DEFAULT_PORT. */
+    uint16_t port = config->local_port;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -3402,8 +3453,8 @@ int dislmdb_network_init(DISLMDB_env *env, const DISLMDB_network_config *config)
 
     dislmdb_log(env, DISLMDB_LOG_INFO, "NET",
                 "Network listening on port %u transport=%d mtls=%s",
-                (unsigned)(config->local_port ? config->local_port : DISLMDB_DEFAULT_PORT),
-                (int)ctx->transport, ctx->mtls_enabled ? "on" : "off");
+                (unsigned)port, (int)ctx->transport,
+                ctx->mtls_enabled ? "on" : "off");
     return DISLMDB_SUCCESS;
 }
 
@@ -4162,41 +4213,3 @@ int dislmdb_network_free_message(DISLMDB_network_message *message)
     return DISLMDB_SUCCESS;
 }
 
-int dislmdb_network_send_consensus_message(DISLMDB_env *env,
-                                           const DISLMDB_pbft_message *message,
-                                           const char *node_id,
-                                           uint32_t timeout_ms)
-{
-    if (!env || !message || !node_id) {
-        return DISLMDB_ERR_INVALID_PARAMETER;
-    }
-    DISLMDB_network_message nm;
-    int rc = dislmdb_network_create_message(&nm, message->type,
-                                            message->data, message->data_size, node_id);
-    if (rc != DISLMDB_SUCCESS) {
-        return rc;
-    }
-    strncpy(nm.header.sender_id, message->node_id, sizeof(nm.header.sender_id) - 1);
-    rc = dislmdb_network_send(env, &nm, node_id, timeout_ms);
-    dislmdb_network_free_message(&nm);
-    return rc;
-}
-
-int dislmdb_network_broadcast_consensus_message(DISLMDB_env *env,
-                                                const DISLMDB_pbft_message *message,
-                                                uint32_t timeout_ms)
-{
-    if (!env || !message) {
-        return DISLMDB_ERR_INVALID_PARAMETER;
-    }
-    DISLMDB_network_message nm;
-    int rc = dislmdb_network_create_message(&nm, message->type,
-                                            message->data, message->data_size, NULL);
-    if (rc != DISLMDB_SUCCESS) {
-        return rc;
-    }
-    strncpy(nm.header.sender_id, message->node_id, sizeof(nm.header.sender_id) - 1);
-    rc = dislmdb_network_broadcast(env, &nm, timeout_ms);
-    dislmdb_network_free_message(&nm);
-    return rc;
-}

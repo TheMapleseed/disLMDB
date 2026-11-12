@@ -102,6 +102,10 @@ int dislmdb_topo_map_publish(DISLMDB_env *env)
     if (!env || env->magic != DISLMDB_MAGIC) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
     uint8_t *buf = NULL;
     size_t len = 0;
     int rc = topo_encode(env, &buf, &len);
@@ -139,18 +143,78 @@ int dislmdb_topo_map_publish(DISLMDB_env *env)
     return rc;
 }
 
-#define FWD_REQ_MAGIC 0x46574457u /* 'FWDW' */
+#define FWD_REQ_MAGIC 0x33445746u /* 'FWD3' — origin+principal-bound forward RPC */
 #define FWD_REP_MAGIC 0x46574452u /* 'FWDR' */
 #define FWD_OP_PUT 1u
 #define FWD_OP_DEL 2u
 #define FWD_OP_GET 3u
+#define FWD_OP_TXN 4u /* multi-op atomic apply (index_put/del, …) */
 #define FWD_MAX_GET_BYTES (4u * 1024u * 1024u)
+#define FWD_MAX_PUT_BYTES FWD_MAX_GET_BYTES
+#define FWD_MAX_TXN_OPS 16u
 
-static int forward_apply_local(DISLMDB_env *env, uint32_t op, const char *dbname,
-                               const uint8_t *key, uint32_t klen,
-                               const uint8_t *val, uint32_t vlen)
+/**
+ * Run @p fn under the origin principal (TLS only). Restores prior TLS after.
+ * Empty/NULL principal clears TLS so ACL require fails when enable_acl.
+ */
+static int forward_with_principal(DISLMDB_env *env, const char *principal,
+                                  int (*fn)(DISLMDB_env *, void *), void *arg)
 {
-    /* Retry across brief leader changes / inbox scheduling. */
+    char saved[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+    memset(saved, 0, sizeof(saved));
+    const char *cur = dislmdb_acl_current_principal(env);
+    if (cur && cur[0] != '\0') {
+        strncpy(saved, cur, DISLMDB_ACL_PRINCIPAL_MAX);
+    }
+    int prc = dislmdb_acl_set_thread_principal(
+        env, (principal && principal[0] != '\0') ? principal : NULL);
+    if (prc != DISLMDB_SUCCESS) {
+        return prc;
+    }
+    int rc = fn(env, arg);
+    (void)dislmdb_acl_set_thread_principal(
+        env, saved[0] != '\0' ? saved : NULL);
+    return rc;
+}
+
+typedef struct {
+    uint32_t op;
+    const char *dbname;
+    const uint8_t *key;
+    uint32_t klen;
+    const uint8_t *val;
+    uint32_t vlen;
+} forward_apply_args;
+
+static int forward_apply_one(DISLMDB_txn *txn, uint32_t op, const char *dbname,
+                             const uint8_t *key, uint32_t klen,
+                             const uint8_t *val, uint32_t vlen)
+{
+    if (dislmdb_dbname_is_reserved(dbname)) {
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
+    MDB_dbi dbi;
+    int rc = dislmdb_dbi_open(txn, dbname, MDB_CREATE, &dbi);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
+    MDB_val k = {.mv_size = klen, .mv_data = (void *)key};
+    if (op == FWD_OP_PUT) {
+        MDB_val v = {.mv_size = vlen, .mv_data = (void *)val};
+        return dislmdb_put(txn, dbi, &k, &v, 0);
+    }
+    rc = dislmdb_del(txn, dbi, &k, NULL);
+    if (rc == MDB_NOTFOUND) {
+        return DISLMDB_SUCCESS;
+    }
+    return rc;
+}
+
+static int forward_apply_local_body(DISLMDB_env *env, void *arg)
+{
+    forward_apply_args *a = arg;
+    /* Retry across brief leader changes / inbox scheduling.
+     * dislmdb_txn_commit always consumes the handle. */
     int last = DISLMDB_ERR_CONSENSUS_FAILED;
     for (int attempt = 0; attempt < 8; attempt++) {
         DISLMDB_txn *txn = NULL;
@@ -160,22 +224,8 @@ static int forward_apply_local(DISLMDB_env *env, uint32_t op, const char *dbname
             usleep(20 * 1000);
             continue;
         }
-        MDB_dbi dbi;
-        rc = dislmdb_dbi_open(txn, dbname, MDB_CREATE, &dbi);
-        if (rc != DISLMDB_SUCCESS) {
-            dislmdb_txn_abort(txn);
-            return rc;
-        }
-        MDB_val k = {.mv_size = klen, .mv_data = (void *)key};
-        if (op == FWD_OP_PUT) {
-            MDB_val v = {.mv_size = vlen, .mv_data = (void *)val};
-            rc = dislmdb_put(txn, dbi, &k, &v, 0);
-        } else {
-            rc = dislmdb_del(txn, dbi, &k, NULL);
-            if (rc == MDB_NOTFOUND) {
-                rc = DISLMDB_SUCCESS; /* idempotent delete */
-            }
-        }
+        rc = forward_apply_one(txn, a->op, a->dbname, a->key, a->klen, a->val,
+                               a->vlen);
         if (rc != DISLMDB_SUCCESS) {
             dislmdb_txn_abort(txn);
             return rc;
@@ -194,23 +244,137 @@ static int forward_apply_local(DISLMDB_env *env, uint32_t op, const char *dbname
     return last;
 }
 
-/** Local readonly get for FWD_OP_GET. Caller frees *@p out on success. */
-static int forward_get_local(DISLMDB_env *env, const char *dbname,
-                             const uint8_t *key, uint32_t klen,
-                             uint8_t **out, size_t *out_len)
+typedef struct {
+    const uint8_t *blob;
+    uint32_t blob_len;
+} forward_txn_args;
+
+static int forward_txn_local_body(DISLMDB_env *env, void *arg)
 {
+    forward_txn_args *a = arg;
+    if (a->blob_len < 4) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    uint32_t count = dislmdb_read_u32(a->blob);
+    if (count == 0 || count > FWD_MAX_TXN_OPS) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    size_t o = 4;
+    int last = DISLMDB_ERR_CONSENSUS_FAILED;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        DISLMDB_txn *txn = NULL;
+        int rc = dislmdb_txn_begin(env, NULL, 0, &txn);
+        if (rc != DISLMDB_SUCCESS) {
+            last = rc;
+            usleep(20 * 1000);
+            continue;
+        }
+        size_t pos = o;
+        for (uint32_t i = 0; i < count; i++) {
+            if (pos + 16 > a->blob_len) {
+                dislmdb_txn_abort(txn);
+                return DISLMDB_ERR_MESSAGE_VALIDATION;
+            }
+            uint32_t sop = dislmdb_read_u32(a->blob + pos); pos += 4;
+            uint32_t nlen = dislmdb_read_u32(a->blob + pos); pos += 4;
+            uint32_t klen = dislmdb_read_u32(a->blob + pos); pos += 4;
+            uint32_t vlen = dislmdb_read_u32(a->blob + pos); pos += 4;
+            if (sop != FWD_OP_PUT && sop != FWD_OP_DEL) {
+                dislmdb_txn_abort(txn);
+                return DISLMDB_ERR_INVALID_PARAMETER;
+            }
+            if (nlen >= 64 ||
+                pos + (size_t)nlen + (size_t)klen + (size_t)vlen > a->blob_len ||
+                (sop == FWD_OP_DEL && vlen != 0) ||
+                (sop == FWD_OP_PUT && vlen > FWD_MAX_PUT_BYTES)) {
+                dislmdb_txn_abort(txn);
+                return DISLMDB_ERR_MESSAGE_VALIDATION;
+            }
+            char dbname[64];
+            memset(dbname, 0, sizeof(dbname));
+            if (nlen) {
+                memcpy(dbname, a->blob + pos, nlen);
+            }
+            pos += nlen;
+            const uint8_t *key = a->blob + pos;
+            pos += klen;
+            const uint8_t *val = a->blob + pos;
+            pos += vlen;
+            rc = forward_apply_one(txn, sop, nlen ? dbname : NULL, key, klen, val,
+                                   vlen);
+            if (rc != DISLMDB_SUCCESS) {
+                dislmdb_txn_abort(txn);
+                return rc;
+            }
+        }
+        rc = dislmdb_txn_commit(txn);
+        if (rc == DISLMDB_SUCCESS) {
+            return DISLMDB_SUCCESS;
+        }
+        last = rc;
+        if (rc != DISLMDB_ERR_NO_LEADER && rc != DISLMDB_ERR_CONSENSUS_TIMEOUT &&
+            rc != DISLMDB_ERR_LEADER_CHANGE && rc != DISLMDB_ERR_CONSENSUS_FAILED) {
+            return rc;
+        }
+        usleep(50 * 1000);
+    }
+    return last;
+}
+
+static int forward_txn_local(DISLMDB_env *env, const uint8_t *blob, uint32_t blob_len,
+                             const char *principal)
+{
+    forward_txn_args a = {.blob = blob, .blob_len = blob_len};
+    return forward_with_principal(env, principal, forward_txn_local_body, &a);
+}
+
+static int forward_apply_local(DISLMDB_env *env, uint32_t op, const char *dbname,
+                               const uint8_t *key, uint32_t klen,
+                               const uint8_t *val, uint32_t vlen,
+                               const char *principal)
+{
+    forward_apply_args a = {
+        .op = op,
+        .dbname = dbname,
+        .key = key,
+        .klen = klen,
+        .val = val,
+        .vlen = vlen,
+    };
+    return forward_with_principal(env, principal, forward_apply_local_body, &a);
+}
+
+typedef struct {
+    const char *dbname;
+    const uint8_t *key;
+    uint32_t klen;
+    uint8_t **out;
+    size_t *out_len;
+} forward_get_args;
+
+/** Local readonly get for FWD_OP_GET. Caller frees *@p out on success. */
+static int forward_get_local_body(DISLMDB_env *env, void *arg)
+{
+    forward_get_args *a = arg;
+    if (dislmdb_dbname_is_reserved(a->dbname)) {
+        return DISLMDB_ERR_NOT_AUTHORIZED;
+    }
+    int arc = dislmdb_acl_require_key(env, DISLMDB_ACL_READ, a->key, a->klen);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
     DISLMDB_txn *txn = NULL;
     int rc = dislmdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
     if (rc != DISLMDB_SUCCESS) {
         return rc;
     }
     MDB_dbi dbi;
-    rc = dislmdb_dbi_open(txn, dbname, 0, &dbi);
+    rc = dislmdb_dbi_open(txn, a->dbname, 0, &dbi);
     if (rc != DISLMDB_SUCCESS) {
         dislmdb_txn_abort(txn);
         return rc;
     }
-    MDB_val k = {.mv_size = klen, .mv_data = (void *)key};
+    MDB_val k = {.mv_size = a->klen, .mv_data = (void *)a->key};
     MDB_val v;
     rc = mdb_get(dislmdb_get_lmdb_txn(txn), dbi, &k, &v);
     if (rc != 0) {
@@ -229,10 +393,25 @@ static int forward_get_local(DISLMDB_env *env, const char *dbname,
     if (v.mv_size) {
         memcpy(copy, v.mv_data, v.mv_size);
     }
-    *out = copy;
-    *out_len = v.mv_size;
+    *a->out = copy;
+    *a->out_len = v.mv_size;
     dislmdb_txn_abort(txn);
     return DISLMDB_SUCCESS;
+}
+
+static int forward_get_local(DISLMDB_env *env, const char *dbname,
+                             const uint8_t *key, uint32_t klen,
+                             uint8_t **out, size_t *out_len,
+                             const char *principal)
+{
+    forward_get_args a = {
+        .dbname = dbname,
+        .key = key,
+        .klen = klen,
+        .out = out,
+        .out_len = out_len,
+    };
+    return forward_with_principal(env, principal, forward_get_local_body, &a);
 }
 
 static int forward_send_reply_ex(DISLMDB_env *env, const char *to, uint64_t corr,
@@ -278,33 +457,85 @@ typedef struct {
     uint32_t op;
     char dbname[64];
     bool has_dbname;
+    char principal[DISLMDB_ACL_PRINCIPAL_MAX + 1];
     uint8_t *key;
     uint32_t klen;
     uint8_t *val;
     uint32_t vlen;
 } forward_job;
 
+static int forward_txn_keys_writable(DISLMDB_env *env, const uint8_t *blob,
+                                     uint32_t blob_len)
+{
+    if (blob_len < 4) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    uint32_t count = dislmdb_read_u32(blob);
+    if (count == 0 || count > FWD_MAX_TXN_OPS) {
+        return DISLMDB_ERR_MESSAGE_VALIDATION;
+    }
+    size_t pos = 4;
+    for (uint32_t i = 0; i < count; i++) {
+        if (pos + 16 > blob_len) {
+            return DISLMDB_ERR_MESSAGE_VALIDATION;
+        }
+        uint32_t sop = dislmdb_read_u32(blob + pos); pos += 4;
+        uint32_t nlen = dislmdb_read_u32(blob + pos); pos += 4;
+        uint32_t klen = dislmdb_read_u32(blob + pos); pos += 4;
+        uint32_t vlen = dislmdb_read_u32(blob + pos); pos += 4;
+        (void)sop;
+        if (nlen >= 64 ||
+            pos + (size_t)nlen + (size_t)klen + (size_t)vlen > blob_len) {
+            return DISLMDB_ERR_MESSAGE_VALIDATION;
+        }
+        pos += nlen;
+        int wrc = dislmdb_topo_key_writable(env, blob + pos, klen);
+        if (wrc != DISLMDB_SUCCESS) {
+            return wrc;
+        }
+        pos += (size_t)klen + (size_t)vlen;
+    }
+    return DISLMDB_SUCCESS;
+}
+
 static void *forward_job_main(void *arg)
 {
     forward_job *job = arg;
     const char *dbname = job->has_dbname ? job->dbname : NULL;
-    int wrc = dislmdb_topo_key_writable(job->env, job->key, job->klen);
-    if (wrc != DISLMDB_SUCCESS) {
-        (void)forward_send_reply(job->env, job->reply_to, job->corr, wrc);
-        free(job->key);
-        free(job->val);
-        free(job);
-        return NULL;
+    const char *principal =
+        job->principal[0] != '\0' ? job->principal : NULL;
+    if (job->op == FWD_OP_TXN) {
+        int wrc = forward_txn_keys_writable(job->env, job->val, job->vlen);
+        if (wrc != DISLMDB_SUCCESS) {
+            (void)forward_send_reply(job->env, job->reply_to, job->corr, wrc);
+            free(job->key);
+            free(job->val);
+            free(job);
+            return NULL;
+        }
+    } else {
+        int wrc = dislmdb_topo_key_writable(job->env, job->key, job->klen);
+        if (wrc != DISLMDB_SUCCESS) {
+            (void)forward_send_reply(job->env, job->reply_to, job->corr, wrc);
+            free(job->key);
+            free(job->val);
+            free(job);
+            return NULL;
+        }
     }
     if (job->op == FWD_OP_GET) {
         uint8_t *got = NULL;
         size_t glen = 0;
-        int status = forward_get_local(job->env, dbname, job->key, job->klen, &got, &glen);
+        int status = forward_get_local(job->env, dbname, job->key, job->klen, &got,
+                                       &glen, principal);
         (void)forward_send_reply_ex(job->env, job->reply_to, job->corr, status, got, glen);
         free(got);
+    } else if (job->op == FWD_OP_TXN) {
+        int status = forward_txn_local(job->env, job->val, job->vlen, principal);
+        (void)forward_send_reply(job->env, job->reply_to, job->corr, status);
     } else {
         int status = forward_apply_local(job->env, job->op, dbname, job->key, job->klen,
-                                         job->val, job->vlen);
+                                         job->val, job->vlen, principal);
         (void)forward_send_reply(job->env, job->reply_to, job->corr, status);
     }
     free(job->key);
@@ -349,13 +580,17 @@ bool dislmdb_topo_handle_forward_message(DISLMDB_env *env,
                 env->forward_waiters[i].reply_val = NULL;
                 env->forward_waiters[i].reply_vlen = 0;
                 if (status == DISLMDB_SUCCESS && vlen > 0 && vptr) {
-                    uint8_t *copy = malloc(vlen);
-                    if (copy) {
-                        memcpy(copy, vptr, vlen);
-                        env->forward_waiters[i].reply_val = copy;
-                        env->forward_waiters[i].reply_vlen = vlen;
+                    if (vlen > FWD_MAX_GET_BYTES) {
+                        status = DISLMDB_ERR_BUFFER_OVERFLOW;
                     } else {
-                        status = DISLMDB_ERR_MEMORY_ERROR;
+                        uint8_t *copy = malloc(vlen);
+                        if (copy) {
+                            memcpy(copy, vptr, vlen);
+                            env->forward_waiters[i].reply_val = copy;
+                            env->forward_waiters[i].reply_vlen = vlen;
+                        } else {
+                            status = DISLMDB_ERR_MEMORY_ERROR;
+                        }
                     }
                 }
                 env->forward_waiters[i].status = status;
@@ -370,7 +605,8 @@ bool dislmdb_topo_handle_forward_message(DISLMDB_env *env,
     if (message->header.type != DISLMDB_MESSAGE_FORWARD) {
         return false;
     }
-    if (message->header.payload_size < 4 + 8 + 4 + 4 + 4 + 4) {
+    /* magic + corr + op + olen + plen + nlen + klen + vlen */
+    if (message->header.payload_size < 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4) {
         return true;
     }
     const uint8_t *p = message->payload;
@@ -381,14 +617,35 @@ bool dislmdb_topo_handle_forward_message(DISLMDB_env *env,
     o += 4;
     uint64_t corr = dislmdb_read_u64(p + o); o += 8;
     uint32_t op = dislmdb_read_u32(p + o); o += 4;
+    uint32_t olen = dislmdb_read_u32(p + o); o += 4;
+    uint32_t plen = dislmdb_read_u32(p + o); o += 4;
     uint32_t nlen = dislmdb_read_u32(p + o); o += 4;
     uint32_t klen = dislmdb_read_u32(p + o); o += 4;
     uint32_t vlen = dislmdb_read_u32(p + o); o += 4;
-    if (o + nlen + klen + vlen > message->header.payload_size || nlen >= 64 ||
-        (op != FWD_OP_PUT && op != FWD_OP_DEL && op != FWD_OP_GET) ||
-        (op == FWD_OP_GET && vlen != 0)) {
+    if (olen >= 64 || plen > DISLMDB_ACL_PRINCIPAL_MAX || nlen >= 64 ||
+        o + (size_t)olen + (size_t)plen + (size_t)nlen + (size_t)klen +
+                (size_t)vlen >
+            message->header.payload_size ||
+        (op != FWD_OP_PUT && op != FWD_OP_DEL && op != FWD_OP_GET &&
+         op != FWD_OP_TXN) ||
+        (op == FWD_OP_GET && vlen != 0) ||
+        (op == FWD_OP_TXN && (klen != 0 || nlen != 0)) ||
+        ((op == FWD_OP_PUT || op == FWD_OP_TXN) && vlen > FWD_MAX_PUT_BYTES)) {
         (void)forward_send_reply(env, message->header.sender_id, corr,
                                  DISLMDB_ERR_INVALID_PARAMETER);
+        return true;
+    }
+    char origin[64];
+    memset(origin, 0, sizeof(origin));
+    if (olen > 0) {
+        memcpy(origin, p + o, olen);
+    }
+    o += olen;
+    /* Origin must match authenticated wire sender (HMAC covers header). */
+    if (message->header.sender_id[0] == '\0' ||
+        strncmp(origin, message->header.sender_id, 63) != 0) {
+        (void)forward_send_reply(env, message->header.sender_id, corr,
+                                 DISLMDB_ERR_NOT_AUTHORIZED);
         return true;
     }
     /* Apply on a worker — Raft commit must not block the network thread. */
@@ -402,12 +659,32 @@ bool dislmdb_topo_handle_forward_message(DISLMDB_env *env,
     strncpy(job->reply_to, message->header.sender_id, sizeof(job->reply_to) - 1);
     job->corr = corr;
     job->op = op;
+    if (plen > 0) {
+        memcpy(job->principal, p + o, plen);
+        job->principal[plen] = '\0';
+    }
+    o += plen;
+    {
+        int arc = dislmdb_acl_authorize_asserted_principal(
+            env, origin, job->principal[0] ? job->principal : NULL);
+        if (arc != DISLMDB_SUCCESS) {
+            free(job);
+            (void)forward_send_reply(env, message->header.sender_id, corr, arc);
+            return true;
+        }
+    }
     if (nlen > 0) {
         memcpy(job->dbname, p + o, nlen);
         job->dbname[nlen] = '\0';
         job->has_dbname = true;
     }
     o += nlen;
+    if (dislmdb_dbname_is_reserved(job->has_dbname ? job->dbname : NULL)) {
+        free(job);
+        (void)forward_send_reply(env, message->header.sender_id, corr,
+                                 DISLMDB_ERR_NOT_AUTHORIZED);
+        return true;
+    }
     job->key = malloc(klen ? klen : 1);
     if (!job->key) {
         free(job);
@@ -415,10 +692,12 @@ bool dislmdb_topo_handle_forward_message(DISLMDB_env *env,
                                  DISLMDB_ERR_MEMORY_ERROR);
         return true;
     }
-    memcpy(job->key, p + o, klen);
+    if (klen) {
+        memcpy(job->key, p + o, klen);
+    }
     job->klen = klen;
     o += klen;
-    if (op == FWD_OP_PUT) {
+    if (op == FWD_OP_PUT || op == FWD_OP_TXN) {
         job->val = malloc(vlen ? vlen : 1);
         if (!job->val) {
             free(job->key);
@@ -445,20 +724,37 @@ bool dislmdb_topo_handle_forward_message(DISLMDB_env *env,
     return true;
 }
 
-static int forward_rpc(DISLMDB_env *env, uint32_t op, const char *dbname,
-                       const void *key, size_t key_len, const void *data,
-                       size_t data_len, uint32_t timeout_ms,
-                       void **out_data, size_t *out_len)
+/**
+ * @p owner_override NULL → resolve from @p key. FWD_OP_TXN uses empty key and
+ * puts the txn blob in the value field (requires @p owner_override).
+ */
+static int forward_rpc_to(DISLMDB_env *env, const char *owner_override,
+                          uint32_t op, const char *dbname, const void *key,
+                          size_t key_len, const void *data, size_t data_len,
+                          uint32_t timeout_ms, void **out_data, size_t *out_len)
 {
-    if (!env || env->magic != DISLMDB_MAGIC || !key || key_len == 0 ||
-        key_len > UINT32_MAX || data_len > UINT32_MAX) {
+    bool is_txn = (op == FWD_OP_TXN);
+    if (!env || env->magic != DISLMDB_MAGIC || data_len > UINT32_MAX) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
-    if (op == FWD_OP_PUT && !data && data_len > 0) {
+    if (!is_txn && (!key || key_len == 0 || key_len > UINT32_MAX)) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (is_txn && (key_len != 0 || !data || data_len == 0 || !owner_override ||
+                   owner_override[0] == '\0')) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if ((op == FWD_OP_PUT || is_txn) && !data && data_len > 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if ((op == FWD_OP_PUT || is_txn) && data_len > FWD_MAX_PUT_BYTES) {
+        return DISLMDB_ERR_BUFFER_OVERFLOW;
     }
     if (op == FWD_OP_GET && (!out_data || !out_len)) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    if (dbname && dislmdb_dbname_is_reserved(dbname)) {
+        return DISLMDB_ERR_NOT_AUTHORIZED;
     }
     if (out_data) {
         *out_data = NULL;
@@ -467,16 +763,28 @@ static int forward_rpc(DISLMDB_env *env, uint32_t op, const char *dbname,
         *out_len = 0;
     }
     char owner[64] = {0};
-    int rc = dislmdb_topo_resolve_owner(env, key, key_len, owner);
-    if (rc != DISLMDB_SUCCESS) {
-        return rc;
+    int rc;
+    if (owner_override && owner_override[0] != '\0') {
+        strncpy(owner, owner_override, sizeof(owner) - 1);
+    } else {
+        rc = dislmdb_topo_resolve_owner(env, key, key_len, owner);
+        if (rc != DISLMDB_SUCCESS) {
+            return rc;
+        }
     }
     if (strncmp(owner, env->local_node_id, sizeof(owner)) == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    const char *who = dislmdb_acl_current_principal(env);
+    size_t plen = 0;
+    if (who && who[0] != '\0') {
+        plen = strnlen(who, DISLMDB_ACL_PRINCIPAL_MAX);
+    }
+    size_t olen = strnlen(env->local_node_id, 63);
     size_t nlen = dbname ? strnlen(dbname, 63) : 0;
-    size_t need = 4 + 8 + 4 + 4 + 4 + 4 + nlen + key_len +
-                  (op == FWD_OP_PUT ? data_len : 0);
+    size_t wire_vlen = (op == FWD_OP_PUT || is_txn) ? data_len : 0;
+    size_t need = 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + olen + plen + nlen + key_len +
+                  wire_vlen;
     uint8_t *buf = malloc(need);
     if (!buf) {
         return DISLMDB_ERR_MEMORY_ERROR;
@@ -508,18 +816,30 @@ static int forward_rpc(DISLMDB_env *env, uint32_t op, const char *dbname,
     dislmdb_write_u32(buf + o, FWD_REQ_MAGIC); o += 4;
     dislmdb_write_u64(buf + o, corr); o += 8;
     dislmdb_write_u32(buf + o, op); o += 4;
+    dislmdb_write_u32(buf + o, (uint32_t)olen); o += 4;
+    dislmdb_write_u32(buf + o, (uint32_t)plen); o += 4;
     dislmdb_write_u32(buf + o, (uint32_t)nlen); o += 4;
     dislmdb_write_u32(buf + o, (uint32_t)key_len); o += 4;
-    dislmdb_write_u32(buf + o, (uint32_t)(op == FWD_OP_PUT ? data_len : 0)); o += 4;
+    dislmdb_write_u32(buf + o, (uint32_t)wire_vlen); o += 4;
+    if (olen) {
+        memcpy(buf + o, env->local_node_id, olen);
+        o += olen;
+    }
+    if (plen) {
+        memcpy(buf + o, who, plen);
+        o += plen;
+    }
     if (nlen) {
         memcpy(buf + o, dbname, nlen);
         o += nlen;
     }
-    memcpy(buf + o, key, key_len);
-    o += key_len;
-    if (op == FWD_OP_PUT && data_len > 0) {
-        memcpy(buf + o, data, data_len);
-        o += data_len;
+    if (key_len && key) {
+        memcpy(buf + o, key, key_len);
+        o += key_len;
+    }
+    if (wire_vlen > 0 && data) {
+        memcpy(buf + o, data, wire_vlen);
+        o += wire_vlen;
     }
 
     DISLMDB_network_message nm;
@@ -578,6 +898,81 @@ static int forward_rpc(DISLMDB_env *env, uint32_t op, const char *dbname,
     return status;
 }
 
+static int forward_rpc(DISLMDB_env *env, uint32_t op, const char *dbname,
+                       const void *key, size_t key_len, const void *data,
+                       size_t data_len, uint32_t timeout_ms,
+                       void **out_data, size_t *out_len)
+{
+    return forward_rpc_to(env, NULL, op, dbname, key, key_len, data, data_len,
+                          timeout_ms, out_data, out_len);
+}
+
+int dislmdb_topo_forward_txn(DISLMDB_env *env, const DISLMDB_fwd_op *ops,
+                             size_t nop, uint32_t timeout_ms)
+{
+    if (!env || env->magic != DISLMDB_MAGIC || !ops || nop == 0 ||
+        nop > FWD_MAX_TXN_OPS) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    size_t blob_need = 4;
+    char owner0[64] = {0};
+    for (size_t i = 0; i < nop; i++) {
+        if ((ops[i].op != FWD_OP_PUT && ops[i].op != FWD_OP_DEL) || !ops[i].key ||
+            ops[i].key_len == 0 || ops[i].key_len > UINT32_MAX ||
+            ops[i].val_len > UINT32_MAX ||
+            (ops[i].op == FWD_OP_PUT && ops[i].val_len > FWD_MAX_PUT_BYTES) ||
+            (ops[i].op == FWD_OP_DEL && ops[i].val_len != 0) ||
+            (ops[i].dbname && dislmdb_dbname_is_reserved(ops[i].dbname))) {
+            return DISLMDB_ERR_INVALID_PARAMETER;
+        }
+        size_t nlen = ops[i].dbname ? strnlen(ops[i].dbname, 63) : 0;
+        blob_need += 16 + nlen + ops[i].key_len +
+                     (ops[i].op == FWD_OP_PUT ? ops[i].val_len : 0);
+        char owner[64] = {0};
+        int rc = dislmdb_topo_resolve_owner(env, ops[i].key, ops[i].key_len, owner);
+        if (rc != DISLMDB_SUCCESS) {
+            return rc;
+        }
+        if (i == 0) {
+            memcpy(owner0, owner, sizeof(owner0));
+        } else if (strncmp(owner0, owner, 63) != 0) {
+            return DISLMDB_ERR_OPERATION_REJECTED;
+        }
+    }
+    if (strncmp(owner0, env->local_node_id, 63) == 0) {
+        return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    uint8_t *blob = malloc(blob_need);
+    if (!blob) {
+        return DISLMDB_ERR_MEMORY_ERROR;
+    }
+    size_t bo = 0;
+    dislmdb_write_u32(blob + bo, (uint32_t)nop);
+    bo += 4;
+    for (size_t i = 0; i < nop; i++) {
+        size_t nlen = ops[i].dbname ? strnlen(ops[i].dbname, 63) : 0;
+        size_t vlen = (ops[i].op == FWD_OP_PUT) ? ops[i].val_len : 0;
+        dislmdb_write_u32(blob + bo, ops[i].op); bo += 4;
+        dislmdb_write_u32(blob + bo, (uint32_t)nlen); bo += 4;
+        dislmdb_write_u32(blob + bo, (uint32_t)ops[i].key_len); bo += 4;
+        dislmdb_write_u32(blob + bo, (uint32_t)vlen); bo += 4;
+        if (nlen) {
+            memcpy(blob + bo, ops[i].dbname, nlen);
+            bo += nlen;
+        }
+        memcpy(blob + bo, ops[i].key, ops[i].key_len);
+        bo += ops[i].key_len;
+        if (vlen) {
+            memcpy(blob + bo, ops[i].val, vlen);
+            bo += vlen;
+        }
+    }
+    int rc = forward_rpc_to(env, owner0, FWD_OP_TXN, NULL, NULL, 0, blob, bo,
+                            timeout_ms, NULL, NULL);
+    free(blob);
+    return rc;
+}
+
 int dislmdb_topo_forward_put(DISLMDB_env *env, const char *dbname, const void *key,
                              size_t key_len, const void *data, size_t data_len,
                              uint32_t timeout_ms)
@@ -612,10 +1007,11 @@ int dislmdb_topo_get(DISLMDB_env *env, const char *dbname, const void *key,
     *out_data = NULL;
     *out_len = 0;
 
+    const char *principal = dislmdb_acl_current_principal(env);
     int wrc = dislmdb_topo_key_writable(env, key, key_len);
     if (wrc == DISLMDB_SUCCESS || env->config.topology_mode == DISLMDB_TOPO_MIRROR) {
         return forward_get_local(env, dbname, (const uint8_t *)key, (uint32_t)key_len,
-                                 (uint8_t **)out_data, out_len);
+                                 (uint8_t **)out_data, out_len, principal);
     }
     if (wrc == DISLMDB_ERR_NODE_NOT_FOUND) {
         return wrc;
@@ -628,7 +1024,7 @@ int dislmdb_topo_get(DISLMDB_env *env, const char *dbname, const void *key,
     }
     if (strncmp(owner, env->local_node_id, sizeof(owner)) == 0) {
         return forward_get_local(env, dbname, (const uint8_t *)key, (uint32_t)key_len,
-                                 (uint8_t **)out_data, out_len);
+                                 (uint8_t **)out_data, out_len, principal);
     }
     return dislmdb_topo_forward_get(env, dbname, key, key_len, out_data, out_len,
                                     timeout_ms);

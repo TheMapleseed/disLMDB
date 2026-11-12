@@ -340,35 +340,6 @@ int dislmdb_network_create_message(DISLMDB_network_message *message,
  */
 int dislmdb_network_free_message(DISLMDB_network_message *message);
 
-/**
- * @brief Send a consensus message to a specific node
- * 
- * This is a convenience function that creates a network message
- * from a consensus message and sends it.
- * 
- * @param env The distributed environment handle
- * @param message The consensus message to send
- * @param node_id ID of the target node
- * @param timeout_ms Timeout in milliseconds
- * @return 0 on success, non-zero on error
- */
-int dislmdb_network_send_consensus_message(DISLMDB_env *env,
-                                          const DISLMDB_pbft_message *message,
-                                          const char *node_id,
-                                          uint32_t timeout_ms);
-
-/**
- * @brief Broadcast a consensus message to all connected nodes
- * 
- * @param env The distributed environment handle
- * @param message The consensus message to broadcast
- * @param timeout_ms Timeout in milliseconds
- * @return 0 on success, non-zero on error
- */
-int dislmdb_network_broadcast_consensus_message(DISLMDB_env *env,
-                                               const DISLMDB_pbft_message *message,
-                                               uint32_t timeout_ms);
-
 #ifdef __cplusplus
 }
 #endif

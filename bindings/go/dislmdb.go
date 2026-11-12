@@ -73,12 +73,14 @@ type Env struct {
 	path *C.char
 }
 
-// Open opens a SOLO environment at path (default config).
+// Open opens a SOLO environment at path (ephemeral local_port=0).
 func Open(path string) (*Env, error) {
 	return OpenWith(path, OpenOptions{})
 }
 
 // OpenWith opens with optional ACL / maxdbs overrides.
+// Always forces DISLMDB_CONSENSUS_SOLO and local_port=0 so concurrent tests
+// do not collide on the C default (PBFT + :9876).
 func OpenWith(path string, opts OpenOptions) (*Env, error) {
 	var raw *C.DISLMDB_env
 	if rc := C.dislmdb_env_create(&raw); rc != 0 {
@@ -96,6 +98,7 @@ func OpenWith(path string, opts OpenOptions) (*Env, error) {
 	} else {
 		cfg.maxdbs = 16
 	}
+	cfg.consensus.mechanism = C.DISLMDB_CONSENSUS_SOLO
 	cfg.network.local_port = 0
 	if opts.EnableACL {
 		cfg.enable_acl = true
@@ -403,7 +406,12 @@ func (e *Env) withWrite(db string, f func(*C.DISLMDB_txn, C.MDB_dbi) error) erro
 		C.dislmdb_txn_abort(txn)
 		return err
 	}
-	return errRC(C.dislmdb_txn_commit(txn))
+	// commit always consumes the handle; abort after failure is a safe no-op.
+	if rc := C.dislmdb_txn_commit(txn); rc != 0 {
+		C.dislmdb_txn_abort(txn)
+		return errRC(rc)
+	}
+	return nil
 }
 
 func (e *Env) withIndexWrite(primaryDB, indexDB string, f func(*C.DISLMDB_txn, C.MDB_dbi, C.MDB_dbi) error) error {
@@ -428,7 +436,11 @@ func (e *Env) withIndexWrite(primaryDB, indexDB string, f func(*C.DISLMDB_txn, C
 		C.dislmdb_txn_abort(txn)
 		return err
 	}
-	return errRC(C.dislmdb_txn_commit(txn))
+	if rc := C.dislmdb_txn_commit(txn); rc != 0 {
+		C.dislmdb_txn_abort(txn)
+		return errRC(rc)
+	}
+	return nil
 }
 
 func (e *Env) withIndexRead(primaryDB, indexDB string, f func(*C.DISLMDB_txn, C.MDB_dbi, C.MDB_dbi) error) error {

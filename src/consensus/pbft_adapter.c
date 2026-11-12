@@ -389,17 +389,31 @@ typedef struct {
     DISLMDB_env *env;
     uint8_t *data;
     size_t size;
+    char sender_id[64];
 } forwarded_propose_job;
 
 static void *forwarded_propose_thread(void *arg)
 {
     forwarded_propose_job *job = arg;
     if (job && job->env && job->env->consensus_context) {
-        ConsensusError err = consensus_core_propose(job->env->consensus_context,
-                                                   job->data, job->size);
-        if (err != CONSENSUS_OK) {
+        const uint8_t *oplog = NULL;
+        size_t olen = 0;
+        bool owned = false;
+        int urc = dislmdb_sync_unwrap_authorize(job->env, job->sender_id, job->data,
+                                               job->size, &oplog, &olen, &owned);
+        if (urc == DISLMDB_SUCCESS && oplog && olen > 0) {
+            ConsensusError err =
+                consensus_core_propose(job->env->consensus_context, oplog, olen);
+            if (err != CONSENSUS_OK) {
+                dislmdb_log(job->env, DISLMDB_LOG_WARNING, "PBFT",
+                            "Forwarded write propose failed err=%d", (int)err);
+            }
+        } else if (urc != DISLMDB_SUCCESS) {
             dislmdb_log(job->env, DISLMDB_LOG_WARNING, "PBFT",
-                        "Forwarded write propose failed err=%d", (int)err);
+                        "SYNC_REQUEST rejected err=%d", urc);
+        }
+        if (owned) {
+            free((void *)oplog);
         }
     }
     if (job) {
@@ -418,10 +432,17 @@ static int forward_oplog_to_primary(DISLMDB_env *env, const uint8_t *data, size_
         strncmp(primary, env->local_node_id, EPDFT_NODE_ID_LEN) == 0) {
         return DISLMDB_ERR_NO_LEADER;
     }
+    uint8_t *wrapped = NULL;
+    size_t wrapped_len = 0;
+    int rc = dislmdb_sync_wrap_oplog(env, data, size, &wrapped, &wrapped_len);
+    if (rc != DISLMDB_SUCCESS) {
+        return rc;
+    }
     uint64_t before = consensus_core_last_committed(core);
     DISLMDB_network_message nm;
-    int rc = dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_SYNC_REQUEST,
-                                            data, (uint32_t)size, primary);
+    rc = dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_SYNC_REQUEST, wrapped,
+                                        (uint32_t)wrapped_len, primary);
+    free(wrapped);
     if (rc != DISLMDB_SUCCESS) {
         return rc;
     }
@@ -592,6 +613,14 @@ void dislmdb_pbft_handle_hello(DISLMDB_env *env, const DISLMDB_network_message *
     if (strncmp(peer_id, env->local_node_id, 63) == 0) {
         return;
     }
+    /* Bind HELLO identity to authenticated wire sender (HMAC/mTLS peer). */
+    if (message->header.sender_id[0] != '\0' &&
+        strncmp(peer_id, message->header.sender_id, 63) != 0) {
+        dislmdb_log(env, DISLMDB_LOG_WARNING, "HELLO",
+                    "Reject peer_id=%s != sender_id=%s", peer_id,
+                    message->header.sender_id);
+        return;
+    }
 
     DISLMDB_node_addr addr;
     memset(&addr, 0, sizeof(addr));
@@ -758,6 +787,13 @@ void dislmdb_pbft_handle_leave(DISLMDB_env *env, const DISLMDB_network_message *
     if (strncmp(peer_id, env->local_node_id, 63) == 0) {
         return;
     }
+    if (message->header.sender_id[0] != '\0' &&
+        strncmp(peer_id, message->header.sender_id, 63) != 0) {
+        dislmdb_log(env, DISLMDB_LOG_WARNING, "LEAVE",
+                    "Reject peer_id=%s != sender_id=%s", peer_id,
+                    message->header.sender_id);
+        return;
+    }
 
     dislmdb_log(env, DISLMDB_LOG_INFO, "LEAVE", "Peer leaving id=%s", peer_id);
     (void)dislmdb_update_node_state(env, peer_id, DISLMDB_NODE_STATE_LEAVING);
@@ -815,6 +851,7 @@ void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *
             if (!job) {
                 return;
             }
+            memset(job, 0, sizeof(*job));
             job->env = env;
             job->size = message->header.payload_size;
             job->data = malloc(job->size ? job->size : 1);
@@ -823,6 +860,8 @@ void dislmdb_pbft_message_handler(const DISLMDB_network_message *message, void *
                 return;
             }
             memcpy(job->data, message->payload, job->size);
+            strncpy(job->sender_id, message->header.sender_id,
+                    sizeof(job->sender_id) - 1);
             pthread_t th;
             if (pthread_create(&th, NULL, forwarded_propose_thread, job) != 0) {
                 free(job->data);

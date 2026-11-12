@@ -27,6 +27,7 @@ typedef struct raft_inbox_item {
     DISLMDB_MESSAGE_TYPE type;
     uint8_t *payload;
     uint32_t payload_size;
+    char sender_id[64];
     struct raft_inbox_item *next;
 } raft_inbox_item;
 
@@ -57,7 +58,8 @@ static void raft_inbox_clear(raft_adapter_ctx *actx)
 }
 
 static int raft_inbox_push(raft_adapter_ctx *actx, DISLMDB_MESSAGE_TYPE type,
-                           const uint8_t *payload, uint32_t payload_size)
+                           const uint8_t *payload, uint32_t payload_size,
+                           const char *sender_id)
 {
     if (!payload || payload_size == 0) {
         return DISLMDB_ERR_INVALID_PARAMETER;
@@ -81,6 +83,9 @@ static int raft_inbox_push(raft_adapter_ctx *actx, DISLMDB_MESSAGE_TYPE type,
     memcpy(it->payload, payload, payload_size);
     it->payload_size = payload_size;
     it->type = type;
+    if (sender_id && sender_id[0] != '\0') {
+        strncpy(it->sender_id, sender_id, sizeof(it->sender_id) - 1);
+    }
     if (actx->inbox_tail) {
         actx->inbox_tail->next = it;
     } else {
@@ -116,8 +121,19 @@ static void *raft_inbox_main(void *arg)
 
         if (it->type == DISLMDB_MESSAGE_SYNC_REQUEST) {
             if (actx->started && raft_is_leader(actx->node)) {
-                (void)raft_propose(actx->node, it->payload, it->payload_size,
-                                   env->config.consensus.timeout_ms);
+                const uint8_t *oplog = NULL;
+                size_t olen = 0;
+                bool owned = false;
+                int urc = dislmdb_sync_unwrap_authorize(env, it->sender_id,
+                                                       it->payload, it->payload_size,
+                                                       &oplog, &olen, &owned);
+                if (urc == DISLMDB_SUCCESS && oplog && olen > 0) {
+                    (void)raft_propose(actx->node, oplog, olen,
+                                       env->config.consensus.timeout_ms);
+                }
+                if (owned) {
+                    free((void *)oplog);
+                }
             }
         } else if (it->type == DISLMDB_MESSAGE_ELECTION) {
             RaftMessage msg;
@@ -450,17 +466,24 @@ static int raft_propose_owned(DISLMDB_env *env, uint8_t *data, size_t size)
             free(data);
             return DISLMDB_ERR_NO_LEADER;
         }
+        uint8_t *wrapped = NULL;
+        size_t wrapped_len = 0;
+        int wrc = dislmdb_sync_wrap_oplog(env, data, size, &wrapped, &wrapped_len);
+        free(data);
+        data = NULL;
+        if (wrc != DISLMDB_SUCCESS) {
+            return wrc;
+        }
         DISLMDB_network_message nm;
-        int rc = dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_SYNC_REQUEST, data,
-                                                (uint32_t)size, leader);
+        int rc = dislmdb_network_create_message(&nm, DISLMDB_MESSAGE_SYNC_REQUEST, wrapped,
+                                                (uint32_t)wrapped_len, leader);
+        free(wrapped);
         if (rc != DISLMDB_SUCCESS) {
-            free(data);
             return rc;
         }
         strncpy(nm.header.sender_id, env->local_node_id, sizeof(nm.header.sender_id) - 1);
         rc = dislmdb_network_send(env, &nm, leader, env->config.consensus.timeout_ms);
         dislmdb_network_free_message(&nm);
-        free(data);
         if (rc != DISLMDB_SUCCESS) {
             return rc;
         }
@@ -808,7 +831,8 @@ void dislmdb_raft_message_handler(const DISLMDB_network_message *message, void *
     }
     if (message->header.type == DISLMDB_MESSAGE_LEAVE) {
         dislmdb_pbft_handle_leave(env, message);
-        /* Durably shrink voter set when we are leader; else local drop. */
+        /* Durably shrink voter set when we are leader; else local drop.
+         * peer_id already bound to sender inside handle_leave. */
         if (message->payload && message->header.payload_size >= 5) {
             const uint8_t *p = message->payload;
             if (dislmdb_read_u32(p) == DISLMDB_LEAV_MAGIC) {
@@ -818,7 +842,10 @@ void dislmdb_raft_message_handler(const DISLMDB_network_message *message, void *
                     char peer_id[RAFT_NODE_ID_LEN];
                     memset(peer_id, 0, sizeof(peer_id));
                     memcpy(peer_id, p + 5, id_len);
-                    (void)dislmdb_raft_remove_peer(env, peer_id);
+                    if (message->header.sender_id[0] == '\0' ||
+                        strncmp(peer_id, message->header.sender_id, 63) == 0) {
+                        (void)dislmdb_raft_remove_peer(env, peer_id);
+                    }
                 }
             }
         }
@@ -827,7 +854,7 @@ void dislmdb_raft_message_handler(const DISLMDB_network_message *message, void *
 
     if (message->header.type == DISLMDB_MESSAGE_SYNC_REQUEST && message->payload) {
         (void)raft_inbox_push(actx, DISLMDB_MESSAGE_SYNC_REQUEST, message->payload,
-                              message->header.payload_size);
+                              message->header.payload_size, message->header.sender_id);
         return;
     }
     if (message->header.type != DISLMDB_MESSAGE_ELECTION || !message->payload) {
@@ -835,5 +862,5 @@ void dislmdb_raft_message_handler(const DISLMDB_network_message *message, void *
     }
     /* Phase G: deserialize + handle on the Raft inbox worker. */
     (void)raft_inbox_push(actx, DISLMDB_MESSAGE_ELECTION, message->payload,
-                          message->header.payload_size);
+                          message->header.payload_size, message->header.sender_id);
 }

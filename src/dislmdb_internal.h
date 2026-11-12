@@ -170,6 +170,12 @@ struct DISLMDB_env {
     /* Access-control (independent of transport crypto) */
     pthread_mutex_t acl_mutex;
     bool acl_mutex_ready;
+    /**
+     * Once true, empty grant table no longer allows unauthenticated bootstrap
+     * (survives full revoke). Set on first grant / non-empty persist load.
+     */
+    bool acl_sealed;
+    /** Process-wide fallback when TLS principal unset (legacy single-thread). */
     char acl_principal[DISLMDB_ACL_PRINCIPAL_MAX + 1];
     struct {
         char name[DISLMDB_ACL_PRINCIPAL_MAX + 1];
@@ -197,7 +203,26 @@ struct DISLMDB_env {
         bool used;
     } acl_role_members[DISLMDB_ACL_MAX_ROLE_MEMBERS];
     uint32_t acl_role_member_count;
+    /**
+     * Peer node_id may assert @p principal on FWD/SYN2 only when listed here
+     * (or when principal equals the authenticated origin).
+     */
+    struct {
+        char peer[DISLMDB_MAX_NODE_ID_SIZE];
+        char principal[DISLMDB_ACL_PRINCIPAL_MAX + 1];
+        bool used;
+    } acl_delegates[DISLMDB_ACL_MAX_DELEGATES];
+    uint32_t acl_delegate_count;
 };
+
+/** Thread-local (preferred) or env fallback principal string; never NULL. */
+const char *dislmdb_acl_current_principal(DISLMDB_env *env);
+
+/**
+ * Set TLS principal for this thread only (does not change env fallback).
+ * @p principal NULL/"" clears TLS so fallback applies.
+ */
+int dislmdb_acl_set_thread_principal(DISLMDB_env *env, const char *principal);
 
 /** Require @p need bits when enable_acl; no-op success when ACL off. */
 int dislmdb_acl_require(DISLMDB_env *env, unsigned int need);
@@ -208,6 +233,30 @@ int dislmdb_acl_require(DISLMDB_env *env, unsigned int need);
  */
 int dislmdb_acl_require_key(DISLMDB_env *env, unsigned int need,
                             const void *key, size_t key_len);
+
+/**
+ * Walk an OPLG blob and require WRITE (put/del) for each key under @p principal
+ * (TLS set for the check). No-op success when enable_acl is false.
+ */
+int dislmdb_acl_authorize_oplog(DISLMDB_env *env, const char *principal,
+                                const uint8_t *data, size_t size);
+
+/**
+ * Wrap OPLG for SYNC_REQUEST: SYN2 | origin_len | origin | prin_len | principal | oplog.
+ * Caller frees *@p out.
+ */
+int dislmdb_sync_wrap_oplog(DISLMDB_env *env, const uint8_t *oplog, size_t oplog_len,
+                            uint8_t **out, size_t *out_len);
+
+/**
+ * Unwrap SYN2 (or accept legacy bare OPLG from older peers): bind origin to
+ * @p sender_id, ACL-check under principal, return inner oplog pointers into @p data
+ * (or allocated copy for legacy — *@p oplog_out owned if *@p oplog_owned).
+ */
+int dislmdb_sync_unwrap_authorize(DISLMDB_env *env, const char *sender_id,
+                                  const uint8_t *data, size_t size,
+                                  const uint8_t **oplog_out, size_t *oplog_len,
+                                  bool *oplog_owned);
 
 /** Pack grant table for meta DBI (owns *out). Empty table → len 8 header only. */
 int dislmdb_acl_persist_pack(DISLMDB_env *env, uint8_t **out, size_t *out_len);
@@ -232,6 +281,41 @@ int dislmdb_acl_role_members_persist_pack(DISLMDB_env *env, uint8_t **out,
                                           size_t *out_len);
 int dislmdb_acl_role_members_persist_unpack(DISLMDB_env *env,
                                             const uint8_t *data, size_t len);
+
+/** Pack peer→principal delegation table (owns *out). */
+int dislmdb_acl_delegates_persist_pack(DISLMDB_env *env, uint8_t **out,
+                                       size_t *out_len);
+int dislmdb_acl_delegates_persist_unpack(DISLMDB_env *env, const uint8_t *data,
+                                         size_t len);
+
+/**
+ * Authorize a wire-asserted principal from authenticated @p origin.
+ * ACL off / empty principal → success. principal==origin → success.
+ * Otherwise requires an ADMIN-granted delegate entry.
+ */
+int dislmdb_acl_authorize_asserted_principal(DISLMDB_env *env,
+                                             const char *origin,
+                                             const char *principal);
+
+/** True for reserved internal DBI names (__* / known meta/raft/bytecode). */
+bool dislmdb_dbname_is_reserved(const char *name);
+
+/** One op in an atomic forward TXN (FWD_OP_TXN). */
+typedef struct DISLMDB_fwd_op {
+    uint32_t op; /**< 1=PUT, 2=DEL */
+    const char *dbname;
+    const void *key;
+    size_t key_len;
+    const void *val;
+    size_t val_len;
+} DISLMDB_fwd_op;
+
+/**
+ * Forward a multi-op write to one shard owner; applied in a single local txn.
+ * All keys must resolve to the same remote owner.
+ */
+int dislmdb_topo_forward_txn(DISLMDB_env *env, const DISLMDB_fwd_op *ops,
+                             size_t nop, uint32_t timeout_ms);
 
 /** @brief Pending op recorded for replication */
 typedef struct DISLMDB_pending_op {
@@ -266,6 +350,8 @@ struct DISLMDB_txn {
 
 #define DISLMDB_META_DBI "__dislmdb_meta__"
 #define DISLMDB_OPLOG_MAGIC 0x4F504C47u /* OPLG */
+/** SYNC_REQUEST envelope: origin + principal + inner OPLG (ACL-checked at leader). */
+#define DISLMDB_SYNC_WRAP_MAGIC 0x32594E53u /* SYN2 */
 #define DISLMDB_SMAP_MAGIC 0x534D4150u  /* SMAP — shard map consensus blob */
 #define DISLMDB_TOPO_MAGIC 0x544F504Fu  /* TOPO — peer topology consensus blob */
 #define DISLMDB_REPL_MAGIC 0x5245504Cu  /* REPL — length-prefixed replica stream */
@@ -381,7 +467,6 @@ int dislmdb_generate_node_id(char *node_id);
  * @param digest Output digest (must be at least 32 bytes)
  * @return 0 on success, non-zero on error
  */
-int dislmdb_sha256(const void *data, size_t size, uint8_t *digest);
 
 /**
  * @brief Add a node to the environment's node list
@@ -418,28 +503,6 @@ int dislmdb_find_node(DISLMDB_env *env,
                      uint32_t *index);
 
 /**
- * @brief Process a consensus operation
- * 
- * @param env The environment
- * @param operation The operation to process
- * @param result Output: Result of the operation
- * @return 0 on success, non-zero on error
- */
-int dislmdb_process_operation(DISLMDB_env *env,
-                             const DISLMDB_operation *operation,
-                             DISLMDB_consensus_result *result);
-
-/**
- * @brief Handle a received PBFT message
- * 
- * @param env The environment
- * @param message The received message
- * @return 0 on success, non-zero on error
- */
-int dislmdb_handle_pbft_message(DISLMDB_env *env,
-                               const DISLMDB_pbft_message *message);
-
-/**
  * @brief Add an entry to the operation log
  * 
  * @param env The environment
@@ -460,31 +523,5 @@ int dislmdb_add_operation_log_entry(DISLMDB_env *env,
 int dislmdb_find_operation_log_entry(DISLMDB_env *env,
                                     const DISLMDB_op_id *op_id,
                                     DISLMDB_operation_log_entry *entry);
-
-/**
- * @brief Parse a consensus operation from a byte buffer
- * 
- * @param buffer The buffer containing the operation data
- * @param size Size of the buffer
- * @param operation Output: The parsed operation
- * @return 0 on success, non-zero on error
- */
-int dislmdb_parse_operation(const uint8_t *buffer,
-                           size_t size,
-                           DISLMDB_operation *operation);
-
-/**
- * @brief Serialize a consensus operation to a byte buffer
- * 
- * @param operation The operation to serialize
- * @param buffer Output: Buffer to store the serialized operation
- * @param size Size of the buffer
- * @param bytes_written Output: Number of bytes written to the buffer
- * @return 0 on success, non-zero on error
- */
-int dislmdb_serialize_operation(const DISLMDB_operation *operation,
-                               uint8_t *buffer,
-                               size_t size,
-                               size_t *bytes_written);
 
 #endif /* DISLMDB_INTERNAL_H */

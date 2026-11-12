@@ -103,11 +103,6 @@ bool dislmdb_crypto_secure_eq(const uint8_t *a, const uint8_t *b, size_t len)
     return diff == 0;
 }
 
-uint16_t dislmdb_htons(uint16_t v) { return htons(v); }
-uint16_t dislmdb_ntohs(uint16_t v) { return ntohs(v); }
-uint32_t dislmdb_htonl(uint32_t v) { return htonl(v); }
-uint32_t dislmdb_ntohl(uint32_t v) { return ntohl(v); }
-
 uint64_t dislmdb_htonll(uint64_t v)
 {
 #if defined(__APPLE__)

@@ -46,12 +46,9 @@ int dislmdb_crypto_random_bytes(uint8_t *buf, size_t len);
 bool dislmdb_crypto_secure_eq(const uint8_t *a, const uint8_t *b, size_t len);
 
 /**
- * @brief Network-endian helpers for wire format
+ * @brief Network-endian helpers for 64-bit wire fields
+ * (16/32-bit paths use htons/htonl directly in write_u*).
  */
-uint16_t dislmdb_htons(uint16_t v);
-uint16_t dislmdb_ntohs(uint16_t v);
-uint32_t dislmdb_htonl(uint32_t v);
-uint32_t dislmdb_ntohl(uint32_t v);
 uint64_t dislmdb_htonll(uint64_t v);
 uint64_t dislmdb_ntohll(uint64_t v);
 

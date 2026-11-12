@@ -132,7 +132,7 @@ endif()
 set_target_properties(dislmdb PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
-    PUBLIC_HEADER "include/dislmdb.h;include/dislmdb_consensus.h;include/dislmdb_network.h;include/dislmdb_errors.h;include/dislmdb_crypto.h"
+    PUBLIC_HEADER "include/dislmdb.h;include/dislmdb_consensus.h;include/dislmdb_network.h;include/dislmdb_errors.h;include/dislmdb_crypto.h;include/dislmdb_quic.h;include/dislmdb_iouring.h"
 )
 
 find_package(ZLIB REQUIRED)

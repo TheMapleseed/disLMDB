@@ -187,6 +187,10 @@ int dislmdb_shard_map_set(DISLMDB_env *env,
     if (!env || env->magic != DISLMDB_MAGIC) {
         return DISLMDB_ERR_INVALID_PARAMETER;
     }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
+    }
     DISLMDB_shard_desc tmp[DISLMDB_MAX_SHARDS];
     int rc = validate_shards(shards, count, tmp);
     if (rc != DISLMDB_SUCCESS) {

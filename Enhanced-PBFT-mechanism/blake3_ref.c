@@ -338,11 +338,3 @@ void blake3_hasher_finalize(const blake3_hasher *self, uint8_t *out, size_t out_
     }
     root_output_bytes(&output, out, out_len);
 }
-
-void blake3_hash_32(const uint8_t *input, size_t input_len, uint8_t out[BLAKE3_OUT_LEN])
-{
-    blake3_hasher h;
-    blake3_hasher_init(&h);
-    blake3_hasher_update(&h, input, input_len);
-    blake3_hasher_finalize(&h, out, BLAKE3_OUT_LEN);
-}

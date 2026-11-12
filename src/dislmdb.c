@@ -277,11 +277,6 @@ int dislmdb_generate_node_id(char *node_id)
     return DISLMDB_SUCCESS;
 }
 
-int dislmdb_sha256(const void *data, size_t size, uint8_t *digest)
-{
-    return dislmdb_crypto_sha256(data, size, digest);
-}
-
 void dislmdb_log(DISLMDB_env *env, DISLMDB_LOG_LEVEL level,
                  const char *module, const char *format, ...)
 {
@@ -937,6 +932,27 @@ static void unlink_txn(DISLMDB_env *env, DISLMDB_txn *txn)
     pthread_mutex_unlock(&env->txn_mutex);
 }
 
+/**
+ * Always consume @p txn (abort LMDB staging if still open, unlink, free).
+ * Safe after mdb_txn_commit failure (LMDB already freed MDB_txn; ptr must be NULL).
+ */
+static void dislmdb_txn_consume(DISLMDB_env *env, DISLMDB_txn *txn)
+{
+    if (!txn) {
+        return;
+    }
+    if (txn->mdb_txn) {
+        mdb_txn_abort(txn->mdb_txn);
+        txn->mdb_txn = NULL;
+    }
+    if (env && env->magic == DISLMDB_MAGIC) {
+        unlink_txn(env, txn);
+    }
+    dislmdb_free_pending_ops(txn);
+    txn->magic = 0;
+    free(txn);
+}
+
 int dislmdb_txn_commit(DISLMDB_txn *txn)
 {
     if (!txn || txn->magic != DISLMDB_MAGIC) {
@@ -948,6 +964,7 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
     }
 
     if (env->config.read_only_node && txn->is_write_txn) {
+        dislmdb_txn_consume(env, txn);
         return DISLMDB_ERR_READ_ONLY;
     }
 
@@ -955,6 +972,7 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
         int trc = dislmdb_topo_check_txn_writes(txn);
         if (trc != DISLMDB_SUCCESS) {
             dislmdb_set_error(env, trc, "Topology mode rejected transaction writes");
+            dislmdb_txn_consume(env, txn);
             return trc;
         }
     }
@@ -968,6 +986,7 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
             rc = dislmdb_pbft_propose_transaction(txn);
             if (rc != DISLMDB_SUCCESS) {
                 dislmdb_set_error(env, rc, "Failed to achieve consensus for transaction");
+                dislmdb_txn_consume(env, txn);
                 return rc;
             }
             applied_via_consensus = true;
@@ -975,6 +994,7 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
             rc = dislmdb_raft_propose_transaction(txn);
             if (rc != DISLMDB_SUCCESS) {
                 dislmdb_set_error(env, rc, "Failed to achieve Raft consensus for transaction");
+                dislmdb_txn_consume(env, txn);
                 return rc;
             }
             applied_via_consensus = true;
@@ -984,6 +1004,7 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
             DISLMDB_consensus_result result;
             rc = dislmdb_consensus_generate_op_id(env, &op.id);
             if (rc != DISLMDB_SUCCESS) {
+                dislmdb_txn_consume(env, txn);
                 return rc;
             }
             op.type = DISLMDB_OP_TYPE_NOP;
@@ -991,6 +1012,7 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
             strncpy(op.node_id, env->local_node_id, sizeof(op.node_id) - 1);
             rc = dislmdb_consensus_propose(env, &op, env->config.consensus.timeout_ms, &result);
             if (rc != DISLMDB_SUCCESS || result.status != DISLMDB_CONSENSUS_COMMITTED) {
+                dislmdb_txn_consume(env, txn);
                 return rc != DISLMDB_SUCCESS ? rc : DISLMDB_ERR_CONSENSUS_FAILED;
             }
         }
@@ -1003,12 +1025,18 @@ int dislmdb_txn_commit(DISLMDB_txn *txn)
             txn->mdb_txn = NULL;
         }
     } else if (txn->mdb_txn) {
+        /*
+         * LMDB frees the MDB_txn on commit failure (_mdb_txn_abort + END_FREE).
+         * On success the writer txn may be sticky (me_txn0) — still drop our ptr.
+         * Commit always consumes the DISLMDB_txn (success or fail).
+         */
         rc = mdb_txn_commit(txn->mdb_txn);
+        txn->mdb_txn = NULL;
         if (rc != 0) {
             dislmdb_set_error(env, rc, "Failed to commit transaction: %s", mdb_strerror(rc));
+            dislmdb_txn_consume(env, txn);
             return rc;
         }
-        txn->mdb_txn = NULL;
     }
 
     unlink_txn(env, txn);
@@ -1110,6 +1138,16 @@ int dislmdb_add_node(DISLMDB_env *env, const DISLMDB_node_addr *node_addr)
     int rc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
     if (rc != DISLMDB_SUCCESS) {
         return rc;
+    }
+    /* Soft peer cap before auth — callers expect MAX_NODES when full. */
+    if (env->config.max_peers != 0 &&
+        env->node_count >= env->config.max_peers) {
+        return DISLMDB_ERR_MAX_NODES;
+    }
+    /* Growing beyond solo requires a cluster key (wire HMAC + PBFT MAC). */
+    if (!env->has_cluster_key && !env->config.network.has_cluster_key &&
+        env->node_count >= 1) {
+        return DISLMDB_ERR_AUTH_FAILED;
     }
     rc = dislmdb_add_node_internal(env, node_addr);
     if (rc != DISLMDB_SUCCESS) {
@@ -1424,6 +1462,12 @@ int dislmdb_set_cluster_key(DISLMDB_env *env, const uint8_t key[32])
         if (env->config.network.enable_payload_encryption || env->config.network.enable_tls) {
             (void)dislmdb_network_set_encryption(env, true);
         }
+        (void)dislmdb_network_set_plane_keys(
+            env,
+            env->config.has_region_key ? env->config.region_key : NULL,
+            env->config.has_region_key,
+            env->config.has_cross_region_key ? env->config.cross_region_key : NULL,
+            env->config.has_cross_region_key);
     }
     return dislmdb_persist_save(env);
 }
@@ -1432,6 +1476,10 @@ int dislmdb_get_cluster_key(DISLMDB_env *env, uint8_t out[32])
 {
     if (!env || env->magic != DISLMDB_MAGIC || !out) {
         return DISLMDB_ERR_INVALID_PARAMETER;
+    }
+    int arc = dislmdb_acl_require(env, DISLMDB_ACL_ADMIN);
+    if (arc != DISLMDB_SUCCESS) {
+        return arc;
     }
     if (!env->has_cluster_key) {
         return DISLMDB_ERR_NOT_INITIALIZED;

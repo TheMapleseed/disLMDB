@@ -30,7 +30,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", libdir.join("libdislmdb.dylib").display());
     println!("cargo:rerun-if-changed={}", libdir.join("libdislmdb.so").display());
 
-    // Probe DISLMDB_env_config layout so open() can patch maxdbs / enable_acl.
+    // Probe DISLMDB_env_config layout so open() can patch solo defaults / ACL.
     let probe_c = out.join("offset_probe.c");
     let probe_bin = out.join("offset_probe");
     fs::write(
@@ -45,6 +45,12 @@ int main(void) {
            offsetof(DISLMDB_env_config, maxdbs));
     printf("pub const OFFSETOF_ENABLE_ACL: usize = %zu;\n",
            offsetof(DISLMDB_env_config, enable_acl));
+    printf("pub const OFFSETOF_LOCAL_PORT: usize = %zu;\n",
+           offsetof(DISLMDB_env_config, network.local_port));
+    printf("pub const OFFSETOF_CONSENSUS_MECH: usize = %zu;\n",
+           offsetof(DISLMDB_env_config, consensus.mechanism));
+    printf("pub const CONSENSUS_SOLO: u32 = %u;\n",
+           (unsigned)DISLMDB_CONSENSUS_SOLO);
     return 0;
 }
 "#,

@@ -284,7 +284,11 @@ static ConsensusError verify_inbound(ConsensusCore *core, const PbftMessage *msg
         return CONSENSUS_OK;
     }
     if (!security_manager_has_key(core->security)) {
-        return CONSENSUS_OK; /* solo / no key yet */
+        /* Solo (≤1 replica): allow unsigned local progress. Multi-peer: fail closed. */
+        if (core->config.replica_count > 1) {
+            return CONSENSUS_ERROR_SIGNATURE;
+        }
+        return CONSENSUS_OK;
     }
     if (!msg->has_auth) {
         return CONSENSUS_ERROR_SIGNATURE;
@@ -1184,28 +1188,6 @@ ConsensusError consensus_core_propose(ConsensusCore *core,
     }
     pthread_mutex_unlock(&core->lock);
     return CONSENSUS_OK;
-}
-
-ConsensusError consensus_core_handle_message(ConsensusCore *core,
-                                             MessageType type,
-                                             const char *from_node,
-                                             const uint8_t *data,
-                                             size_t size)
-{
-    if (!core || !from_node) {
-        return CONSENSUS_ERROR_INVALID_PARAMETER;
-    }
-    /* Prefer framed PBFT payloads */
-    PbftMessage msg;
-    if (pbft_message_deserialize(data, size, &msg) == 0) {
-        ConsensusError err = consensus_core_handle_pbft(core, &msg);
-        pbft_message_clear(&msg);
-        return err;
-    }
-
-    /* Fallback: treat raw bytes as pre-prepare data only if primary-shaped (legacy) */
-    (void)type;
-    return CONSENSUS_ERROR_STATE;
 }
 
 void pbft_message_clear(PbftMessage *msg)

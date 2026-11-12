@@ -24,6 +24,8 @@
 #define META_KEY_ACL_PREFIX "acl_prefix_grants"
 #define META_KEY_ACL_ROLES "acl_roles"
 #define META_KEY_ACL_ROLE_MEMBERS "acl_role_members"
+#define META_KEY_ACL_DELEGATES "acl_delegates"
+#define META_KEY_ENABLE_ACL "enable_acl"
 
 /* Packed shard: count u32 + N * (id + prefix + owner [+ flags v2]) */
 #define SHARD_PACK_SIZE_V1 (DISLMDB_SHARD_ID_LEN + DISLMDB_SHARD_PREFIX_LEN + 64)
@@ -363,6 +365,38 @@ int dislmdb_persist_save(DISLMDB_env *env)
             mdb_txn_abort(txn);
             return rc;
         }
+
+        uint8_t *dbuf = NULL;
+        size_t dsize = 0;
+        rc = dislmdb_acl_delegates_persist_pack(env, &dbuf, &dsize);
+        if (rc != DISLMDB_SUCCESS) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+        k.mv_size = strlen(META_KEY_ACL_DELEGATES);
+        k.mv_data = (void *)META_KEY_ACL_DELEGATES;
+        v.mv_size = dsize;
+        v.mv_data = dbuf;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        free(dbuf);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
+    }
+
+    /* Persist enable_acl so cold opens restore enforcement with grant blobs. */
+    {
+        uint8_t flag = env->config.enable_acl ? 1u : 0u;
+        k.mv_size = strlen(META_KEY_ENABLE_ACL);
+        k.mv_data = (void *)META_KEY_ENABLE_ACL;
+        v.mv_size = 1;
+        v.mv_data = &flag;
+        rc = mdb_put(txn, dbi, &k, &v, 0);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return rc;
+        }
     }
     return mdb_txn_commit(txn);
 }
@@ -613,7 +647,30 @@ int dislmdb_persist_load(DISLMDB_env *env)
         (void)dislmdb_acl_role_members_persist_unpack(env, v.mv_data,
                                                       v.mv_size);
     }
+    k.mv_size = strlen(META_KEY_ACL_DELEGATES);
+    k.mv_data = (void *)META_KEY_ACL_DELEGATES;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 8) {
+        (void)dislmdb_acl_delegates_persist_unpack(env, v.mv_data, v.mv_size);
+    }
+
+    bool enable_acl_from_disk = false;
+    bool have_enable_acl_key = false;
+    k.mv_size = strlen(META_KEY_ENABLE_ACL);
+    k.mv_data = (void *)META_KEY_ENABLE_ACL;
+    if (mdb_get(txn, dbi, &k, &v) == 0 && v.mv_size >= 1 && v.mv_data) {
+        have_enable_acl_key = true;
+        enable_acl_from_disk = (((const uint8_t *)v.mv_data)[0] != 0);
+    }
     mdb_txn_abort(txn);
+
+    if (have_enable_acl_key) {
+        env->config.enable_acl = enable_acl_from_disk;
+    } else if (!env->config.enable_acl &&
+               (env->acl_grant_count > 0 || env->acl_prefix_grant_count > 0 ||
+                env->acl_role_count > 0 || env->acl_delegate_count > 0)) {
+        /* Legacy DBs: grants on disk without the flag → fail closed. */
+        env->config.enable_acl = true;
+    }
 
     if (env->consensus_context && env->config.consensus.mechanism == DISLMDB_CONSENSUS_PBFT) {
         ConsensusCore *core = env->consensus_context;

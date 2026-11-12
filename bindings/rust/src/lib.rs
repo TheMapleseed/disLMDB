@@ -277,7 +277,7 @@ pub struct OpenOptions {
     pub maxdbs: u32,
 }
 
-/// Open environment (solo consensus by default).
+/// Open environment (**solo** consensus + ephemeral `local_port=0` by default).
 pub struct Env {
     raw: *mut ffi::DislmdbEnv,
     _path: CString,
@@ -299,11 +299,16 @@ impl Env {
         let mut cfg = vec![0u8; offsets::ENV_CONFIG_SIZE];
         check(unsafe { ffi::dislmdb_env_config_init(cfg.as_mut_ptr() as *mut c_void) })?;
 
-        // Patch path (offset 0), optional maxdbs, optional enable_acl.
+        // Patch path (offset 0), force SOLO + port 0, optional maxdbs / enable_acl.
+        // C config_init defaults to PBFT:9876; bindings open is single-process.
         unsafe {
             let base = cfg.as_mut_ptr();
             let path_slot = base as *mut *const c_char;
             *path_slot = path_c.as_ptr();
+            let mech = base.add(offsets::OFFSETOF_CONSENSUS_MECH) as *mut u32;
+            *mech = offsets::CONSENSUS_SOLO;
+            let port = base.add(offsets::OFFSETOF_LOCAL_PORT) as *mut u16;
+            *port = 0;
             if opts.maxdbs != 0 {
                 let slot = base.add(offsets::OFFSETOF_MAXDBS) as *mut c_uint;
                 *slot = opts.maxdbs;
@@ -612,7 +617,14 @@ impl Env {
             return Err(Error(rc));
         }
         match f(txn, dbi) {
-            Ok(()) => check(unsafe { ffi::dislmdb_txn_commit(txn) }),
+            Ok(()) => {
+                let rc = unsafe { ffi::dislmdb_txn_commit(txn) };
+                // commit always consumes the handle; abort is a safe no-op after.
+                if rc != 0 {
+                    unsafe { ffi::dislmdb_txn_abort(txn) };
+                }
+                check(rc)
+            }
             Err(e) => {
                 unsafe { ffi::dislmdb_txn_abort(txn) };
                 Err(e)
@@ -643,7 +655,13 @@ impl Env {
             return Err(Error(rc));
         }
         match f(txn, primary, index) {
-            Ok(()) => check(unsafe { ffi::dislmdb_txn_commit(txn) }),
+            Ok(()) => {
+                let crc = unsafe { ffi::dislmdb_txn_commit(txn) };
+                if crc != 0 {
+                    unsafe { ffi::dislmdb_txn_abort(txn) };
+                }
+                check(crc)
+            }
             Err(e) => {
                 unsafe { ffi::dislmdb_txn_abort(txn) };
                 Err(e)

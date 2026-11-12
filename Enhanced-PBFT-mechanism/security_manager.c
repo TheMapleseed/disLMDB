@@ -78,14 +78,6 @@ void security_manager_hash_consensus(SecurityManager *sm,
     tvb3_hash_payload(t, sm ? &sm->tvb3 : NULL, data, size, out);
 }
 
-void security_manager_hash(SecurityManager *sm,
-                           const uint8_t *data,
-                           size_t size,
-                           uint8_t out[SECURITY_DIGEST_LEN])
-{
-    security_manager_hash_consensus(sm, 0, 0, data, size, out);
-}
-
 bool security_manager_digest_eq(const uint8_t a[SECURITY_DIGEST_LEN],
                                 const uint8_t b[SECURITY_DIGEST_LEN])
 {
